@@ -81,3 +81,6 @@ work_dir*/
 
 !CMakeLists.txt
 proxy_config.yml
+
+# Benchmark datasets
+dataset/
