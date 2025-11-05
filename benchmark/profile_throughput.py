@@ -25,6 +25,7 @@ def sample_requests(
     dataset_path: str,
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
+    chat_template=None,  # Add chat_template parameter
 ) -> List[Tuple[str, int]]:
     """Sample requests from dataset for DLLM benchmarking.
     
@@ -50,6 +51,14 @@ def sample_requests(
 
         # Tokenize the prompts.
         prompt = dataset[i][0]
+        
+        # Apply chat template to format the prompt
+        if chat_template is not None:
+            # Convert raw prompt to message format
+            messages = [{'role': 'user', 'content': prompt}]
+            # Apply chat template
+            prompt = chat_template.messages2prompt(messages, sequence_start=True, enable_thinking=False)
+        
         prompt_token_ids = tokenizer.encode(prompt)
         prompt_len = len(prompt_token_ids)
         completion = dataset[i][1]
@@ -72,9 +81,18 @@ class Engine:
 
     def __init__(self, model_path: str, engine_config: Union[PytorchEngineConfig, TurbomindEngineConfig]):
         self.tokenizer = Tokenizer(model_path)
+        
+        # Automatically detect and use the model's corresponding chat template
+        from lmdeploy.model import ChatTemplateConfig, best_match_model
+        chat_template_name = best_match_model(model_path)
+        self.chat_template_config = ChatTemplateConfig(model_name=chat_template_name, model_path=model_path)
+        self.chat_template = self.chat_template_config.chat_template
+        
         if isinstance(engine_config, TurbomindEngineConfig):
             from lmdeploy.turbomind import TurboMind
-            tm_model = TurboMind.from_pretrained(model_path, engine_config=engine_config)
+            tm_model = TurboMind.from_pretrained(model_path,
+                                           engine_config=engine_config,
+                                           chat_template_name=chat_template_name)
             self.backend = 'turbomind'
         elif isinstance(engine_config, PytorchEngineConfig):
             from lmdeploy.pytorch.engine import Engine as PytorchEngine
@@ -96,7 +114,8 @@ class Engine:
             if skip_tokenize:
                 input_ids = prompt
             else:
-                print("Prompt:\n", prompt)
+                # print("Prompt:")
+                # print(prompt)
                 input_ids = self.tokenizer(prompt).input_ids
 
             state = DetokenizeState(len(input_ids))
@@ -119,12 +138,13 @@ class Engine:
                     n_token += len(outputs.token_ids)
                     token_ids += outputs.token_ids
                     if not skip_detokenize:
-                        # _, state = self.tokenizer.detokenize_incrementally(token_ids, state)
-                        text, state = self.tokenizer.detokenize_incrementally(token_ids, state)
-                        print("Generated:\n", text)
+                        _, state = self.tokenizer.detokenize_incrementally(token_ids, state)
+                        # text, state = self.tokenizer.detokenize_incrementally(token_ids, state)
+                        # print(text, end='')
                     sess.tick(n_token)
                     # No need to check for cancel_after since we're generating until EOS
                 sess.finish(Session.SUCCESS)
+                # print()
             finally:
                 await generator.aclose()
 
@@ -293,6 +313,7 @@ def main():
         dataset_path=args.dataset,
         num_requests=args.num_prompts,
         tokenizer=engine.tokenizer.model.model,
+        chat_template=engine.chat_template,  # Pass the automatically detected chat template
     )
 
     stream_output = not args.no_stream_output
@@ -310,11 +331,14 @@ def main():
                            skip_detokenize=args.skip_detokenize,
                            max_new_tokens=args.max_new_tokens)
 
+    # Get and display the used chat template name
+    chat_template_name = engine.chat_template_config.model_name
     hyperparams = [('Concurrency', args.concurrency),
                    ('Max new tokens', args.max_new_tokens),
-                   ('Stream output', str(stream_output).lower()), 
+                   ('Stream output', str(stream_output).lower()),
                    ('Skip tokenize', str(args.skip_tokenize).lower()),
-                   ('Skip detokenize', str(args.skip_detokenize).lower())]
+                   ('Skip detokenize', str(args.skip_detokenize).lower()),
+                   ('Chat template', chat_template_name)]
     profiler.compute_metrics()
     profiler.summarize(title='Profile LLM Throughput', hyperparams=hyperparams)
     if args.csv:
@@ -323,6 +347,7 @@ def main():
             ('bs', args.concurrency),
             ('max_new_tokens', args.max_new_tokens),
             ('num_prompts', args.num_prompts),
+            ('chat_template', chat_template_name),
         ))
 
 
