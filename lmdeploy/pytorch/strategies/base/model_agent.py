@@ -143,6 +143,10 @@ class ModelAgentStrategy(ABC):
             next_token_ids = inputs.input_ids.new_zeros(logits.size(0))
         return next_token_ids, extra_inputs
 
+    def reshape_logits(self, logits: torch.Tensor, inputs: 'ModelInputs') -> torch.Tensor:
+        """Hook to reshape logits before sampling."""
+        return logits
+
     @abstractmethod
     @contextmanager
     def broadcast_next_token(self, next_token_ids: torch.Tensor, extra_inputs: ExtraInputs, dist_ctx: 'DistContext'):

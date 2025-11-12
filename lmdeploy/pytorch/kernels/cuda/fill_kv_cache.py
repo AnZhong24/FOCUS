@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from typing import Literal
 
+import torch
 import triton
 import triton.language as tl
 from torch import Tensor
@@ -33,6 +34,94 @@ def _quant_int4(val1, val2):
     q_val2 = (val2 / scales[:, None] + zeros[:, None] + 0.5).to(tl.uint8)
     q_val = q_val1 + q_val2 * 16
     return q_val, scales, zeros
+
+
+
+@triton.jit
+def _fill_kv_cache_sparse_kernel(
+    KStates,
+    VStates,
+    KCaches,
+    VCaches,
+    ProcessingIndices,
+    QStartLoc,
+    QSeqLens,
+    KVSeqLens,
+    BlockOffsets,
+    head_dim: tl.constexpr,
+    head_dim_v: tl.constexpr,
+    stride_kss,
+    stride_ksh,
+    stride_ksd,
+    stride_vss,
+    stride_vsh,
+    stride_vsd,
+    stride_kcn: tl.constexpr,
+    stride_kcb: tl.constexpr,
+    stride_kch: tl.constexpr,
+    stride_kcd: tl.constexpr,
+    stride_vcn: tl.constexpr,
+    stride_vcb: tl.constexpr,
+    stride_vch: tl.constexpr,
+    stride_vcd: tl.constexpr,
+    stride_boff,
+    BLOCK: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_DV: tl.constexpr,
+):
+    head_id = tl.program_id(0)
+    batch_id = tl.program_id(1)
+
+    q_len = tl.load(QSeqLens + batch_id)
+    if q_len <= 0:
+        return
+
+    kv_seqlen = tl.load(KVSeqLens + batch_id)
+    if kv_seqlen <= 0:
+        return
+
+    q_start = tl.load(QStartLoc + batch_id)
+    block_idx = (kv_seqlen - 1) // BLOCK
+    block_off = tl.load(BlockOffsets + batch_id * stride_boff + block_idx)
+
+    token_offsets = tl.arange(0, BLOCK)
+    mask_t = token_offsets < q_len
+    seq_offsets = (q_start + token_offsets).to(tl.int32)
+    seq_offsets = tl.where(mask_t, seq_offsets, 0)
+
+    proc_idx = tl.load(ProcessingIndices + seq_offsets, mask=mask_t, other=0).to(tl.int32)
+    last_off = (q_start + q_len - 1).to(tl.int32)
+    last_proc_idx = tl.load(ProcessingIndices + last_off).to(tl.int32)
+    rightmost_plus_one = last_proc_idx + 1
+    history_len = kv_seqlen - rightmost_plus_one
+    history_len = tl.maximum(history_len, 0)
+    block_start = block_idx * BLOCK
+    history_offset = history_len - block_start
+    history_offset = tl.maximum(history_offset, 0)
+    cache_idx = proc_idx + history_offset
+
+    d_off = tl.arange(0, BLOCK_D)
+    mask_d = d_off < head_dim
+
+    ks_head_ptr = KStates + head_id * stride_ksh
+    k = tl.load(ks_head_ptr + seq_offsets[:, None] * stride_kss + d_off[None, :] * stride_ksd,
+                mask=mask_t[:, None] & mask_d[None, :],
+                other=0)
+
+    kc_head_ptr = KCaches + head_id * stride_kch
+    kc_ptr = kc_head_ptr + block_off * stride_kcn + cache_idx[:, None] * stride_kcb + d_off[None, :] * stride_kcd
+    tl.store(kc_ptr, k, mask=mask_t[:, None] & mask_d[None, :])
+
+    if BLOCK_DV > 0:
+        dv_off = tl.arange(0, BLOCK_DV)
+        mask_v = dv_off < head_dim_v
+        vs_head_ptr = VStates + head_id * stride_vsh
+        v = tl.load(vs_head_ptr + seq_offsets[:, None] * stride_vss + dv_off[None, :] * stride_vsd,
+                    mask=mask_t[:, None] & mask_v[None, :],
+                    other=0)
+        vc_head_ptr = VCaches + head_id * stride_vch
+        vc_ptr = vc_head_ptr + block_off * stride_vcn + cache_idx[:, None] * stride_vcb + dv_off[None, :] * stride_vcd
+        tl.store(vc_ptr, v, mask=mask_t[:, None] & mask_v[None, :])
 
 
 @triton.jit
@@ -277,7 +366,8 @@ def fill_kv_cache(k_states: Tensor,
                   k_scales_zeros: Tensor = None,
                   v_scales_zeros: Tensor = None,
                   quant_policy: Literal[0, 4, 8] = 0,
-                  kv_layout: str = 'bshd'):
+                  kv_layout: str = 'bshd',
+                  processing_indices: Tensor = None):
     """Fill key/value state to cache for paged attention."""
     if kv_layout == 'bshd':
         b_dim, s_dim, h_dim, d_dim = (0, 1, 2, 3)
@@ -303,6 +393,47 @@ def fill_kv_cache(k_states: Tensor,
     BLOCK_DV = triton.next_power_of_2(head_dim_v)
     if k_caches.data_ptr() == v_caches.data_ptr() and head_dim_v <= head_dim:
         BLOCK_DV = 0
+    if processing_indices is not None and processing_indices.numel() > 0:
+        processing_indices = processing_indices.to(torch.int32).contiguous()
+        q_start_loc_i32 = q_start_loc.to(torch.int32).contiguous()
+        q_seq_length_i32 = q_seq_length.to(torch.int32).contiguous()
+        kv_seq_length_i32 = kv_seq_length.to(torch.int32).contiguous()
+        grid = (num_heads, batch_size)
+        _fill_kv_cache_sparse_kernel[grid](
+            k_states,
+            v_states,
+            k_caches,
+            v_caches,
+            processing_indices,
+            q_start_loc_i32,
+            q_seq_length_i32,
+            kv_seq_length_i32,
+            block_offsets,
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
+            stride_kss=k_states.stride(-3),
+            stride_ksh=k_states.stride(-2),
+            stride_ksd=k_states.stride(-1),
+            stride_vss=v_states.stride(-3),
+            stride_vsh=v_states.stride(-2),
+            stride_vsd=v_states.stride(-1),
+            stride_kcn=k_caches.stride(b_dim),
+            stride_kcb=k_caches.stride(s_dim),
+            stride_kch=k_caches.stride(h_dim),
+            stride_kcd=k_caches.stride(d_dim),
+            stride_vcn=v_caches.stride(b_dim),
+            stride_vcb=v_caches.stride(s_dim),
+            stride_vch=v_caches.stride(h_dim),
+            stride_vcd=v_caches.stride(d_dim),
+            stride_boff=block_offsets.stride(0),
+            BLOCK=BLOCK,
+            BLOCK_D=BLOCK_D,
+            BLOCK_DV=BLOCK_DV,
+            num_warps=4,
+            num_stages=2,
+        )
+        return
+
     if quant_policy == 0:
         grid = (num_heads, max_num_blocks, batch_size)
         is_decoding = max_num_blocks == 1

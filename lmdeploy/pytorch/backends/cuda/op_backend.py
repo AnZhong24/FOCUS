@@ -146,6 +146,8 @@ class CudaOpsBackend(DefaultOpsBackend):
             quant_policy=step_context.kv_quant_policy,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
+            processing_indices=step_context.processing_indices,
+            use_block_cache=step_context.use_block_cache,
         )
         if getattr(step_context.model_config, 'use_flash_mla', False) is True:
             if step_context.is_decoding is True:

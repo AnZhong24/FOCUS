@@ -120,6 +120,47 @@ class DLLMModelAgentStrategy(ModelAgentStrategy):
 
         self.unmasking_processor = UnmaskingProcessor(dllm_config=dllm_config)
 
+    def _use_delayed_cache(self, inputs: ModelInputs) -> bool:
+        cfg = self.unmasking_processor.dllm_config
+        return (cfg.enable_delayed_cache and inputs.processing_indices is not None
+                and inputs.processing_q_lens is not None)
+
+    def _scatter_logits(self, flat_logits: torch.Tensor, inputs: ModelInputs) -> torch.Tensor:
+        batch_size = inputs.seq_length.size(0)
+        vocab_size = flat_logits.size(-1)
+        block_size = self.block_size
+        full_logits = flat_logits.new_empty(batch_size, block_size, vocab_size)
+        device = flat_logits.device
+        proc_indices = inputs.processing_indices.to(device=device, dtype=torch.long)
+        seq_lengths_src = inputs.processing_q_lens if inputs.processing_q_lens is not None else inputs.seq_length
+        seq_lengths = seq_lengths_src.to(device=device, dtype=torch.long)
+        num_proc = proc_indices.numel()
+
+        batch_indices = torch.arange(batch_size, device=device).repeat_interleave(seq_lengths)
+        dense_row_indices = batch_indices * block_size + proc_indices
+        total_logits = flat_logits.size(0)
+        # Kernels may output ragged logits (one row per processing index) or dense block
+        # logits. Select the corresponding rows before scattering into the full buffer.
+        if total_logits == num_proc:
+            assign_logits = flat_logits
+        elif total_logits == batch_size * block_size:
+            assign_logits = flat_logits.index_select(0, dense_row_indices)
+        else:
+            raise RuntimeError(
+                f'Unexpected logits rows: got {total_logits}, '
+                f'but need either {num_proc} (sparse) or {batch_size * block_size} (dense).')
+
+        full_logits[batch_indices, proc_indices] = assign_logits
+        return full_logits.view(-1, vocab_size)
+
+    def reshape_logits(self, logits: torch.Tensor, inputs: ModelInputs) -> torch.Tensor:
+        if not self._use_delayed_cache(inputs):
+            return logits
+        vocab_size = logits.size(-1)
+        flat_logits = logits.reshape(-1, vocab_size)
+        restored = self._scatter_logits(flat_logits, inputs)
+        return restored.unsqueeze(0)
+
     def _update_dllm(self, next_token_ids: torch.Tensor, dllm_mask: torch.Tensor, seqlens: torch.Tensor):
         """Update token_ids and dllm_mask."""
         dllm_mask_token = self.dllm_mask_token

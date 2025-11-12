@@ -335,6 +335,7 @@ class DLLMConfig:
     unmasking_strategy: UnmaskingStrategy = UnmaskingStrategy.LOW_CONFIDENCE_DYNAMIC
     denoising_steps: int = None
     confidence_threshold: float = 0.85
+    enable_delayed_cache: bool = False
 
 
 @dataclass
@@ -355,7 +356,8 @@ class MiscConfig:
         dllm_config = DLLMConfig(block_length=engine_config.dllm_block_length,
                                  unmasking_strategy=dllm_unmasking_strategy,
                                  denoising_steps=engine_config.dllm_denoising_steps,
-                                 confidence_threshold=engine_config.dllm_confidence_threshold)
+                                 confidence_threshold=engine_config.dllm_confidence_threshold,
+                                 enable_delayed_cache=engine_config.dllm_enable_delayed_cache)
         misc_config = cls(custom_module_map=engine_config.custom_module_map,
                           empty_init=engine_config.empty_init,
                           prefill_interval=engine_config.prefill_interval,

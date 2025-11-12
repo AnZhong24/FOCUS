@@ -342,6 +342,7 @@ class PytorchEngineConfig:
         dllm_denoising_steps (int): Dllm denoising steps.
         dllm_confidence_threshold (float): dllm unmasking threshold for
             dynamic unmasking.
+        dllm_enable_delayed_cache (bool): enable delayed KV cache flow for DLLM decoding.
     """
     dtype: str = 'auto'
     tp: int = 1
@@ -382,6 +383,7 @@ class PytorchEngineConfig:
     dllm_unmasking_strategy: str = 'low_confidence_dynamic'
     dllm_denoising_steps: int = None
     dllm_confidence_threshold: float = 0.85
+    dllm_enable_delayed_cache: bool = False
 
     role: EngineRole = EngineRole.Hybrid
     migration_backend: MigrationBackend = MigrationBackend.DLSlime

@@ -30,6 +30,46 @@ class HistoryDLLMMask(HistoryTokenIds):
 
 
 @dataclass
+class DelayedCacheState:
+    block_length: int
+    uncached_positions: np.ndarray
+    last_indices: np.ndarray | None = None
+
+    @classmethod
+    def new(cls, block_length: int):
+        uncached = np.ones((block_length, ), dtype=bool)
+        return cls(block_length=block_length, uncached_positions=uncached)
+
+    def reset(self):
+        self.uncached_positions[:] = True
+        self.last_indices = None
+
+    def mark_cached(self, ready_mask: np.ndarray):
+        if ready_mask is None:
+            return
+        self.uncached_positions &= ~ready_mask
+        self.last_indices = None
+
+    def update_from_mask(self, dllm_mask: np.ndarray):
+        if dllm_mask is None or dllm_mask.size == 0:
+            return
+        non_mask = dllm_mask != DLLM_MASKED
+        right_neighbor = np.roll(non_mask, -1)
+        right_neighbor[-1] = True
+        ready = non_mask & right_neighbor
+        self.mark_cached(ready)
+
+    def get_processing_indices(self):
+        if self.last_indices is not None:
+            return self.last_indices
+        indices = np.nonzero(self.uncached_positions)[0]
+        if indices.size == 0:
+            indices = np.arange(self.block_length, dtype=np.int64)
+        self.last_indices = indices.astype(np.int64, copy=False)
+        return self.last_indices
+
+
+@dataclass
 class SchedulerSequenceDLLM(SchedulerSequenceDefault):
 
     # For dllm
@@ -40,6 +80,9 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
         super().__post_init__()
         self._num_valid_ids: int = len(self.history_cache)
         self._strategy: DLLMSequenceStrategy = self._seq_meta.strategy
+        self._delayed_cache_state: DelayedCacheState | None = None
+        if self._strategy.enable_delayed_cache:
+            self._delayed_cache_state = DelayedCacheState.new(self.dllm_block_length)
 
     @property
     def dllm_mask(self):
@@ -68,6 +111,32 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
     @property
     def dllm_mask_token(self):
         return self._strategy.dllm_mask_token
+
+    @property
+    def delayed_cache_enabled(self) -> bool:
+        return self._delayed_cache_state is not None
+
+    def _reset_delayed_cache_state(self):
+        if self._delayed_cache_state is not None:
+            self._delayed_cache_state.reset()
+
+    def _update_delayed_cache_state(self):
+        if not self.delayed_cache_enabled:
+            return
+        mask = self.dllm_mask
+        if mask.size == 0:
+            return
+        self._delayed_cache_state.update_from_mask(mask)
+        if np.all(mask == DLLM_CACHED):
+            self._reset_delayed_cache_state()
+
+    def get_processing_indices(self) -> Optional[np.ndarray]:
+        if not self.delayed_cache_enabled:
+            return None
+        indices = self._delayed_cache_state.get_processing_indices()
+        # NOTE: sparse kernels assume each per-sequence slice is sorted
+        # ascending, so keep using np.nonzero() without extra shuffling.
+        return None if indices is None else indices.copy()
 
     def set_stop_pos(self, pos: int):
         dllm_block_length = self.dllm_block_length
@@ -145,6 +214,7 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
             self.history_dllm_mask.append(new_dllm_mask)
             self._num_history_ids += self._num_token_ids
             self._num_token_ids = dllm_block_length
+            self._reset_delayed_cache_state()
 
     def _update_token_ids_prefill(self, token_ids: np.ndarray, dllm_mask: np.ndarray):
         """Update token ids for prefill."""
@@ -196,9 +266,10 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
 
 class DLLMSequenceStrategy(SequenceStrategy):
 
-    def __init__(self, block_size: int, dllm_mask_token: int) -> None:
+    def __init__(self, block_size: int, dllm_mask_token: int, enable_delayed_cache: bool = False) -> None:
         self.block_size = block_size
         self.dllm_mask_token = dllm_mask_token
+        self.enable_delayed_cache = enable_delayed_cache
 
     def make_sequence(self,
                       seq_id: int,
@@ -243,6 +314,8 @@ class DLLMSequenceStrategy(SequenceStrategy):
 
             # fill token
             msg.update_token_ids(token, dllm_mask=mask, model_meta=model_meta, mode=update_mode)
+            if self.enable_delayed_cache:
+                msg._update_delayed_cache_state()
             if stop:
                 msg.set_stop_pos(stop_pos[idx])
                 msg.status = MessageStatus.TO_BE_MIGRATED if msg.preserve_cache else MessageStatus.STOPPED

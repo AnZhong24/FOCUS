@@ -84,3 +84,8 @@ proxy_config.yml
 
 # Benchmark datasets
 dataset/
+
+context.py
+delayed_cache_plan.md
+focus_generate.py
+modeling_sdar.py

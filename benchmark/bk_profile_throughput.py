@@ -309,6 +309,7 @@ def parse_args():
     ArgumentHelper.dllm_unmasking_strategy(pt_group)
     ArgumentHelper.dllm_denoising_steps(pt_group)
     ArgumentHelper.dllm_confidence_threshold(pt_group)
+    ArgumentHelper.dllm_enable_delayed_cache(pt_group)
 
     tp_act = ArgumentHelper.tp(pt_group)
     cache_count_act = ArgumentHelper.cache_max_entry_count(pt_group)
@@ -369,6 +370,7 @@ def main():
             dllm_unmasking_strategy=args.dllm_unmasking_strategy,
             dllm_denoising_steps=args.dllm_denoising_steps,
             dllm_confidence_threshold=args.dllm_confidence_threshold,
+            dllm_enable_delayed_cache=args.dllm_enable_delayed_cache,
         )
 
     if args.use_uvloop:

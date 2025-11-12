@@ -16,6 +16,8 @@ class AttentionMetadata:
     kv_seqlens: torch.Tensor = None
     fill_seqlens: torch.Tensor = None
     quant_policy: Literal[0, 4, 8] = 0
+    processing_indices: torch.Tensor = None
+    use_block_cache: bool = False
 
 
 T = TypeVar('T', bound=AttentionMetadata)

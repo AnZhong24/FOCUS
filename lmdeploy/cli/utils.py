@@ -34,6 +34,16 @@ class DefaultsAndTypesHelpFormatter(argparse.HelpFormatter):
 
 def convert_args(args):
     """Convert args to dict format."""
+    if getattr(args, 'dllm_enable_delayed_cache', False):
+        quant_policy = getattr(args, 'quant_policy', 0)
+        assert quant_policy in (0, None), \
+            '--dllm-enable-delayed-cache currently requires kv quantization to be disabled (quant-policy=0).'
+        sliding_window = getattr(args, 'sliding_window', None)
+        assert sliding_window in (None, -1), \
+            '--dllm-enable-delayed-cache requires sliding window attention to be disabled.'
+        learnable_sink = getattr(args, 'learnable_sink', False)
+        assert not learnable_sink, \
+            '--dllm-enable-delayed-cache is incompatible with learnable sink attention.'
     special_names = ['run', 'command']
     kwargs = {k[0]: k[1] for k in args._get_kwargs() if k[0] not in special_names}
     return kwargs
@@ -666,6 +676,14 @@ class ArgumentHelper:
                                    type=float,
                                    default=0.85,
                                    help='The confidence threshold for dllm.')
+
+    @staticmethod
+    def dllm_enable_delayed_cache(parser):
+        """Enable delayed cache for DLLM decoding."""
+        return parser.add_argument('--dllm-enable-delayed-cache',
+                                   action='store_true',
+                                   default=False,
+                                   help='Enable delayed KV-cache updates for DLLM diffusion decoding.')
 
 
 # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/utils/__init__.py

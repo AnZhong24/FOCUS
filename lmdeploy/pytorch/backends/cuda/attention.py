@@ -81,10 +81,11 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
         assert not (alibi and not causal)
 
         from lmdeploy.pytorch.kernels.cuda import (alibi_paged_attention_fwd, fill_kv_cache, flash_attention_fwd,
-                                                   flatten_kv_cache, paged_attention_fwd)
+                                                   flatten_kv_cache, paged_attention_fwd, paged_attention_sparse)
 
         self.fill_kv_cache = fill_kv_cache
         self.paged_attention_fwd = paged_attention_fwd
+        self.paged_attention_sparse = paged_attention_sparse
         self.alibi_paged_attention_fwd = alibi_paged_attention_fwd
         self.flatten_kv_cache = flatten_kv_cache
         self.flash_attention_fwd = flash_attention_fwd
@@ -118,8 +119,13 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
         kv_seqlens = attn_metadata.kv_seqlens
         kv_flatten_size = attn_metadata.kv_flatten_size
         quant_policy = attn_metadata.quant_policy
+        processing_indices = getattr(attn_metadata, 'processing_indices', None)
+        use_block_cache = getattr(attn_metadata, 'use_block_cache', False)
         if attn_metadata.is_decoding:
-            max_q_seqlen = self.block_sparse_size
+            if use_block_cache and q_seqlens.numel() > 0:
+                max_q_seqlen = int(q_seqlens.max().item())
+            else:
+                max_q_seqlen = self.block_sparse_size
         else:
             max_q_seqlen = query.numel() // (query.size(-1) * query.size(-2))
         fill_max_q_seqlen = max_q_seqlen
@@ -143,6 +149,7 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
                 k_scales_zeros=k_scales_zeros,
                 v_scales_zeros=v_scales_zeros,
                 quant_policy=quant_policy,
+                processing_indices=processing_indices if use_block_cache else None,
             )
 
         q_shape = query.shape
@@ -170,21 +177,36 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
             return attn_output
 
         if is_decoding:
-            self.paged_attention_fwd(
-                query,
-                k_cache,
-                v_cache,
-                attn_output,
-                block_offsets,
-                kv_seqlens=kv_seqlens,
-                k_scales_zeros=k_scales_zeros,
-                v_scales_zeros=v_scales_zeros,
-                quant_policy=quant_policy,
-                window_size=self.sliding_window,
-                sm_scale=self.scale,
-                logit_softcapping=self.logit_softcapping,
-                sinks=learnable_sink,
-            )
+            if use_block_cache:
+                self.paged_attention_sparse(
+                    query,
+                    k_cache,
+                    v_cache,
+                    attn_output,
+                    block_offsets,
+                    kv_seqlens=kv_seqlens,
+                    q_start_loc=q_start_loc,
+                    q_seqlens=q_seqlens,
+                    processing_indices=processing_indices,
+                    sm_scale=self.scale,
+                    logit_softcapping=self.logit_softcapping,
+                )
+            else:
+                self.paged_attention_fwd(
+                    query,
+                    k_cache,
+                    v_cache,
+                    attn_output,
+                    block_offsets,
+                    kv_seqlens=kv_seqlens,
+                    k_scales_zeros=k_scales_zeros,
+                    v_scales_zeros=v_scales_zeros,
+                    quant_policy=quant_policy,
+                    window_size=self.sliding_window,
+                    sm_scale=self.scale,
+                    logit_softcapping=self.logit_softcapping,
+                    sinks=learnable_sink,
+                )
         else:
             BLOCK_BS = k_cache.size(1)
             # pad one more block to avoid invalid kv visit

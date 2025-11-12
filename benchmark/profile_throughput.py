@@ -77,6 +77,53 @@ def sample_requests(
     return filtered_dataset
 
 
+def _subset_elapsed_time(sessions, start_ts, fallback):
+    """Estimate elapsed time for a subset of profiler sessions."""
+    if not sessions or start_ts is None:
+        return fallback
+    finish_ts = max((sess.ts[-1] for sess in sessions if sess.ts), default=None)
+    if finish_ts is None:
+        return fallback
+    elapsed = finish_ts - start_ts
+    return elapsed if elapsed > 0 else fallback
+
+
+def _summarize_profiler_slice(profiler: Profiler, sessions, title: str, hyperparams):
+    """Print profiler summary for the provided `sessions`."""
+    if not sessions:
+        return
+    partial_profiler = Profiler(profiler.stream_output, profiler.percentages)
+    partial_profiler.sessions = list(sessions)
+    partial_profiler.t_start = getattr(profiler, 't_start', None)
+    fallback_elapsed = getattr(profiler, 'elapsed_time', 0) or 1e-9
+    partial_profiler.elapsed_time = _subset_elapsed_time(partial_profiler.sessions,
+                                                         partial_profiler.t_start,
+                                                         fallback_elapsed)
+    partial_profiler.compute_metrics()
+    partial_profiler.summarize(title=title, hyperparams=hyperparams)
+
+
+def _full_batch_completion_target(total_prompts: int, concurrency: int) -> int:
+    """Return the number of completions that keep the system fully saturated."""
+    if total_prompts <= 0 or concurrency <= 0:
+        return 0
+    target = total_prompts - concurrency + 1
+    if target <= 0 or target >= total_prompts:
+        return 0
+    return target
+
+
+def _earliest_completed_sessions(profiler: Profiler, count: int):
+    """Pick the earliest `count` completed sessions based on finish timestamps."""
+    if count <= 0:
+        return []
+    completed = [sess for sess in profiler.sessions if sess.status == Session.SUCCESS and sess.ts]
+    if not completed:
+        return []
+    completed.sort(key=lambda sess: sess.ts[-1])
+    return completed[:min(count, len(completed))]
+
+
 class Engine:
 
     def __init__(self, model_path: str, engine_config: Union[PytorchEngineConfig, TurbomindEngineConfig]):
@@ -240,6 +287,7 @@ def parse_args():
     ArgumentHelper.dllm_unmasking_strategy(pt_group)
     ArgumentHelper.dllm_denoising_steps(pt_group)
     ArgumentHelper.dllm_confidence_threshold(pt_group)
+    ArgumentHelper.dllm_enable_delayed_cache(pt_group)
 
     tp_act = ArgumentHelper.tp(pt_group)
     cache_count_act = ArgumentHelper.cache_max_entry_count(pt_group)
@@ -301,6 +349,8 @@ def main():
             dllm_unmasking_strategy=args.dllm_unmasking_strategy,
             dllm_denoising_steps=args.dllm_denoising_steps,
             dllm_confidence_threshold=args.dllm_confidence_threshold,
+            dllm_enable_delayed_cache=args.dllm_enable_delayed_cache,
+            max_prefill_token_num=args.concurrency * args.dllm_block_length if args.dllm_block_length is not None else 4096,
         )
 
     if args.use_uvloop:
@@ -319,13 +369,14 @@ def main():
     stream_output = not args.no_stream_output
 
     profiler = Profiler(stream_output, [50, 75, 95, 99])
+    effective_concurrency = args.concurrency if args.concurrency < args.num_prompts else args.num_prompts
 
     engine.process_request(requests,
                            profiler,
                            temperature=args.temperature,
                            top_p=args.top_p,
                            top_k=args.top_k,
-                           concurrency=args.concurrency if args.concurrency < args.num_prompts else args.num_prompts,
+                           concurrency=effective_concurrency,
                            stream_output=not args.no_stream_output,
                            skip_tokenize=args.skip_tokenize,
                            skip_detokenize=args.skip_detokenize,
@@ -339,6 +390,16 @@ def main():
                    ('Skip tokenize', str(args.skip_tokenize).lower()),
                    ('Skip detokenize', str(args.skip_detokenize).lower()),
                    ('Chat template', chat_template_name)]
+    total_requests = len(requests)
+    completion_target = _full_batch_completion_target(total_requests, effective_concurrency)
+    subset_sessions = _earliest_completed_sessions(profiler, completion_target)
+    if subset_sessions:
+        partial_hyperparams = hyperparams + [('Prompts covered', len(subset_sessions))]
+        _summarize_profiler_slice(profiler,
+                                  sessions=subset_sessions,
+                                  title='Profile LLM Throughput (Full Batches)',
+                                  hyperparams=partial_hyperparams)
+
     profiler.compute_metrics()
     profiler.summarize(title='Profile LLM Throughput', hyperparams=hyperparams)
     if args.csv:

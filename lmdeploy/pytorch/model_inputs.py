@@ -145,6 +145,8 @@ class ModelInputs:
     dp_meta: 'DPMeta' = None
     enable_microbatch: bool = False
     state_offsets: torch.LongTensor = None
+    processing_indices: torch.LongTensor = None
+    processing_q_lens: torch.LongTensor = None
 
     def step(self, input_ids: torch.LongTensor, step_seqlens: torch.Tensor = None):
         """Update input ids."""
@@ -157,6 +159,8 @@ class ModelInputs:
         if input_ids.dim() == 1:
             input_ids = input_ids[None, :]
         self.input_ids = input_ids
+        self.processing_indices = None
+        self.processing_q_lens = None
         return self
 
     def split(self, split_size: int):
@@ -327,6 +331,8 @@ class StepContext:
     # states for ssm
     state_caches: List = None
     state_offsets: torch.LongTensor = None
+    processing_indices: torch.LongTensor = None
+    use_block_cache: bool = False
 
     _outputs: Dict = field(default_factory=dict)
 
@@ -345,8 +351,12 @@ class StepContext:
             inputs (ModelInputs): packaged model inputs.
             device (str): The device of the tensors.
         """
-        q_seqlens = inputs.seq_length
+        seq_length_full = inputs.seq_length
         history_seqlens = inputs.history_lengths
+        processing_indices = inputs.processing_indices
+        processing_q_lens = inputs.processing_q_lens
+        use_block_cache = bool(inputs.is_decoding and processing_indices is not None and processing_q_lens is not None)
+        q_seqlens = seq_length_full
 
         input_multimodals = None
         if inputs.vision_inputs is not None:
@@ -359,9 +369,49 @@ class StepContext:
                 inputs.vision_inputs.get_inputs(history_seqlens, q_seqlens)
 
         # position ids
-        attention_mask, position_ids = cls.get_mask_and_position_ids(inputs)
-        position_ids = position_ids[None]  # [num_tokens] -> [1, num_tokens]
+        attention_mask_full, position_ids_flat = cls.get_mask_and_position_ids(inputs)
+
+        def _gather_flat_tensor(tensor: torch.Tensor, full_lengths: torch.Tensor, gathered_lengths: torch.Tensor,
+                                 gathered_indices: torch.Tensor):
+            if gathered_lengths.numel() == 0:
+                new_shape = list(tensor.shape)
+                new_shape[-1] = 0
+                return tensor.new_empty(new_shape)
+            offsets = torch.cumsum(full_lengths, dim=0) - full_lengths
+            parts = []
+            ptr = 0
+            gathered_indices = gathered_indices.to(tensor.device)
+            for seq_idx, offset in enumerate(offsets.tolist()):
+                block_len = int(full_lengths[seq_idx].item())
+                cur_len = int(gathered_lengths[seq_idx].item())
+                if cur_len == 0:
+                    continue
+                slice_tensor = tensor.narrow(-1, offset, block_len)
+                idx_slice = gathered_indices[ptr:ptr + cur_len]
+                ptr += cur_len
+                parts.append(slice_tensor.index_select(-1, idx_slice))
+            if len(parts) == 0:
+                new_shape = list(tensor.shape)
+                new_shape[-1] = 0
+                return tensor.new_empty(new_shape)
+            return torch.cat(parts, dim=-1)
+
+        if use_block_cache:
+            q_seqlens = processing_q_lens.to(device=seq_length_full.device, dtype=seq_length_full.dtype)
+            proc_tensor = processing_indices.to(seq_length_full.device)
+            input_ids_tensor = _gather_flat_tensor(inputs.input_ids, seq_length_full, q_seqlens, proc_tensor)
+            position_ids_flat = _gather_flat_tensor(position_ids_flat.unsqueeze(0), seq_length_full,
+                                                    q_seqlens, proc_tensor).squeeze(0)
+            if attention_mask_full is not None:
+                attention_mask = _gather_flat_tensor(attention_mask_full.reshape(1, -1), seq_length_full,
+                                                     q_seqlens, proc_tensor)
+            else:
+                attention_mask = None
+        else:
+            input_ids_tensor = inputs.input_ids
+            attention_mask = attention_mask_full
         q_start_loc = q_seqlens.cumsum(0) - q_seqlens
+        position_ids = position_ids_flat[None]
 
         # cross
         cross_seqlens = inputs.cross_length
@@ -370,11 +420,30 @@ class StepContext:
             cross_kv_seqlens = (inputs.cross_length + inputs.history_cross_length)
 
         # seq_len + history_length
-        kv_seqlens = q_seqlens + history_seqlens
+        processing_tensor = None
+        if use_block_cache:
+            ptr = 0
+            device = history_seqlens.device
+            dtype = history_seqlens.dtype
+            rightmost = []
+            for length in q_seqlens.tolist():
+                length = int(length)
+                if length == 0:
+                    rightmost.append(torch.zeros((), device=device, dtype=dtype))
+                    continue
+                idx_slice = proc_tensor[ptr:ptr + length]
+                ptr += length
+                rightmost.append((idx_slice.max() + 1).to(dtype=dtype))
+            rightmost_plus_one = torch.stack(rightmost) if len(rightmost) > 0 else history_seqlens.new_zeros(
+                history_seqlens.size(0))
+            kv_seqlens = history_seqlens + rightmost_plus_one
+            processing_tensor = proc_tensor
+        else:
+            kv_seqlens = q_seqlens + history_seqlens
         kv_seqlens -= inputs.num_ignored_history
 
         ret = StepContext(
-            input_ids=inputs.input_ids,
+            input_ids=input_ids_tensor,
             model_config=model_config,
             block_offsets=inputs.block_offsets,
             position_ids=position_ids,
@@ -398,6 +467,8 @@ class StepContext:
             enable_microbatch=inputs.enable_microbatch,
             state_caches=state_caches,
             state_offsets=inputs.state_offsets,
+            use_block_cache=use_block_cache,
+            processing_indices=processing_tensor,
         )
 
         ret = get_backend().update_step_context(ret)

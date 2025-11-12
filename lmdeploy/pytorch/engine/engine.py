@@ -747,7 +747,6 @@ class Engine(EngineBase):
         # history lengths
         history_lengths = torch.tensor([msg.num_history_ids for msg in messages])
 
-        # input ids
         token_ids = [msg.token_ids for msg in messages]
         input_ids = torch.as_tensor(np.concatenate(token_ids))[None]
 
@@ -758,8 +757,34 @@ class Engine(EngineBase):
             seq_length = torch.tensor(seq_length, dtype=torch.long)
             max_q_seqlen = seq_length.max().item()
         else:
-            max_q_seqlen = len(token_ids[0])
+            max_q_seqlen = len(token_ids[0]) if token_ids else 0
             seq_length = torch.full((batch_size, ), max_q_seqlen, dtype=torch.long)
+
+        processing_indices = None
+        processing_q_lens = None
+        dllm_cfg = getattr(self.misc_config, 'dllm_config', None)
+        enable_delayed = bool(dllm_cfg and dllm_cfg.enable_delayed_cache and is_decoding)
+        if enable_delayed:
+            proc_lists = []
+            proc_lengths = []
+            for msg in messages:
+                getter = getattr(msg, 'get_processing_indices', None)
+                indices = getter() if getter is not None else None
+                if indices is None:
+                    proc_lists = []
+                    break
+                indices = np.asarray(indices, dtype=np.int64)
+                proc_lists.append(indices)
+                proc_lengths.append(indices.shape[0])
+            if len(proc_lists) == len(messages) and len(proc_lists) > 0:
+                flat_indices = np.concatenate(proc_lists) if proc_lists else np.empty((0, ), dtype=np.int64)
+                if flat_indices.size > 0:
+                    processing_indices = torch.as_tensor(flat_indices, dtype=torch.long)
+                    processing_q_lens = torch.as_tensor(proc_lengths, dtype=torch.long)
+                else:
+                    processing_indices = None
+                    processing_q_lens = None
+
         kv_seqlens = seq_length + history_lengths
         max_kv_seqlen = kv_seqlens.max().item()
         sum_kv_seqlen = kv_seqlens.sum().item()
@@ -787,6 +812,9 @@ class Engine(EngineBase):
             sum_kv_seqlen=sum_kv_seqlen,
             model_metas=model_metas,
         )
+        if processing_indices is not None:
+            model_inputs.processing_indices = processing_indices
+            model_inputs.processing_q_lens = processing_q_lens
 
         # adapters
         local_adapter_ids = None

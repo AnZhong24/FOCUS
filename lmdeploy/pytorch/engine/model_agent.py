@@ -434,9 +434,17 @@ class BaseModelAgent:
     def _postprocess_forward_output(self, output: dict, inputs: ModelInputs):
         """Post process forward output."""
         hidden_states = output['hidden_states']
-        seq_length = output.get('seq_length', inputs.seq_length)
-        hidden_states = self._slice_outs(hidden_states[0], seq_length)[None]
-        output['hidden_states'] = hidden_states
+        use_block_cache = bool(inputs.processing_indices is not None and inputs.processing_q_lens is not None)
+        seq_length = output.get('seq_length')
+        hidden_tensor = hidden_states[0]
+        if use_block_cache:
+            output['seq_length'] = inputs.seq_length
+            output['hidden_states'] = hidden_states
+            return output
+        seq_length = seq_length if seq_length is not None else inputs.seq_length
+        sliced = self._slice_outs(hidden_tensor, seq_length)[None]
+        output['hidden_states'] = sliced
+        output['seq_length'] = seq_length
         return output
 
     async def _async_model_forward(
@@ -544,6 +552,7 @@ class BaseModelAgent:
 
         hidden_states = ret.pop('hidden_states')
         logits = self.get_logits(hidden_states)
+        logits = self.agent_strategy.reshape_logits(logits, origin_inputs)
         ret['logits'] = logits
         return ret
 
