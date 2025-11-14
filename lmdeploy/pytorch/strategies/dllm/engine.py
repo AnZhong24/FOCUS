@@ -12,10 +12,15 @@ logger = get_logger('lmdeploy')
 class DLLMEngineStrategy(EngineStrategy):
     """DLLM Engine Strategy."""
 
-    def __init__(self, scheduler_config: SchedulerConfig, cache_config: CacheConfig, dllm_block_length: int) -> None:
+    def __init__(self,
+                 scheduler_config: SchedulerConfig,
+                 cache_config: CacheConfig,
+                 dllm_block_length: int,
+                 enable_delayed_cache: bool = False) -> None:
         self.scheduler_config = scheduler_config
         self.cache_config = cache_config
         self.dllm_block_length = dllm_block_length
+        self.enable_delayed_cache = enable_delayed_cache
 
         self._check()
 
@@ -42,6 +47,8 @@ class DLLMEngineStrategy(EngineStrategy):
     def get_num_loops(self, is_decoding: bool) -> int:
         """Get num_loops."""
         if not is_decoding:
+            return 1
+        if self.enable_delayed_cache:
             return 1
         block_size = self.cache_config.block_size
         dllm_block_length = self.dllm_block_length

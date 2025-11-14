@@ -138,6 +138,11 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
         # ascending, so keep using np.nonzero() without extra shuffling.
         return None if indices is None else indices.copy()
 
+    # def get_uncached_bitmap(self) -> Optional[np.ndarray]:
+    #     if not self.delayed_cache_enabled:
+    #         return None
+    #     return self._delayed_cache_state.uncached_positions.copy()
+
     def set_stop_pos(self, pos: int):
         dllm_block_length = self.dllm_block_length
         val = dllm_block_length - pos - 1
