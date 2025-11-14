@@ -34,6 +34,7 @@ class DelayedCacheState:
     block_length: int
     uncached_positions: np.ndarray
     last_indices: np.ndarray | None = None
+    needs_warmup: bool = True
 
     @classmethod
     def new(cls, block_length: int):
@@ -43,6 +44,7 @@ class DelayedCacheState:
     def reset(self):
         self.uncached_positions[:] = True
         self.last_indices = None
+        self.needs_warmup = True
 
     def mark_cached(self, ready_mask: np.ndarray):
         if ready_mask is None:
@@ -62,10 +64,14 @@ class DelayedCacheState:
     def get_processing_indices(self):
         if self.last_indices is not None:
             return self.last_indices
-        indices = np.nonzero(self.uncached_positions)[0]
+        if self.needs_warmup:
+            indices = np.arange(self.block_length, dtype=np.int64)
+        else:
+            indices = np.nonzero(self.uncached_positions)[0]
         if indices.size == 0:
             indices = np.arange(self.block_length, dtype=np.int64)
         self.last_indices = indices.astype(np.int64, copy=False)
+        self.needs_warmup = False
         return self.last_indices
 
 
@@ -127,8 +133,6 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
         if mask.size == 0:
             return
         self._delayed_cache_state.update_from_mask(mask)
-        if np.all(mask == DLLM_CACHED):
-            self._reset_delayed_cache_state()
 
     def get_processing_indices(self) -> Optional[np.ndarray]:
         if not self.delayed_cache_enabled:
@@ -319,7 +323,7 @@ class DLLMSequenceStrategy(SequenceStrategy):
 
             # fill token
             msg.update_token_ids(token, dllm_mask=mask, model_meta=model_meta, mode=update_mode)
-            if self.enable_delayed_cache:
+            if self.enable_delayed_cache and is_decoding:
                 msg._update_delayed_cache_state()
             if stop:
                 msg.set_stop_pos(stop_pos[idx])

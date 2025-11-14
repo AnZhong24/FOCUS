@@ -444,6 +444,7 @@ class StepContext:
         kv_seqlens -= inputs.num_ignored_history
 
         # if inputs.is_decoding:
+        #     print("In StepContext.new(), processing_tensor", processing_tensor)
         #     print("In StepContext.new(), input_ids_tensor.shape", input_ids_tensor.shape)
         #     print("In StepContext.new(), batch_size", q_seqlens.shape[0])
         ret = StepContext(
