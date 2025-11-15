@@ -322,7 +322,8 @@ class DLLMSequenceStrategy(SequenceStrategy):
                 continue
 
             if self.enable_delayed_cache and is_decoding:
-                # Update delayed-cache metadata based on the mask state before unmasking
+                # Update delayed cache state using the pre-unmask mask so each
+                # newly unmasked token is processed at least once more.
                 msg._update_delayed_cache_state()
             # fill token
             msg.update_token_ids(token, dllm_mask=mask, model_meta=model_meta, mode=update_mode)

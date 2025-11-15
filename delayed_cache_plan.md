@@ -25,8 +25,9 @@
    - Thread these values through scheduler / engine configs so downstream components can check the flag without ad-hoc environment reads.
 
 2. **Sequence State Enhancements**
-   - Update `SchedulerSequenceDLLM` in `sequence.py` to track per-block delayed-cache metadata (`uncached_positions`, `processing_indices`) alongside existing DLLM masks.
-   - Add helpers to reset/apply these masks each denoising step and ensure they are serialised/deserialised consistently (numpy ↔ torch).
+- Update `SchedulerSequenceDLLM` in `sequence.py` to track per-block delayed-cache metadata (`uncached_positions`, `processing_indices`) alongside existing DLLM masks.
+- When advancing decode steps (`DLLMSequenceStrategy.update_running`), snapshot the delayed-cache metadata **before** applying mask updates so any freshly unmasked tokens are queued for at least one more pass; this mirrors HF’s behaviour where blocks must process the newly exposed logits prior to being considered cached.
+- Add helpers to reset/apply these masks each denoising step and ensure they are serialised/deserialised consistently (numpy ↔ torch).
    - Mirror the HF rule: mark a position as “cached” (stable) once both the token and its immediate right neighbour are unmasked. It's checked after each model forward (see `uncached_positions` update in `focus_generate.py`).
    - When delayed cache is enabled, compute per-sequence lengths (=len(indices)) that double as the ragged `q_seqlens`, and pack all indices into the single flattened `processing_indices` tensor whose layout matches the flattened query tensor (use `q_start_loc` to recover the per-sequence slice).
    - When delayed cache is disabled, skip building any `processing_indices` buffers and simply re-use the existing `q_seqlens = block_len` contract so we can call the legacy kernels unchanged.
