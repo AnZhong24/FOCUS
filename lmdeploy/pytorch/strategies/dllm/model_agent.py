@@ -153,50 +153,6 @@ class DLLMModelAgentStrategy(ModelAgentStrategy):
         full_logits[batch_indices, proc_indices] = assign_logits
         return full_logits.view(-1, vocab_size)
 
-    # def _build_processing_from_bitmap(self, bitmap: torch.BoolTensor):
-    #     batch_size, block_size = bitmap.shape
-    #     device = bitmap.device
-    #     row_counts = torch.sum(bitmap, dim=1, dtype=torch.long)
-    #     has_entries = row_counts > 0
-    #     processing_q_lens = torch.where(has_entries, row_counts,
-    #                                     row_counts.new_full((batch_size, ), block_size))
-
-    #     positions = torch.nonzero(bitmap, as_tuple=False)
-    #     empty_rows = torch.nonzero(~has_entries, as_tuple=False).flatten()
-    #     if empty_rows.numel() > 0:
-    #         cols = torch.arange(block_size, device=device, dtype=torch.long)
-    #         cols = cols.repeat(empty_rows.numel())
-    #         rows = empty_rows.repeat_interleave(block_size)
-    #         extra = torch.stack([rows, cols], dim=1)
-    #         positions = extra if positions.numel() == 0 else torch.cat([positions, extra], dim=0)
-
-    #     if positions.numel() == 0:
-    #         # happens only when batch_size == 0
-    #         processing_indices = torch.empty(0, dtype=torch.long, device=device)
-    #     else:
-    #         order = positions[:, 0] * block_size + positions[:, 1]
-    #         perm = torch.argsort(order)
-    #         processing_indices = positions[perm, 1]
-
-    #     return processing_indices, processing_q_lens
-
-    # def _refresh_processing_metadata(self, inputs: ModelInputs, dllm_mask: torch.Tensor,
-    #                                  step_seqlens: Optional[torch.Tensor]):
-    #     pending = inputs.delayed_cache_uncached
-    #     batch_size, block_size = pending.shape
-    #     mask = dllm_mask.view(batch_size, block_size).to(pending.device)
-    #     non_masked = mask != consts.DLLM_MASKED
-    #     right_neighbor = torch.roll(non_masked, shifts=-1, dims=1)
-    #     right_neighbor[:, -1] = True
-    #     ready = non_masked & right_neighbor
-    #     pending &= ~ready
-    #     if step_seqlens is not None:
-    #         step_mask = step_seqlens.to(pending.device).view(-1) > 0
-    #         if step_mask.any():
-    #             pending[step_mask] = True
-    #     processing_indices, processing_q_lens = self._build_processing_from_bitmap(pending)
-    #     inputs.processing_indices = processing_indices
-    #     inputs.processing_q_lens = processing_q_lens
 
     def reshape_logits(self, logits: torch.Tensor, inputs: ModelInputs) -> torch.Tensor:
         if not self._use_delayed_cache(inputs):
@@ -296,8 +252,6 @@ class DLLMModelAgentStrategy(ModelAgentStrategy):
 
         next_token_ids, dllm_mask, step_seqlens = self._update_dllm(next_token_ids, dllm_mask, model_inputs.seq_length)
         model_inputs.step(next_token_ids, step_seqlens)
-        # if model_inputs.delayed_cache_uncached is not None:
-        #     self._refresh_processing_metadata(model_inputs, dllm_mask, step_seqlens)
         self._step_sampling_inputs(sampling_inputs, next_token_ids, dllm_mask=dllm_mask)
 
         extra_inputs = DLLMExtraInputs(dllm_mask=dllm_mask)

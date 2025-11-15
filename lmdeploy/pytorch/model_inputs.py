@@ -147,7 +147,6 @@ class ModelInputs:
     state_offsets: torch.LongTensor = None
     processing_indices: torch.LongTensor = None
     processing_q_lens: torch.LongTensor = None
-    # delayed_cache_uncached: torch.BoolTensor = None
 
     def step(self, input_ids: torch.LongTensor, step_seqlens: torch.Tensor = None):
         """Update input ids."""

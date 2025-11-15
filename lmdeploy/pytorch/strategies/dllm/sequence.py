@@ -321,10 +321,11 @@ class DLLMSequenceStrategy(SequenceStrategy):
             if msg.status != MessageStatus.LOCKED:
                 continue
 
+            if self.enable_delayed_cache and is_decoding:
+                # Update delayed-cache metadata based on the mask state before unmasking
+                msg._update_delayed_cache_state()
             # fill token
             msg.update_token_ids(token, dllm_mask=mask, model_meta=model_meta, mode=update_mode)
-            if self.enable_delayed_cache and is_decoding:
-                msg._update_delayed_cache_state()
             if stop:
                 msg.set_stop_pos(stop_pos[idx])
                 msg.status = MessageStatus.TO_BE_MIGRATED if msg.preserve_cache else MessageStatus.STOPPED

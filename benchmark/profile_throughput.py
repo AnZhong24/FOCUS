@@ -161,8 +161,8 @@ class Engine:
             if skip_tokenize:
                 input_ids = prompt
             else:
-                # print("Prompt:")
-                # print(prompt)
+                print("Prompt:")
+                print(prompt)
                 input_ids = self.tokenizer(prompt).input_ids
 
             state = DetokenizeState(len(input_ids))
@@ -185,13 +185,13 @@ class Engine:
                     n_token += len(outputs.token_ids)
                     token_ids += outputs.token_ids
                     if not skip_detokenize:
-                        _, state = self.tokenizer.detokenize_incrementally(token_ids, state)
-                        # text, state = self.tokenizer.detokenize_incrementally(token_ids, state)
-                        # print(text, end='')
+                        # _, state = self.tokenizer.detokenize_incrementally(token_ids, state)
+                        text, state = self.tokenizer.detokenize_incrementally(token_ids, state)
+                        print(text, end='')
                     sess.tick(n_token)
                     # No need to check for cancel_after since we're generating until EOS
                 sess.finish(Session.SUCCESS)
-                # print()
+                print()
             finally:
                 await generator.aclose()
 
