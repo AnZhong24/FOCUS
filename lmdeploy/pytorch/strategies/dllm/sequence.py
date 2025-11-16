@@ -33,7 +33,6 @@ class HistoryDLLMMask(HistoryTokenIds):
 class DelayedCacheState:
     block_length: int
     uncached_positions: np.ndarray
-    last_indices: np.ndarray | None = None
     needs_warmup: bool = True
 
     @classmethod
@@ -43,14 +42,12 @@ class DelayedCacheState:
 
     def reset(self):
         self.uncached_positions[:] = True
-        self.last_indices = None
         self.needs_warmup = True
 
     def mark_cached(self, ready_mask: np.ndarray):
         if ready_mask is None:
             return
         self.uncached_positions &= ~ready_mask
-        self.last_indices = None
 
     def update_from_mask(self, dllm_mask: np.ndarray):
         if dllm_mask is None or dllm_mask.size == 0:
@@ -62,17 +59,14 @@ class DelayedCacheState:
         self.mark_cached(ready)
 
     def get_processing_indices(self):
-        if self.last_indices is not None:
-            return self.last_indices
         if self.needs_warmup:
             indices = np.arange(self.block_length, dtype=np.int64)
         else:
             indices = np.nonzero(self.uncached_positions)[0]
         if indices.size == 0:
             indices = np.arange(self.block_length, dtype=np.int64)
-        self.last_indices = indices.astype(np.int64, copy=False)
         self.needs_warmup = False
-        return self.last_indices
+        return indices
 
 
 @dataclass
