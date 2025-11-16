@@ -1040,22 +1040,16 @@ def paged_attention_sparse(
         1,
     )
 
-    block_offsets = block_offsets.contiguous()
-    kv_seqlens_i32 = kv_seqlens.to(torch.int32).contiguous()
-    q_start_loc_i32 = q_start_loc.to(torch.int32).contiguous()
-    q_seqlens_i32 = q_seqlens_i32.contiguous()
-    processing_i32 = processing_indices.to(torch.int32).contiguous()
-
     _fwd_grouped_split_sparse_kernel[grid](
         q,
         k,
         v,
         sm_scale,
-        kv_seqlens_i32,
+        kv_seqlens,
         block_offsets,
-        q_start_loc_i32,
-        q_seqlens_i32,
-        processing_i32,
+        q_start_loc,
+        q_seqlens,
+        processing_indices,
         acc,
         tile_to_batch,
         tile_to_subtile,

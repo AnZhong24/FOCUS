@@ -393,11 +393,7 @@ def fill_kv_cache(k_states: Tensor,
     BLOCK_DV = triton.next_power_of_2(head_dim_v)
     if k_caches.data_ptr() == v_caches.data_ptr() and head_dim_v <= head_dim:
         BLOCK_DV = 0
-    if processing_indices is not None and processing_indices.numel() > 0:
-        processing_indices = processing_indices.to(torch.int32).contiguous()
-        q_start_loc_i32 = q_start_loc.to(torch.int32).contiguous()
-        q_seq_length_i32 = q_seq_length.to(torch.int32).contiguous()
-        kv_seq_length_i32 = kv_seq_length.to(torch.int32).contiguous()
+    if processing_indices is not None:
         grid = (num_heads, batch_size)
         _fill_kv_cache_sparse_kernel[grid](
             k_states,
@@ -405,9 +401,9 @@ def fill_kv_cache(k_states: Tensor,
             k_caches,
             v_caches,
             processing_indices,
-            q_start_loc_i32,
-            q_seq_length_i32,
-            kv_seq_length_i32,
+            q_start_loc,
+            q_seq_length,
+            kv_seq_length,
             block_offsets,
             head_dim=head_dim,
             head_dim_v=head_dim_v,
