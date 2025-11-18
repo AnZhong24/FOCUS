@@ -243,6 +243,60 @@ def delayed_sparse_inputs():
     }
 
 
+@pytest.fixture
+def dense_paged_attention_inputs():
+    torch.manual_seed(7)
+    device = 'cuda'
+    dtype = torch.float16
+    block_size = 16
+    seq_len = block_size
+    num_heads_q = 8
+    num_heads_k = 4
+    head_dim = 64
+    head_dim_v = 80
+
+    history_lens = torch.tensor([0, block_size // 2, block_size * 2], device=device, dtype=torch.long)
+    batch_size = history_lens.numel()
+    kv_seqlens = history_lens + seq_len
+
+    block_q = torch.randn(batch_size, seq_len, num_heads_q, head_dim, dtype=dtype, device=device)
+    q = block_q.reshape(batch_size * seq_len, num_heads_q, head_dim).contiguous()
+
+    k_full = [torch.randn(int(kv_len.item()), num_heads_k, head_dim, dtype=dtype, device=device)
+              for kv_len in kv_seqlens]
+    v_full = [torch.randn(int(kv_len.item()), num_heads_k, head_dim_v, dtype=dtype, device=device)
+              for kv_len in kv_seqlens]
+
+    num_blocks_per_seq = [_div_up(int(kv_len.item()), block_size) for kv_len in kv_seqlens]
+    block_offsets = _make_block_offsets(num_blocks_per_seq, batch_size, device)
+    max_blocks = block_offsets.size(1)
+    k_cache = torch.zeros(batch_size * max_blocks, block_size, num_heads_k, head_dim, dtype=dtype, device=device)
+    v_cache = torch.zeros(batch_size * max_blocks, block_size, num_heads_k, head_dim_v, dtype=dtype, device=device)
+    _scatter_history_cache(k_cache, k_full, block_offsets, block_size)
+    _scatter_history_cache(v_cache, v_full, block_offsets, block_size)
+
+    q_seqlens = torch.full((batch_size, ), seq_len, device=device, dtype=torch.long)
+    q_start_loc = q_seqlens.cumsum(0) - q_seqlens
+    block_indices = torch.arange(seq_len, device=device, dtype=torch.long)
+    processing_indices = torch.empty((q.size(0), ), device=device, dtype=torch.long)
+    for b in range(batch_size):
+        start = int(q_start_loc[b].item())
+        processing_indices[start:start + seq_len] = block_indices
+    processing_indices = processing_indices.contiguous()
+
+    return {
+        'q': q,
+        'k_cache': k_cache,
+        'v_cache': v_cache,
+        'kv_seqlens': kv_seqlens,
+        'block_offsets': block_offsets,
+        'q_seqlens': q_seqlens,
+        'q_start_loc': q_start_loc,
+        'processing_indices': processing_indices,
+        'head_dim_v': head_dim_v,
+    }
+
+
 class TestDelayedCacheSparseKernels:
 
     def test_fill_kv_cache_sparse_scatter(self, delayed_sparse_inputs):
@@ -297,3 +351,28 @@ class TestDelayedCacheSparseKernels:
                                                data['kv_seqlens'], data['q_seqlens'], data['processing_list'],
                                                data['history_lens'], data['block_size'])
         torch.testing.assert_close(out, expected, atol=3e-3, rtol=3e-3)
+
+    def test_sparse_kernel_matches_dense_kernel(self, dense_paged_attention_inputs):
+        from lmdeploy.pytorch.kernels.cuda import paged_attention_dense, paged_attention_sparse
+
+        data = dense_paged_attention_inputs
+        q = data['q']
+        out_dense = torch.empty(q.size(0), q.size(1), data['head_dim_v'], dtype=q.dtype, device=q.device)
+        paged_attention_dense(q,
+                            data['k_cache'],
+                            data['v_cache'],
+                            out_dense,
+                            block_offsets=data['block_offsets'],
+                            kv_seqlens=data['kv_seqlens'])
+
+        out_sparse = torch.empty_like(out_dense)
+        paged_attention_sparse(q,
+                               data['k_cache'],
+                               data['v_cache'],
+                               out_sparse,
+                               block_offsets=data['block_offsets'],
+                               kv_seqlens=data['kv_seqlens'],
+                               q_start_loc=data['q_start_loc'],
+                               q_seqlens=data['q_seqlens'],
+                               processing_indices=data['processing_indices'])
+        torch.testing.assert_close(out_sparse, out_dense, atol=3e-3, rtol=3e-3)

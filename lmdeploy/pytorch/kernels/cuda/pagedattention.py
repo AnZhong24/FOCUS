@@ -934,6 +934,233 @@ def paged_attention_fwd(
                                num_stages=1)
 
 
+def paged_attention_dense(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    o: Tensor,
+    block_offsets: Tensor,
+    kv_seqlens: Tensor,
+    k_scales_zeros: Tensor = None,
+    v_scales_zeros: Tensor = None,
+    quant_policy: Literal[0, 4, 8] = 0,
+    window_size: int = None,
+    sm_scale: float = None,
+    logit_softcapping: float = None,
+    sinks: Tensor = None,
+    kv_layout: str = 'bshd',
+):
+    """Paged Attention forward.
+
+    Args:
+        q (Tensor): Query state.
+        k (Tensor): Key state caches.
+        v (Tensor): Value state caches.
+        o (Tensor): Output state.
+        block_offsets (Tensor): The block offset of key and value.
+        q_start_loc (Tensor): Start token location of each data in batch.
+        kv_seqlens (Tensor): Key/Value length for each data in batch.
+        max_seqlen (int): The max input length.
+        BLOCK (int): The kernel block size.
+    """
+
+    global _nv_cap
+    if _nv_cap is None:
+        _nv_cap = torch.cuda.get_device_capability()
+
+    if kv_layout == 'bshd':
+        b_dim, s_dim, h_dim, d_dim = (0, 1, 2, 3)
+    elif kv_layout == 'bhsd':
+        b_dim, s_dim, h_dim, d_dim = (0, 2, 1, 3)
+    else:
+        raise RuntimeError('Unsupported layout.')
+
+    if window_size is None:
+        window_size = -1
+
+    if logit_softcapping is None:
+        logit_softcapping = -1.0
+
+    shared_kv = k.data_ptr() == v.data_ptr()
+
+    def _get_block_d(Lk):
+        """Get block d."""
+        BLOCK_DMODEL = triton.next_power_of_2(Lk)
+        BLOCK_DMODEL1 = 0
+        if BLOCK_DMODEL != Lk:
+            BLOCK_DMODEL = BLOCK_DMODEL // 2
+            BLOCK_DMODEL1 = max(16, triton.next_power_of_2(Lk - BLOCK_DMODEL))
+        BLOCK_DV = triton.next_power_of_2(Lv)
+        return BLOCK_DMODEL, BLOCK_DMODEL1, BLOCK_DV
+
+    # shape constraints
+    Lq, Lk, Lv = q.shape[-1], k.shape[d_dim], v.shape[d_dim]
+    if quant_policy == 4:
+        assert Lq == Lk * 2 and Lv * 2 == o.shape[-1]
+    else:
+        assert Lq == Lk and Lv == o.shape[-1]
+
+    if sm_scale is None:
+        sm_scale = 1.0 / (Lq**0.5)
+    batch, head = kv_seqlens.shape[0], q.shape[-2]
+    num_tokens = q.shape[-3]
+    num_kv_heads = k.shape[h_dim]
+    kv_group_num = head // num_kv_heads
+
+    if sinks is not None:
+        assert sinks.is_contiguous()
+        assert sinks.numel() == head
+
+    BLOCK = k.size(s_dim)
+    assert BLOCK >= 16
+    if Lq > 512 and BLOCK > 32:
+        logger.warning(f'`head_dim={Lq}` and `block_size={BLOCK}` '
+                       'might leads to bad performance. '
+                       'Please reduce `block_size`.')
+
+    valid = num_tokens % batch == 0
+    assert valid, 'we only support decoding paged attention.'
+    seq_len = num_tokens // batch
+
+    BLOCK_DMODEL, BLOCK_DMODEL1, BLOCK_DV = _get_block_d(Lq)
+    HEADS_PER_REQ = kv_group_num * seq_len
+    BLOCK_H = max(16, min(BLOCK, triton.next_power_of_2(HEADS_PER_REQ)))
+    TILES_PER_GROUP = triton.cdiv(HEADS_PER_REQ, BLOCK_H)
+    grid_1 = TILES_PER_GROUP * num_kv_heads
+
+    if _nv_cap[0] < 8:
+        num_warps, num_stages = _kernel_meta_default(BLOCK_DMODEL, BLOCK_H)
+    elif _nv_cap[0] < 9:
+        num_warps, num_stages = _kernel_meta_sm8x(BLOCK_DMODEL, BLOCK_H)
+    else:
+        num_warps, num_stages = _kernel_meta_sm9x(BLOCK_DMODEL, BLOCK_H)
+
+    SPLIT_K = _get_split_k(q.device.index, grid_1, batch, num_warps)
+
+    if quant_policy != 4:
+        acc = q.new_empty(num_tokens, head, SPLIT_K, Lv + 2, dtype=torch.float32)
+    else:
+        acc = q.new_empty(num_tokens, head, SPLIT_K, o.shape[-1] + 2, dtype=torch.float32)
+
+    grid = (
+        grid_1,
+        SPLIT_K,
+        batch,
+    )
+
+    if quant_policy > 0:
+        _fwd_grouped_split_quant_kernel[grid](q,
+                                              k,
+                                              v,
+                                              k_scales_zeros,
+                                              v_scales_zeros,
+                                              sm_scale,
+                                              kv_seqlens,
+                                              block_offsets,
+                                              acc,
+                                              stride_qbs=q.stride(-3),
+                                              stride_qh=q.stride(-2),
+                                              stride_qd=q.stride(-1),
+                                              stride_kp=k.stride(b_dim),
+                                              stride_kbs=k.stride(s_dim),
+                                              stride_kh=k.stride(h_dim),
+                                              stride_kd=k.stride(d_dim),
+                                              stride_vp=v.stride(b_dim),
+                                              stride_vbs=v.stride(s_dim),
+                                              stride_vh=v.stride(h_dim),
+                                              stride_vd=v.stride(d_dim),
+                                              stride_kszp=k_scales_zeros.stride(b_dim),
+                                              stride_kszbs=k_scales_zeros.stride(s_dim),
+                                              stride_kszh=k_scales_zeros.stride(h_dim),
+                                              stride_kszd=k_scales_zeros.stride(d_dim),
+                                              stride_vszp=v_scales_zeros.stride(b_dim),
+                                              stride_vszbs=v_scales_zeros.stride(s_dim),
+                                              stride_vszh=v_scales_zeros.stride(h_dim),
+                                              stride_vszd=v_scales_zeros.stride(d_dim),
+                                              quant_policy=quant_policy,
+                                              stride_ok=acc.stride(-2),
+                                              stride_obs=acc.stride(-4),
+                                              stride_oh=acc.stride(-3),
+                                              stride_od=acc.stride(-1),
+                                              stride_boffb=block_offsets.stride(0),
+                                              kv_group_num=kv_group_num,
+                                              window_size=window_size,
+                                              head_size=Lq,
+                                              head_size_v=Lv,
+                                              num_heads_q=head,
+                                              logit_softcapping=logit_softcapping,
+                                              SPLIT_K=SPLIT_K,
+                                              BLOCK_DMODEL=BLOCK_DMODEL,
+                                              BLOCK_DV=BLOCK_DV,
+                                              BLOCK_N=BLOCK,
+                                              BLOCK_H=BLOCK_H,
+                                              BLOCK_DMODEL1=BLOCK_DMODEL1,
+                                              num_warps=num_warps,
+                                              num_stages=num_stages)
+
+    else:
+        _fwd_grouped_split_kernel[grid](q,
+                                        k,
+                                        v,
+                                        sm_scale,
+                                        kv_seqlens,
+                                        block_offsets,
+                                        acc,
+                                        stride_qbs=q.stride(-3),
+                                        stride_qh=q.stride(-2),
+                                        stride_qd=q.stride(-1),
+                                        stride_kp=k.stride(b_dim),
+                                        stride_kbs=k.stride(s_dim),
+                                        stride_kh=k.stride(h_dim),
+                                        stride_kd=k.stride(d_dim),
+                                        stride_vp=v.stride(b_dim),
+                                        stride_vbs=v.stride(s_dim),
+                                        stride_vh=v.stride(h_dim),
+                                        stride_vd=v.stride(d_dim),
+                                        stride_ok=acc.stride(-2),
+                                        stride_obs=acc.stride(-4),
+                                        stride_oh=acc.stride(-3),
+                                        stride_od=acc.stride(-1),
+                                        stride_boffb=block_offsets.stride(0),
+                                        kv_group_num=kv_group_num,
+                                        seq_len=seq_len,
+                                        window_size=window_size,
+                                        head_size=Lk,
+                                        head_size_v=Lv,
+                                        num_heads_q=head,
+                                        logit_softcapping=logit_softcapping,
+                                        shared_kv=shared_kv,
+                                        SPLIT_K=SPLIT_K,
+                                        BLOCK_DMODEL=BLOCK_DMODEL,
+                                        BLOCK_DV=BLOCK_DV,
+                                        BLOCK_N=BLOCK,
+                                        BLOCK_H=BLOCK_H,
+                                        BLOCK_DMODEL1=BLOCK_DMODEL1,
+                                        num_warps=num_warps,
+                                        num_stages=num_stages)
+
+    num_warps = 4
+    grid = (num_tokens, head)
+    if quant_policy == 4:
+        Lv *= 2
+        BLOCK_DV *= 2
+    _reduce_split_kernel[grid](acc,
+                               o,
+                               sinks,
+                               stride_ak=acc.stride(2),
+                               stride_abs=acc.stride(0),
+                               stride_ah=acc.stride(1),
+                               stride_ad=acc.stride(3),
+                               stride_obs=o.stride(0),
+                               stride_oh=o.stride(1),
+                               stride_od=o.stride(2),
+                               SPLIT_K=SPLIT_K,
+                               head_size_v=Lv,
+                               BLOCK_DV=BLOCK_DV,
+                               num_warps=num_warps,
+                               num_stages=1)
+
+
 def paged_attention_sparse(
     q: Tensor,
     k: Tensor,

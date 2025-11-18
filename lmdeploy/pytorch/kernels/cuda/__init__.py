@@ -8,7 +8,7 @@ from .flashattention import flash_attention_fwd
 from .flatten_kv_cache import flatten_kv_cache
 from .fused_moe import fused_moe
 from .multinomial_sampling import multinomial_sampling
-from .pagedattention import paged_attention_fwd, paged_attention_sparse
+from .pagedattention import paged_attention_fwd, paged_attention_sparse, paged_attention_dense
 from .rms_norm import rms_norm
 from .w8a8_fused_moe import fused_moe_w8a8
 from .w8a8_triton_kernels import matmul_kernel_dynamic_quant, per_token_quant_int8, rms_norm_dynamic_quant
@@ -18,6 +18,7 @@ __all__ = [
     'fused_moe',
     'paged_attention_fwd',
     'paged_attention_sparse',
+    'paged_attention_dense',
     'alibi_paged_attention_fwd',
     'fill_kv_cache',
     'multinomial_sampling',
