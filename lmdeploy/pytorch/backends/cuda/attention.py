@@ -187,7 +187,6 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
                     kv_seqlens=kv_seqlens,
                     q_start_loc=q_start_loc,
                     q_seqlens=q_seqlens,
-                    processing_indices=processing_indices,
                     sm_scale=self.scale,
                     logit_softcapping=self.logit_softcapping,
                 )

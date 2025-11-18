@@ -344,6 +344,5 @@ class TestDelayedCacheSparseKernels:
                                block_offsets=data['block_offsets'],
                                kv_seqlens=data['kv_seqlens'],
                                q_start_loc=data['q_start_loc'],
-                               q_seqlens=data['q_seqlens'],
-                               processing_indices=data['processing_indices'])
+                               q_seqlens=data['q_seqlens'])
         torch.testing.assert_close(out_sparse, out_dense, atol=3e-3, rtol=3e-3)

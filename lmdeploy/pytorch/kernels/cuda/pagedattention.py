@@ -439,10 +439,8 @@ def _fwd_grouped_split_sparse_kernel(
     Block_offsets,
     QStartLoc,
     QSeqLens,
-    ProcessingIndices,
     Out,
-    TileToBatch,
-    TileToSubtile,
+    TileOffsets,
     stride_qbs: tl.constexpr,
     stride_qh: tl.constexpr,
     stride_qd: tl.constexpr,
@@ -459,6 +457,7 @@ def _fwd_grouped_split_sparse_kernel(
     stride_od: tl.constexpr,
     stride_boffb,
     num_tiles,
+    num_seqs,
     kv_group_num: tl.constexpr,
     num_kv_heads: tl.constexpr,
     head_size: tl.constexpr,
@@ -475,18 +474,25 @@ def _fwd_grouped_split_sparse_kernel(
     """Sparse varlen paged attention kernel."""
     tile_kv_id = tl.program_id(0)
 
-    cur_tile = tile_kv_id // num_kv_heads
+    tile_id = tile_kv_id // num_kv_heads
     cur_kv_head = tile_kv_id % num_kv_heads
-    if cur_tile >= num_tiles or cur_kv_head >= num_kv_heads:
+    if tile_id >= num_tiles or cur_kv_head >= num_kv_heads:
         return
 
-    cur_batch = tl.load(TileToBatch + cur_tile).to(tl.int32)
-    subtile_id = tl.load(TileToSubtile + cur_tile).to(tl.int32)
+    lo = 0
+    hi = num_seqs - 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        upper = tl.load(TileOffsets + mid + 1)
+        if tile_id < upper:
+            hi = mid
+        else:
+            lo = mid + 1
+    cur_batch = lo
+    start_off = tl.load(TileOffsets + cur_batch)
+    subtile_id = tile_id - start_off
 
     q_seqlen = tl.load(QSeqLens + cur_batch)
-    if q_seqlen <= 0:
-        return
-
     kv_seqlen = tl.load(KV_seqlens + cur_batch)
     if kv_seqlen <= 0:
         return
@@ -501,11 +507,6 @@ def _fwd_grouped_split_sparse_kernel(
 
     cur_head = cur_kv_head * kv_group_num + (offs_h % kv_group_num)
     mask_h = mask_token & (cur_head < num_heads_q)
-
-    last_token_offset = q_start_loc + q_seqlen - 1
-    last_idx = tl.load(ProcessingIndices + last_token_offset).to(tl.int32)
-    history_len = kv_seqlen - (last_idx + 1)
-    history_len = tl.maximum(history_len, 0)
 
     # initialize offsets
     offs_n = tl.arange(0, BLOCK_N)
@@ -927,7 +928,6 @@ def paged_attention_sparse(
     kv_seqlens: Tensor,
     q_start_loc: Tensor,
     q_seqlens: Tensor,
-    processing_indices: Tensor,
     sm_scale: float = None,
     logit_softcapping: float = None,
     kv_layout: str = 'bshd',
@@ -989,14 +989,8 @@ def paged_attention_sparse(
     tiles_per_seq = (heads_per_req + BLOCK_H - 1) // BLOCK_H
     total_tiles = int(tiles_per_seq.sum().item())
 
-    batch_range = torch.arange(batch, device=q.device, dtype=torch.int32)
-    tile_to_batch = torch.repeat_interleave(batch_range, tiles_per_seq)
-    tile_offsets = torch.nn.functional.pad(tiles_per_seq.cumsum(0), (1, 0))[:-1]
-    start_offsets = tile_offsets.gather(0, tile_to_batch)
-    tile_idx = torch.arange(total_tiles, device=q.device, dtype=torch.int32)
-    tile_to_subtile = tile_idx - start_offsets
-    tile_to_batch = tile_to_batch.contiguous()
-    tile_to_subtile = tile_to_subtile.contiguous()
+    tile_offsets = torch.nn.functional.pad(tiles_per_seq.cumsum(0), (1, 0))
+    tile_offsets = tile_offsets.to(dtype=torch.int32, device=q.device).contiguous()
 
     grid_1 = total_tiles * num_kv_heads
 
@@ -1018,10 +1012,8 @@ def paged_attention_sparse(
         block_offsets,
         q_start_loc,
         q_seqlens,
-        processing_indices,
         o,
-        tile_to_batch,
-        tile_to_subtile,
+        tile_offsets,
         stride_qbs=q.stride(-3),
         stride_qh=q.stride(-2),
         stride_qd=q.stride(-1),
@@ -1038,6 +1030,7 @@ def paged_attention_sparse(
         stride_od=o.stride(2),
         stride_boffb=block_offsets.stride(0),
         num_tiles=total_tiles,
+        num_seqs=batch,
         kv_group_num=kv_group_num,
         num_kv_heads=num_kv_heads,
         head_size=Lk,
