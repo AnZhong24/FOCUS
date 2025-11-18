@@ -324,12 +324,12 @@ class TestDelayedCacheSparseKernels:
         torch.testing.assert_close(v_cache, expected_v, atol=0, rtol=0)
 
     def test_sparse_kernel_matches_dense_kernel(self, dense_paged_attention_inputs):
-        from lmdeploy.pytorch.kernels.cuda import paged_attention_dense, paged_attention_sparse
+        from lmdeploy.pytorch.kernels.cuda import paged_attention_fwd, paged_attention_sparse
 
         data = dense_paged_attention_inputs
         q = data['q']
         out_dense = torch.empty(q.size(0), q.size(1), data['head_dim_v'], dtype=q.dtype, device=q.device)
-        paged_attention_dense(q,
+        paged_attention_fwd(q,
                             data['k_cache'],
                             data['v_cache'],
                             out_dense,
