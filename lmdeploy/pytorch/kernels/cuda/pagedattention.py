@@ -508,12 +508,16 @@ def _fwd_grouped_split_sparse_kernel(
     proc_ptr = ProcessingIndices + cur_token
     proc_idx = tl.load(proc_ptr, mask=mask_token, other=0).to(tl.int32)
 
+    first_idx = tl.load(ProcessingIndices + q_start_loc).to(tl.int32)
     last_token_offset = q_start_loc + q_seqlen - 1
     last_idx = tl.load(ProcessingIndices + last_token_offset).to(tl.int32)
     history_len = kv_seqlen - (last_idx + 1)
     history_len = tl.maximum(history_len, 0)
 
-    token_positions = history_len + proc_idx
+    # token_positions = history_len + proc_idx
+    # dense_span = (first_idx == 0) & (q_seqlen == (last_idx + 1))
+    # token_positions = tl.where(dense_span, history_len + last_idx, token_positions)
+    token_positions = history_len + last_idx
     token_positions = tl.where(mask_token, token_positions, -1)
 
     # initialize offsets
@@ -1229,19 +1233,16 @@ def paged_attention_sparse(
         return
     BLOCK_H = max(16, min(BLOCK, triton.next_power_of_2(heads_per_req_max)))
 
-    q_seqlens_i32 = q_seqlens.to(torch.int32)
-    heads_per_req = q_seqlens_i32 * kv_group_num
+    heads_per_req = q_seqlens * kv_group_num
     tiles_per_seq = (heads_per_req + BLOCK_H - 1) // BLOCK_H
     total_tiles = int(tiles_per_seq.sum().item())
 
-    tile_counts = tiles_per_seq.to(device=q.device, dtype=torch.int64)
     batch_range = torch.arange(batch, device=q.device, dtype=torch.int32)
-    tile_to_batch = torch.repeat_interleave(batch_range, tile_counts)
-    tile_offsets = torch.nn.functional.pad(tile_counts.cumsum(0), (1, 0))[:-1]
-    tile_to_batch_long = tile_to_batch.to(torch.int64)
-    start_offsets = tile_offsets.gather(0, tile_to_batch_long)
-    tile_idx = torch.arange(total_tiles, device=q.device, dtype=torch.int64)
-    tile_to_subtile = (tile_idx - start_offsets).to(torch.int32)
+    tile_to_batch = torch.repeat_interleave(batch_range, tiles_per_seq)
+    tile_offsets = torch.nn.functional.pad(tiles_per_seq.cumsum(0), (1, 0))[:-1]
+    start_offsets = tile_offsets.gather(0, tile_to_batch)
+    tile_idx = torch.arange(total_tiles, device=q.device, dtype=torch.int32)
+    tile_to_subtile = tile_idx - start_offsets
     tile_to_batch = tile_to_batch.contiguous()
     tile_to_subtile = tile_to_subtile.contiguous()
 
