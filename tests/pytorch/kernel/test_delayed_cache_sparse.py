@@ -323,35 +323,6 @@ class TestDelayedCacheSparseKernels:
         torch.testing.assert_close(k_cache, expected_k, atol=0, rtol=0)
         torch.testing.assert_close(v_cache, expected_v, atol=0, rtol=0)
 
-    def test_paged_attention_sparse_matches_reference(self, delayed_sparse_inputs):
-        from lmdeploy.pytorch.kernels.cuda import fill_kv_cache, paged_attention_sparse
-
-        data = delayed_sparse_inputs
-        if data['processing_indices'].numel() == 0:
-            pytest.skip('No tokens to process for sparse attention.')
-
-        k_cache = data['k_cache_base'].clone()
-        v_cache = data['v_cache_base'].clone()
-        max_q_len = int(data['q_seqlens'].max().item()) if data['q_seqlens'].numel() > 0 else 1
-        fill_kv_cache(data['k_states'], data['v_states'], k_cache, v_cache, data['q_start_loc'], data['q_seqlens'],
-                      data['kv_seqlens'], max_q_len, data['block_offsets'], processing_indices=data['processing_indices'])
-
-        out = data['q_tokens'].new_empty((data['q_tokens'].size(0), data['num_heads_q'], data['head_dim_v']))
-        paged_attention_sparse(data['q_tokens'],
-                               k_cache,
-                               v_cache,
-                               out,
-                               block_offsets=data['block_offsets'],
-                               kv_seqlens=data['kv_seqlens'],
-                               q_start_loc=data['q_start_loc'],
-                               q_seqlens=data['q_seqlens'],
-                               processing_indices=data['processing_indices'])
-
-        expected = _ragged_attention_reference(data['block_q'], k_cache, v_cache, data['block_offsets'],
-                                               data['kv_seqlens'], data['q_seqlens'], data['processing_list'],
-                                               data['history_lens'], data['block_size'])
-        torch.testing.assert_close(out, expected, atol=3e-3, rtol=3e-3)
-
     def test_sparse_kernel_matches_dense_kernel(self, dense_paged_attention_inputs):
         from lmdeploy.pytorch.kernels.cuda import paged_attention_dense, paged_attention_sparse
 

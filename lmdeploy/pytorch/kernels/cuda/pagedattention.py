@@ -505,20 +505,10 @@ def _fwd_grouped_split_sparse_kernel(
     cur_head = cur_kv_head * kv_group_num + (offs_h % kv_group_num)
     mask_h = mask_token & (cur_head < num_heads_q)
 
-    proc_ptr = ProcessingIndices + cur_token
-    proc_idx = tl.load(proc_ptr, mask=mask_token, other=0).to(tl.int32)
-
-    first_idx = tl.load(ProcessingIndices + q_start_loc).to(tl.int32)
     last_token_offset = q_start_loc + q_seqlen - 1
     last_idx = tl.load(ProcessingIndices + last_token_offset).to(tl.int32)
     history_len = kv_seqlen - (last_idx + 1)
     history_len = tl.maximum(history_len, 0)
-
-    # token_positions = history_len + proc_idx
-    # dense_span = (first_idx == 0) & (q_seqlen == (last_idx + 1))
-    # token_positions = tl.where(dense_span, history_len + last_idx, token_positions)
-    token_positions = history_len + last_idx
-    token_positions = tl.where(mask_token, token_positions, -1)
 
     # initialize offsets
     offs_n = tl.arange(0, BLOCK_N)
@@ -585,7 +575,7 @@ def _fwd_grouped_split_sparse_kernel(
         qk = qk * tl_log2(math.e)
 
         positions = start_n + offs_n[None, :]
-        token_mask = (positions <= token_positions[:, None])
+        token_mask = (positions < kv_seqlen)
         qk = tl.where(token_mask, qk, -float('inf'))
 
         m_i_new = tl.maximum(m_i, tl.max(qk, 1))

@@ -191,7 +191,8 @@ class Engine:
                     sess.tick(n_token)
                     # No need to check for cancel_after since we're generating until EOS
                 sess.finish(Session.SUCCESS)
-                print()
+                if not skip_detokenize:
+                    print()
             finally:
                 await generator.aclose()
 
