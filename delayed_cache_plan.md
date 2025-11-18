@@ -15,7 +15,7 @@
 
 ## Constraints & Assumptions
 - Token eviction logic from the reference implementation is **out of scope**; retain only delayed cache mechanics.
-- Existing paged-attention kernels must continue to work with shortened `processing_indices`.
+- Sparse decoding only prunes which query rows are processed; every launched token still attends over the full `[0, kv_seqlen)` prefix exposed by the block cache.
 - Plan for feature to be opt-in through DLLM configuration to avoid regressions.
 
 ## Implementation Steps
@@ -59,7 +59,7 @@
 
 8. **KV Storage Semantics**
    - Add assertions or adapter code to guard against unsupported patterns before enabling delayed cache. When sparse mode is active, ensure block cache writes happen only for the requested indices before we call the sparse kernels.
-   - Teach the attention metadata builder to cap `kv_seqlens`/`q_seqlens` at `history_len + rightmost(processing_indices) + 1` so paged attention only reads up to the rightmost proceesing token (mirroring `modeling_sdar.py`’s `:end` slice).
+   - Teach the attention metadata builder to set `kv_seqlens` to `history_len + rightmost(processing_indices) + 1` (and `q_seqlens` to the ragged counts) so each sparse launch still attends across the entire prefix that is valid in cache without trying to apply per-token cutoffs.
 
 9.  **Strategy/Factory Integration**
    - Wire the configuration into `DLLMStrategyFactory.build_engine_strategy`, `.build_sequence_strategy`, and `.build_model_agent_strategy` so each component can opt into delayed cache based on configuration.
@@ -74,7 +74,7 @@
      - Queries: load via `q_start_loc`/`q_seqlens` and write attention outputs back through the same varlen metadata so the tensor handed to the MLP already aligns with the ragged ordering.
      - Launch shape: derive CTA scheduling from the ragged `q_seqlens` (e.g., CTA-per-chunk) instead of the dense block grid to keep sparse workloads balanced (similar to the one in `lmdeploy/pytorch/backends/cuda/flash_attention.py`)
      - Implementation detail: build compact `tile_to_batch` / `tile_to_subtile` remap tables on the host so each launched CTA corresponds to real work, avoiding the old worst-case grid that immediately exited for short sequences.
-     - KV readback: continue using `block_offsets`/`kv_seqlens` (decode still only touches the newest block per sequence) and just iterate over the ragged set of query rows within that block. All the history kv and kv in the current block until the rightmost positions in `processing_indices` are attended.
+     - KV readback: continue using `block_offsets`/`kv_seqlens` (decode still only touches the newest block per sequence) and just iterate over the ragged set of query rows within that block. Every sparse query should still attend over the entire `[0, kv_seqlen)` prefix implied by the capped value so causal semantics match the dense kernel.
      - Output: only the model logits (after the LM head) require scattering into `[batch, block_len, vocab]`; attention outputs stay in ragged form until the end of the layer stack.
    - Simpilification: Quantization, learnable-sinks, sliding-window are not needed. Add assertions in the CLI to make sure they are disabled.
   
