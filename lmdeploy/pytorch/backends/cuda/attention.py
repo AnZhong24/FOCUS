@@ -81,11 +81,11 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
         assert not (alibi and not causal)
 
         from lmdeploy.pytorch.kernels.cuda import (alibi_paged_attention_fwd, fill_kv_cache, flash_attention_fwd,
-                                                   flatten_kv_cache, paged_attention_fwd, paged_attention_sparse)
+                                                   flatten_kv_cache, paged_attention_fwd, ragged_paged_attention_fwd)
 
         self.fill_kv_cache = fill_kv_cache
         self.paged_attention_fwd = paged_attention_fwd
-        self.paged_attention_sparse = paged_attention_sparse
+        self.ragged_paged_attention_fwd = ragged_paged_attention_fwd
         self.alibi_paged_attention_fwd = alibi_paged_attention_fwd
         self.flatten_kv_cache = flatten_kv_cache
         self.flash_attention_fwd = flash_attention_fwd
@@ -178,7 +178,7 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
 
         if is_decoding:
             if use_block_cache:
-                self.paged_attention_sparse(
+                self.ragged_paged_attention_fwd(
                     query,
                     k_cache,
                     v_cache,

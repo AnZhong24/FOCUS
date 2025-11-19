@@ -94,58 +94,6 @@ def _python_fill_sparse_reference(cache, states, block_offsets, kv_seqlens, q_st
     return cache
 
 
-def _ragged_attention_reference(block_q, k_cache, v_cache, block_offsets, kv_seqlens, q_seqlens, processing_indices,
-                                history_lens, block_size):
-    """Reference implementation for paged_attention_sparse outputs."""
-    batch_size = len(processing_indices)
-    q_lens = [int(idx.numel()) for idx in processing_indices]
-    max_q_len = max(q_lens) if q_lens else 0
-    max_kv_len = int(kv_seqlens.max().item()) if kv_seqlens.numel() > 0 else 0
-    num_heads_q = block_q.size(2)
-    num_heads_k = k_cache.size(2)
-    head_dim = block_q.size(-1)
-    head_dim_v = v_cache.size(3)
-
-    batched_q = block_q.new_zeros((batch_size, max_q_len, num_heads_q, head_dim))
-    batched_k = k_cache.new_zeros((batch_size, max_kv_len, num_heads_k, head_dim))
-    batched_v = v_cache.new_zeros((batch_size, max_kv_len, num_heads_k, head_dim_v))
-    bias = block_q.new_full((batch_size, max_q_len, max_kv_len), NEG_INF)
-
-    for seq_id in range(batch_size):
-        kv_len = int(kv_seqlens[seq_id].item())
-        if kv_len > 0:
-            rows_k = []
-            rows_v = []
-            for pos in range(kv_len):
-                block_id = pos // block_size
-                offset = pos % block_size
-                block_off = int(block_offsets[seq_id, block_id].item())
-                rows_k.append(k_cache[block_off, offset])
-                rows_v.append(v_cache[block_off, offset])
-            batched_k[seq_id, :kv_len] = torch.stack(rows_k)
-            batched_v[seq_id, :kv_len] = torch.stack(rows_v)
-
-        q_len = q_lens[seq_id]
-        if q_len == 0:
-            continue
-        idx = processing_indices[seq_id]
-        batched_q[seq_id, :q_len] = block_q[seq_id, idx]
-        hist = int(history_lens[seq_id].item())
-        for token_idx, proc_idx in enumerate(idx.tolist()):
-            limit = hist + proc_idx + 1
-            bias[seq_id, token_idx, :limit] = 0.0
-
-    attn = _naive_attention(batched_q, (batched_k, batched_v), bias)
-    outputs = []
-    for seq_id, q_len in enumerate(q_lens):
-        if q_len == 0:
-            continue
-        outputs.append(attn[seq_id, :q_len])
-    if not outputs:
-        return block_q.new_empty((0, num_heads_q, head_dim_v))
-    return torch.cat(outputs, dim=0)
-
-
 @pytest.fixture
 def delayed_sparse_inputs():
     torch.manual_seed(3)
@@ -323,8 +271,8 @@ class TestDelayedCacheSparseKernels:
         torch.testing.assert_close(k_cache, expected_k, atol=0, rtol=0)
         torch.testing.assert_close(v_cache, expected_v, atol=0, rtol=0)
 
-    def test_sparse_kernel_matches_dense_kernel(self, dense_paged_attention_inputs):
-        from lmdeploy.pytorch.kernels.cuda import paged_attention_fwd, paged_attention_sparse
+    def test_ragged_kernel_matches_dense_kernel(self, dense_paged_attention_inputs):
+        from lmdeploy.pytorch.kernels.cuda import paged_attention_fwd, ragged_paged_attention_fwd
 
         data = dense_paged_attention_inputs
         q = data['q']
@@ -337,12 +285,12 @@ class TestDelayedCacheSparseKernels:
                             kv_seqlens=data['kv_seqlens'])
 
         out_sparse = torch.empty_like(out_dense)
-        paged_attention_sparse(q,
-                               data['k_cache'],
-                               data['v_cache'],
-                               out_sparse,
-                               block_offsets=data['block_offsets'],
-                               kv_seqlens=data['kv_seqlens'],
-                               q_start_loc=data['q_start_loc'],
-                               q_seqlens=data['q_seqlens'])
+        ragged_paged_attention_fwd(q,
+                                   data['k_cache'],
+                                   data['v_cache'],
+                                   out_sparse,
+                                   block_offsets=data['block_offsets'],
+                                   kv_seqlens=data['kv_seqlens'],
+                                   q_start_loc=data['q_start_loc'],
+                                   q_seqlens=data['q_seqlens'])
         torch.testing.assert_close(out_sparse, out_dense, atol=3e-3, rtol=3e-3)

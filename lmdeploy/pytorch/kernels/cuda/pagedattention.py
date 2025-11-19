@@ -430,7 +430,7 @@ def _fwd_grouped_split_quant_kernel(
 
 
 @triton.jit
-def _fwd_grouped_split_sparse_kernel(
+def _fwd_grouped_split_ragged_kernel(
     Q,
     K,
     V,
@@ -917,7 +917,7 @@ def paged_attention_fwd(
                                num_stages=1)
 
 
-def paged_attention_sparse(
+def ragged_paged_attention_fwd(
     q: Tensor,
     k: Tensor,
     v: Tensor,
@@ -930,7 +930,7 @@ def paged_attention_sparse(
     logit_softcapping: float = None,
     kv_layout: str = 'bshd',
 ):
-    """Sparse paged attention forward."""
+    """Ragged paged attention forward."""
     global _nv_cap
     if _nv_cap is None:
         _nv_cap = torch.cuda.get_device_capability()
@@ -1008,7 +1008,7 @@ def paged_attention_sparse(
 
     grid = (grid_1, SPLIT_K)
 
-    _fwd_grouped_split_sparse_kernel[grid](
+    _fwd_grouped_split_ragged_kernel[grid](
         q,
         k,
         v,

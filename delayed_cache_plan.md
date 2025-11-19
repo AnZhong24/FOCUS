@@ -70,7 +70,7 @@
      - Inputs: same tensor layout as dense kernel plus `q_start_loc` and `q_seqlens`. Each CTA derives token offsets from `(start, len)` pairs, avoiding the need for an intermediate index list.
      - Launch shape: derive CTA scheduling from the ragged `q_seqlens` (e.g., CTA-per-chunk) instead of the dense block grid to keep sparse workloads balanced.
      - Writes: update only the selected cache rows; mask all others to keep previous contents intact.
-   - `paged_attention_sparse`: read queries in ragged form (similar to the varlen flow in `lmdeploy/pytorch/backends/cuda/flash_attention.py`). Use the same ragged metadata to decide how many queries belong to each request without assuming contiguous blocks beyond the `(start, len)` contract.
+   - `ragged_paged_attention_fwd`: read queries in ragged form (similar to the varlen flow in `lmdeploy/pytorch/backends/cuda/flash_attention.py`). Use the same ragged metadata to decide how many queries belong to each request without assuming contiguous blocks beyond the `(start, len)` contract.
      - Queries: load via `q_start_loc`/`q_seqlens` spans and write attention outputs back through the same varlen metadata so the tensor handed to the MLP already aligns with the ragged ordering.
      - Launch shape: derive CTA scheduling from the ragged `q_seqlens` (e.g., CTA-per-chunk) instead of the dense block grid to keep sparse workloads balanced (similar to the one in `lmdeploy/pytorch/backends/cuda/flash_attention.py`)
      - Implementation detail: build compact `tile_to_batch` / `tile_to_subtile` remap tables on the host so each launched CTA corresponds to real work, avoiding the old worst-case grid that immediately exited for short sequences.
