@@ -439,7 +439,7 @@ def _fwd_grouped_split_sparse_kernel(
     Block_offsets,
     QStartLoc,
     QSeqLens,
-    Out,
+    Acc_out,
     TileOffsets,
     stride_qbs: tl.constexpr,
     stride_qh: tl.constexpr,
@@ -452,6 +452,7 @@ def _fwd_grouped_split_sparse_kernel(
     stride_vbs: tl.constexpr,
     stride_vh: tl.constexpr,
     stride_vd: tl.constexpr,
+    stride_ok: tl.constexpr,
     stride_obs: tl.constexpr,
     stride_oh: tl.constexpr,
     stride_od: tl.constexpr,
@@ -465,6 +466,7 @@ def _fwd_grouped_split_sparse_kernel(
     num_heads_q: tl.constexpr,
     logit_softcapping: tl.constexpr,
     shared_kv: tl.constexpr,
+    SPLIT_K: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -473,6 +475,7 @@ def _fwd_grouped_split_sparse_kernel(
 ):
     """Sparse varlen paged attention kernel."""
     tile_kv_id = tl.program_id(0)
+    split_k_id = tl.program_id(1)
 
     tile_id = tile_kv_id // num_kv_heads
     cur_kv_head = tile_kv_id % num_kv_heads
@@ -537,8 +540,12 @@ def _fwd_grouped_split_sparse_kernel(
     l_i = tl.zeros([BLOCK_H], dtype=tl.float32)
     acc = tl.zeros([BLOCK_H, BLOCK_DV], dtype=tl.float32)
 
-    loop_start = 0
-    loop_end = kv_seqlen
+    num_total_blocks = tl.cdiv(kv_seqlen, BLOCK_N)
+    BLOCK_PER_CTA = tl.cdiv(num_total_blocks, SPLIT_K)
+    kv_len_per_prog = BLOCK_PER_CTA * BLOCK_N
+    loop_start = kv_len_per_prog * split_k_id
+    loop_end = tl.minimum(loop_start + kv_len_per_prog, kv_seqlen)
+
     block_offset_ptrs += loop_start // BLOCK_N
     for start_n in range(loop_start, loop_end, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
@@ -581,13 +588,13 @@ def _fwd_grouped_split_sparse_kernel(
         m_i = m_i_new
 
     if loop_end > loop_start:
-        valid_mask = mask_h & (l_i > 0)
-        denom = tl.where(valid_mask, l_i, 1.0)
-        acc = acc / denom[:, None]
-        acc = tl.where(valid_mask[:, None], acc, 0.0)
-        out_offset = (cur_token[:, None] * stride_obs + cur_head[:, None] * stride_oh +
-                      offs_dv[None, :] * stride_od)
-        tl.store(Out + out_offset, acc, mask=mask_h[:, None] & mask_dv[None, :])
+        off_acc = (cur_token[:, None] * stride_obs + split_k_id * stride_ok + cur_head[:, None] * stride_oh +
+                   offs_dv[None, :] * stride_od)
+        tl.store(Acc_out + off_acc, acc, mask=mask_h[:, None] & mask_dv[None, :])
+
+    off_meta = (cur_token * stride_obs + split_k_id * stride_ok + cur_head * stride_oh + head_size_v)
+    tl.store(Acc_out + off_meta, m_i, mask=mask_h)
+    tl.store(Acc_out + off_meta + 1, l_i, mask=mask_h)
 
 
 @triton.jit
@@ -1001,7 +1008,10 @@ def paged_attention_sparse(
     else:
         num_warps, num_stages = _kernel_meta_sm9x(BLOCK_DMODEL, BLOCK_H)
 
-    grid = (grid_1, )
+    SPLIT_K = _get_split_k(q.device.index, grid_1, max(batch, 1), num_warps)
+    acc = q.new_empty((q.shape[-3], head, SPLIT_K, Lv + 2), dtype=torch.float32)
+
+    grid = (grid_1, SPLIT_K)
 
     _fwd_grouped_split_sparse_kernel[grid](
         q,
@@ -1012,7 +1022,7 @@ def paged_attention_sparse(
         block_offsets,
         q_start_loc,
         q_seqlens,
-        o,
+        acc,
         tile_offsets,
         stride_qbs=q.stride(-3),
         stride_qh=q.stride(-2),
@@ -1025,9 +1035,10 @@ def paged_attention_sparse(
         stride_vbs=v.stride(s_dim),
         stride_vh=v.stride(h_dim),
         stride_vd=v.stride(d_dim),
-        stride_obs=o.stride(0),
-        stride_oh=o.stride(1),
-        stride_od=o.stride(2),
+        stride_ok=acc.stride(-2),
+        stride_obs=acc.stride(-4),
+        stride_oh=acc.stride(-3),
+        stride_od=acc.stride(-1),
         stride_boffb=block_offsets.stride(0),
         num_tiles=total_tiles,
         num_seqs=batch,
@@ -1038,6 +1049,7 @@ def paged_attention_sparse(
         num_heads_q=head,
         logit_softcapping=logit_softcapping,
         shared_kv=shared_kv,
+        SPLIT_K=SPLIT_K,
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DV=BLOCK_DV,
         BLOCK_N=BLOCK,
@@ -1046,3 +1058,20 @@ def paged_attention_sparse(
         num_warps=num_warps,
         num_stages=num_stages,
     )
+
+    grid = (q.shape[-3], head)
+    _reduce_split_kernel[grid](acc,
+                               o,
+                               sinks=None,
+                               stride_ak=acc.stride(2),
+                               stride_abs=acc.stride(0),
+                               stride_ah=acc.stride(1),
+                               stride_ad=acc.stride(3),
+                               stride_obs=o.stride(0),
+                               stride_oh=o.stride(1),
+                               stride_od=o.stride(2),
+                               SPLIT_K=SPLIT_K,
+                               head_size_v=Lv,
+                               BLOCK_DV=BLOCK_DV,
+                               num_warps=4,
+                               num_stages=1)
