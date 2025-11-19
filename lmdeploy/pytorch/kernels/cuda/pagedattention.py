@@ -440,7 +440,8 @@ def _fwd_grouped_split_sparse_kernel(
     QStartLoc,
     QSeqLens,
     Acc_out,
-    TileOffsets,
+    TileSeq,
+    TileSeqOffsets,
     stride_qbs: tl.constexpr,
     stride_qh: tl.constexpr,
     stride_qd: tl.constexpr,
@@ -458,7 +459,6 @@ def _fwd_grouped_split_sparse_kernel(
     stride_od: tl.constexpr,
     stride_boffb,
     num_tiles,
-    num_seqs,
     kv_group_num: tl.constexpr,
     num_kv_heads: tl.constexpr,
     head_size: tl.constexpr,
@@ -482,18 +482,9 @@ def _fwd_grouped_split_sparse_kernel(
     if tile_id >= num_tiles or cur_kv_head >= num_kv_heads:
         return
 
-    lo = 0
-    hi = num_seqs - 1
-    while lo < hi:
-        mid = (lo + hi) // 2
-        upper = tl.load(TileOffsets + mid + 1)
-        if tile_id < upper:
-            hi = mid
-        else:
-            lo = mid + 1
-    cur_batch = lo
-    start_off = tl.load(TileOffsets + cur_batch)
-    subtile_id = tile_id - start_off
+    cur_batch = tl.load(TileSeq + tile_id)
+    seq_offset = tl.load(TileSeqOffsets + cur_batch)
+    subtile_id = tile_id - seq_offset
 
     q_seqlen = tl.load(QSeqLens + cur_batch)
     kv_seqlen = tl.load(KV_seqlens + cur_batch)
@@ -998,6 +989,10 @@ def paged_attention_sparse(
 
     tile_offsets = torch.nn.functional.pad(tiles_per_seq.cumsum(0), (1, 0))
     tile_offsets = tile_offsets.to(dtype=torch.int32, device=q.device).contiguous()
+    seq_tile_offsets = tile_offsets[:-1].contiguous()
+
+    seq_ids = torch.arange(batch, device=q.device, dtype=torch.int32)
+    tile_to_seq = torch.repeat_interleave(seq_ids, tiles_per_seq).contiguous()
 
     grid_1 = total_tiles * num_kv_heads
 
@@ -1023,7 +1018,8 @@ def paged_attention_sparse(
         q_start_loc,
         q_seqlens,
         acc,
-        tile_offsets,
+        tile_to_seq,
+        seq_tile_offsets,
         stride_qbs=q.stride(-3),
         stride_qh=q.stride(-2),
         stride_qd=q.stride(-1),
@@ -1041,7 +1037,6 @@ def paged_attention_sparse(
         stride_od=acc.stride(-1),
         stride_boffb=block_offsets.stride(0),
         num_tiles=total_tiles,
-        num_seqs=batch,
         kv_group_num=kv_group_num,
         num_kv_heads=num_kv_heads,
         head_size=Lk,
