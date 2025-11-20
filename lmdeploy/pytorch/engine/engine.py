@@ -774,17 +774,16 @@ class Engine(EngineBase):
         dllm_cfg = getattr(self.misc_config, 'dllm_config', None)
         enable_delayed = bool(dllm_cfg and dllm_cfg.enable_delayed_cache and is_decoding)
         if enable_delayed:
-            proc_lists = []
+            proc_tensors = []
             proc_lengths = []
             for msg in messages:
-                getter = getattr(msg, 'get_processing_indices', None)
-                indices = getter()
-                indices = np.asarray(indices, dtype=np.int64)
-                proc_lists.append(indices)
-                proc_lengths.append(indices.shape[0])
-            flat_indices = np.concatenate(proc_lists) if proc_lists else np.empty((0, ), dtype=np.int64)
-            processing_indices = torch.as_tensor(flat_indices, dtype=torch.long)
-            processing_q_lens = torch.as_tensor(proc_lengths, dtype=torch.long)
+                indices = msg.get_processing_indices()
+                indices_tensor = indices.to(device='cpu', dtype=torch.long).contiguous()
+                proc_tensors.append(indices_tensor)
+                proc_lengths.append(indices_tensor.numel())
+            processing_indices = (torch.cat(proc_tensors)
+                                  if len(proc_tensors) > 0 else torch.empty((0, ), dtype=torch.long))
+            processing_q_lens = torch.tensor(proc_lengths, dtype=torch.long)
 
         kv_seqlens = seq_length + history_lengths
         max_kv_seqlen = kv_seqlens.max().item()

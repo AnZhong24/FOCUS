@@ -119,17 +119,36 @@ class DLLMModelAgentStrategy(ModelAgentStrategy):
         self.dllm_mask_token = dllm_mask_token
 
         self.unmasking_processor = UnmaskingProcessor(dllm_config=dllm_config)
+        self._logits_buffer: torch.Tensor | None = None
+        self._logits_buffer_capacity: int = 0
+        self._logits_vocab_size: int = 0
 
     def _use_delayed_cache(self, inputs: ModelInputs) -> bool:
         cfg = self.unmasking_processor.dllm_config
         return (cfg.enable_delayed_cache and inputs.processing_indices is not None
                 and inputs.processing_q_lens is not None)
 
+    def _get_full_logits_buffer(self, template: torch.Tensor, batch_size: int,
+                                vocab_size: int) -> torch.Tensor:
+        """Return a view of a reusable logits buffer large enough for this batch."""
+        need_new = (self._logits_buffer is None or self._logits_buffer.device != template.device
+                    or self._logits_buffer.dtype != template.dtype
+                    or self._logits_vocab_size != vocab_size
+                    or self._logits_buffer_capacity < batch_size)
+        if need_new:
+            capacity = max(batch_size, self._logits_buffer_capacity)
+            if capacity == 0:
+                capacity = batch_size
+            self._logits_buffer = template.new_empty(capacity, self.block_size, vocab_size)
+            self._logits_buffer_capacity = capacity
+            self._logits_vocab_size = vocab_size
+        return self._logits_buffer[:batch_size]
+
     def _scatter_logits(self, flat_logits: torch.Tensor, inputs: ModelInputs) -> torch.Tensor:
         batch_size = inputs.seq_length.size(0)
         vocab_size = flat_logits.size(-1)
         block_size = self.block_size
-        full_logits = flat_logits.new_empty(batch_size, block_size, vocab_size)
+        full_logits = self._get_full_logits_buffer(flat_logits, batch_size, vocab_size)
         device = flat_logits.device
         proc_indices = inputs.processing_indices.to(device=device, dtype=torch.long)
         seq_lengths_src = inputs.processing_q_lens if inputs.processing_q_lens is not None else inputs.seq_length

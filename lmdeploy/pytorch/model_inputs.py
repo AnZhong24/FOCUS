@@ -373,28 +373,19 @@ class StepContext:
 
         def _gather_flat_tensor(tensor: torch.Tensor, full_lengths: torch.Tensor, gathered_lengths: torch.Tensor,
                                  gathered_indices: torch.Tensor):
-            if gathered_lengths.numel() == 0:
+            total_gather = int(gathered_lengths.sum().item()) if gathered_lengths.numel() > 0 else 0
+            if total_gather == 0:
                 new_shape = list(tensor.shape)
                 new_shape[-1] = 0
                 return tensor.new_empty(new_shape)
+            device = tensor.device
+            full_lengths = full_lengths.to(device=device)
+            gathered_lengths = gathered_lengths.to(device=device)
+            gathered_indices = gathered_indices.to(device=device)
             offsets = torch.cumsum(full_lengths, dim=0) - full_lengths
-            parts = []
-            ptr = 0
-            gathered_indices = gathered_indices.to(tensor.device)
-            for seq_idx, offset in enumerate(offsets.tolist()):
-                block_len = int(full_lengths[seq_idx].item())
-                cur_len = int(gathered_lengths[seq_idx].item())
-                if cur_len == 0:
-                    continue
-                slice_tensor = tensor.narrow(-1, offset, block_len)
-                idx_slice = gathered_indices[ptr:ptr + cur_len]
-                ptr += cur_len
-                parts.append(slice_tensor.index_select(-1, idx_slice))
-            if len(parts) == 0:
-                new_shape = list(tensor.shape)
-                new_shape[-1] = 0
-                return tensor.new_empty(new_shape)
-            return torch.cat(parts, dim=-1)
+            expanded_offsets = torch.repeat_interleave(offsets, gathered_lengths, output_size=total_gather)
+            absolute_indices = gathered_indices + expanded_offsets
+            return tensor.index_select(-1, absolute_indices)
 
         if use_block_cache:
             q_seqlens = processing_q_lens.to(device=seq_length_full.device, dtype=seq_length_full.dtype)
@@ -422,20 +413,15 @@ class StepContext:
         # seq_len + history_length
         processing_tensor = None
         if use_block_cache:
-            ptr = 0
-            device = history_seqlens.device
-            dtype = history_seqlens.dtype
-            rightmost = []
-            for length in q_seqlens.tolist():
-                length = int(length)
-                if length == 0:
-                    rightmost.append(torch.zeros((), device=device, dtype=dtype))
-                    continue
-                idx_slice = proc_tensor[ptr:ptr + length]
-                ptr += length
-                rightmost.append((idx_slice.max() + 1).to(dtype=dtype))
-            rightmost_plus_one = torch.stack(rightmost) if len(rightmost) > 0 else history_seqlens.new_zeros(
-                history_seqlens.size(0))
+            batch_size = q_seqlens.size(0)
+            rightmost_vals = proc_tensor.new_full((batch_size, ), -1)
+            valid_mask = q_seqlens > 0
+            end_offsets = q_start_loc + q_seqlens - 1
+            gathered = proc_tensor.index_select(0, end_offsets[valid_mask])
+            rightmost_vals[valid_mask] = gathered
+            zeros = rightmost_vals.new_zeros((batch_size, ))
+            rightmost_plus_one = torch.where(rightmost_vals < 0, zeros, rightmost_vals + 1)
+            rightmost_plus_one = rightmost_plus_one.to(device=history_seqlens.device, dtype=history_seqlens.dtype)
             kv_seqlens = history_seqlens + rightmost_plus_one
             processing_tensor = proc_tensor
         else:

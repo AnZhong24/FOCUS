@@ -75,12 +75,12 @@
      - Launch shape: derive CTA scheduling from the ragged `q_seqlens` (e.g., CTA-per-chunk) instead of the dense block grid to keep sparse workloads balanced (similar to the one in `lmdeploy/pytorch/backends/cuda/flash_attention.py`)
      - Implementation detail: build compact `tile_to_batch` / `tile_to_subtile` remap tables on the host so each launched CTA corresponds to real work, avoiding the old worst-case grid that immediately exited for short sequences.
      - KV readback: continue using `block_offsets`/`kv_seqlens` (decode still only touches the newest block per sequence) and just iterate over the ragged set of query rows within that block. Every sparse query should still attend over the entire `[0, kv_seqlen)` prefix implied by the capped value so causal semantics match the dense kernel.
-     - Output: only the model logits (after the LM head) require scattering into `[batch, block_len, vocab]`; attention outputs stay in ragged form (ordered by the spans) until the end of the layer stack.
+     - Output: attention outputs can remain in ragged form for the transformer stack, but before sampling we still scatter the LM-head logits into `[batch, block_len, vocab]` so downstream mask/unmask logic can keep using the dense layout.
      - Simpilification: Quantization, learnable-sinks, sliding-window are not needed. Add assertions in the CLI to make sure they are disabled.
   
 11. **After forward (Logit Assembly)**
-   - `SDARForCausalLM.get_logits` expects contiguous `[tokens, hidden]` inputs, and the DLLM `UnmaskingProcessor` (`unmasking.py`) indexes logits by block layout (`block_len` stride). When delayed cache is enabled, run the LM head over the ragged hidden states ordered by `q_start_loc`/`q_seqlens`, and scatter the resulting logits into a dense `[batch, block_len, vocab]` tensor before calling the unmasker.
-   - When delayed cache is disabled, reuse the existing dense pathway. The scatter/gather branch should be transparent to downstream components so unmasking, remasking, and `dllm_mask` updates continue to operate on full blocks regardless of how many tokens were processed in the current denoising step.
+   - `SDARForCausalLM.get_logits` expects contiguous `[tokens, hidden]` inputs, and the DLLM `UnmaskingProcessor` (`unmasking.py`) operates on dense `[batch, block_len, vocab]` tensors. Even when delayed cache is enabled, run the LM head over the ragged hidden states ordered by `q_start_loc`/`q_seqlens`, then scatter the resulting logits into a dense buffer before calling the unmasker.
+   - When delayed cache is disabled, reuse the existing dense pathway. The scatter/gather branch should remain transparent to downstream components so unmasking, remasking, and `dllm_mask` updates continue to operate on full blocks regardless of how many tokens were processed in the current denoising step.
 
 ## Deliverables
 - Code updates across the modules above.

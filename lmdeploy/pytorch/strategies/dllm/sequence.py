@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+import torch
 from torch import Tensor
 
 from lmdeploy.pytorch import consts
@@ -32,39 +33,47 @@ class HistoryDLLMMask(HistoryTokenIds):
 @dataclass
 class DelayedCacheState:
     block_length: int
-    uncached_positions: np.ndarray
+    uncached_positions: torch.Tensor
     needs_warmup: bool = True
 
     @classmethod
     def new(cls, block_length: int):
-        uncached = np.ones((block_length, ), dtype=bool)
+        uncached = torch.ones((block_length, ), dtype=torch.bool, pin_memory=True)
         return cls(block_length=block_length, uncached_positions=uncached)
 
     def reset(self):
-        self.uncached_positions[:] = True
+        self.uncached_positions.fill_(True)
         self.needs_warmup = True
 
-    def mark_cached(self, ready_mask: np.ndarray):
+    def mark_cached(self, ready_mask: torch.Tensor):
         if ready_mask is None:
             return
+        ready_mask = ready_mask.to(device=self.uncached_positions.device, dtype=torch.bool)
         self.uncached_positions &= ~ready_mask
 
     def update_from_mask(self, dllm_mask: np.ndarray):
         if dllm_mask is None or dllm_mask.size == 0:
             return
-        non_mask = dllm_mask != DLLM_MASKED
-        right_neighbor = np.roll(non_mask, -1)
+        non_mask = torch.from_numpy(dllm_mask != DLLM_MASKED)
+        if non_mask.numel() == 0:
+            return
+        right_neighbor = torch.roll(non_mask, shifts=-1, dims=0)
         right_neighbor[-1] = True
         ready = non_mask & right_neighbor
         self.mark_cached(ready)
 
-    def get_processing_indices(self):
+    def get_processing_indices(self) -> torch.Tensor:
+        device = self.uncached_positions.device
         if self.needs_warmup:
-            indices = np.arange(self.block_length, dtype=np.int64)
+            indices = torch.arange(self.block_length, dtype=torch.long, device=device)
         else:
-            indices = np.nonzero(self.uncached_positions)[0]
-        if indices.size == 0:
-            indices = np.arange(self.block_length, dtype=np.int64)
+            indices = self.uncached_positions.nonzero(as_tuple=False).squeeze(-1)
+            if indices.numel() > 0 and indices.dim() == 0:
+                indices = indices.unsqueeze(0)
+            if indices.numel() == 0:
+                indices = torch.arange(self.block_length, dtype=torch.long, device=device)
+        if not indices.is_pinned():
+            indices = indices.pin_memory()
         self.needs_warmup = False
         return indices
 
@@ -128,13 +137,13 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
             return
         self._delayed_cache_state.update_from_mask(mask)
 
-    def get_processing_indices(self) -> Optional[np.ndarray]:
+    def get_processing_indices(self) -> Optional[torch.Tensor]:
         if not self.delayed_cache_enabled:
             return None
         indices = self._delayed_cache_state.get_processing_indices()
         # NOTE: sparse kernels assume each per-sequence slice is sorted
-        # ascending, so keep using np.nonzero() without extra shuffling.
-        return None if indices is None else indices.copy()
+        # ascending, so keep the natural torch.nonzero ordering.
+        return indices
 
     # def get_uncached_bitmap(self) -> Optional[np.ndarray]:
     #     if not self.delayed_cache_enabled:
