@@ -199,6 +199,16 @@ class ArgumentHelper:
                                    help='expert parallelism. dp is required when pytorch engine is used.')
 
     @staticmethod
+    def cp(parser):
+        """Add argument cp to parser."""
+
+        return parser.add_argument(
+            '--cp',
+            type=int,
+            default=1,
+            help='context parallelism size in attention for turbomind backend, tp must be a multiple of cp.')
+
+    @staticmethod
     def dp_rank(parser):
         """Add argument dp_rank to parser."""
 
@@ -684,6 +694,15 @@ class ArgumentHelper:
                                    action='store_true',
                                    default=False,
                                    help='Enable delayed KV-cache updates for DLLM diffusion decoding.')
+
+    @staticmethod
+    def enable_return_routed_experts(parser):
+        """Add argument return routed experts to parser."""
+
+        return parser.add_argument('--enable-return-routed-experts',
+                                   action='store_true',
+                                   default=False,
+                                   help='Whether to output routed expert ids for replay')
 
 
 # adapted from https://github.com/vllm-project/vllm/blob/main/vllm/utils/__init__.py
