@@ -322,7 +322,6 @@ class SDARAttention(nn.Module):
                 retain_mask[retain_indices] = True
                 adjacent_and_right_selected = ((masked_positions[1:] - masked_positions[:-1]) == 1) & retain_mask[1:] & ~retain_mask[:-1]
                 retain_mask[:-1][adjacent_and_right_selected] = True
-                context.reference_indices = context.processing_indices[masked_positions[:-1][adjacent_and_right_selected]]
 
                 rightmost_retain_idx = masked_positions[torch.nonzero(retain_mask, as_tuple=True)[0][-1]]
                 evicted_before_rightmost = (masked_positions < rightmost_retain_idx) & ~retain_mask
@@ -336,8 +335,6 @@ class SDARAttention(nn.Module):
                                                             as_tuple=True)[0]
                     # Update retain_mask to include these tokens
                     retain_mask[unprocessed_evicted_indices] = True
-                    additional_reference_indices = context.processing_indices[masked_positions[unprocessed_evicted_indices]]
-                    context.reference_indices = torch.cat([context.reference_indices, additional_reference_indices], dim=0)
 
                 # Get the actual indices in the sequence
                 evict_token_indices = context.processing_indices[masked_positions[~retain_mask]]

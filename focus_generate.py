@@ -141,9 +141,6 @@ def block_diffusion_generate(
                 processed_mask_indices = torch.zeros_like(mask_indices, dtype=torch.bool, device=mask_indices.device)
                 processed_mask_indices[:, context.processing_indices] = mask_indices[:, context.processing_indices]
                 unprocessed_positions[context.processing_indices] = False
-                if strategy != "none" and context.reference_indices is not None:
-                    processed_mask_indices[:, context.reference_indices] = False
-                    context.reference_indices = None
 
                 # Get logits for the current uncached positions
                 full_logits = torch.zeros(cur_x.shape[0], block_length, model.config.vocab_size, device=cur_x.device, dtype=logits.dtype)

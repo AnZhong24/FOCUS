@@ -9,7 +9,6 @@ class Context:
     mask_indices: torch.Tensor | None = None
     processing_indices: torch.Tensor | None = None
     unprocessed_positions: torch.Tensor | None = None
-    reference_indices: torch.Tensor | None = None
     K: int | None = None
     strategy: str | None = None
     first_layer_importance: torch.Tensor | None = None
@@ -21,7 +20,7 @@ def get_context():
     return _CONTEXT
 
 def set_context(is_decode, enable_token_eviction=False, mask_indices=None, processing_indices=None, K=None, strategy=None, first_layer_importance=None,
-                eviction_phase=None, reference_indices=None, unprocessed_positions=None):
+                eviction_phase=None, unprocessed_positions=None):
     global _CONTEXT
     _CONTEXT.is_decode = is_decode
     _CONTEXT.enable_token_eviction = enable_token_eviction
@@ -37,8 +36,6 @@ def set_context(is_decode, enable_token_eviction=False, mask_indices=None, proce
         _CONTEXT.first_layer_importance = first_layer_importance
     if eviction_phase is not None:
         _CONTEXT.eviction_phase = eviction_phase
-    if reference_indices is not None:
-        _CONTEXT.reference_indices = reference_indices
     if unprocessed_positions is not None:
         _CONTEXT.unprocessed_positions = unprocessed_positions
 
