@@ -250,6 +250,7 @@ class SDARAttention(nn.Module):
         processing_mask = None
         token_evicting = self.layer_idx in [0, 1] and context.enable_token_eviction and context.is_decode and context.mask_indices.sum() > context.K
         if token_evicting:
+            device = hidden_states.device
             # Compute attention importance for masked tokens
             # Get the sequence dimension mask (remove batch dimension)
             seq_mask = context.mask_indices[0, context.processing_indices] # [seq_len]
@@ -267,9 +268,9 @@ class SDARAttention(nn.Module):
             
             # Apply max_pool1d to the attention scores
             batch_size, num_heads, seq_len_filtered, _ = attention_scores.shape
-            attention_scores_reshaped = attention_scores.view(batch_size * num_heads, seq_len_filtered, seq_len_filtered)
+            attention_scores_reshaped = attention_scores.reshape(batch_size * num_heads, seq_len_filtered, seq_len_filtered)
             pooled_attention = torch.nn.functional.max_pool1d(attention_scores_reshaped, kernel_size=3, stride=1, padding=1)
-            pooled_attention = pooled_attention.view(batch_size, num_heads, seq_len_filtered, -1)
+            pooled_attention = pooled_attention.reshape(batch_size, num_heads, seq_len_filtered, seq_len_filtered)
             attention_weights = torch.softmax(pooled_attention, dim=-1)
             
             # Sum over incoming attention first
@@ -283,28 +284,23 @@ class SDARAttention(nn.Module):
                 # For layer 1, implement token eviction based on importance delta
                 # Compute delta: importance of the second layer - importance of the first layer
                 delta_importance = importance_scores - context.first_layer_importance
-                # In theory, the mean should be zero, but numerical errors may cause deviation
-                mean_importance = torch.mean(delta_importance)
-                std_importance = torch.std(delta_importance)
                 # Get indices of masked tokens
                 masked_positions = torch.nonzero(context.mask_indices[0, context.processing_indices], as_tuple=True)[0]
                 # Select tokens to retain based on delta and strategy
                 if context.strategy == "dynamic":
-                    # Calculate mean and standard deviation of delta_importance
-                    # print("delta_importance", delta_importance)
+                    # In theory, the mean should be zero, but numerical errors may cause deviation
+                    mean_importance = torch.mean(delta_importance)
                     std_importance = torch.std(delta_importance)
                     threshold = mean_importance + std_importance
                     # Find outliers (tokens with delta_importance > std)
                     outlier_mask = (delta_importance >= threshold)
                     outlier_indices = torch.nonzero(outlier_mask, as_tuple=True)[1]
-                    # print("outliers", delta_importance[0, outlier_indices])
                     # If number of outliers is less than K, select top K tokens instead
                     if len(outlier_indices) < context.K:
                         sorted_indices = torch.argsort(delta_importance, stable=True, descending=True)
                         retain_indices = sorted_indices[0, :context.K]
                     else:
                         retain_indices = outlier_indices
-                    # print("retained", delta_importance[0, retain_indices])
                 elif context.strategy == "top":
                     # Select top K tokens with highest delta
                     sorted_indices = torch.argsort(delta_importance, stable=True, descending=True)
@@ -315,35 +311,24 @@ class SDARAttention(nn.Module):
                     retain_indices = sorted_indices[0, :context.K]
                 elif context.strategy == "random":
                     # Select K tokens randomly
-                    sorted_indices = torch.randperm(len(delta_importance[0]))
+                    sorted_indices = torch.randperm(len(delta_importance[0]), device=device)
                     retain_indices = sorted_indices[:context.K]
 
-                retain_mask = torch.zeros_like(masked_positions, dtype=torch.bool, device=context.mask_indices.device)
+                retain_mask = torch.zeros_like(masked_positions, dtype=torch.bool, device=device)
                 retain_mask[retain_indices] = True
                 adjacent_and_right_selected = ((masked_positions[1:] - masked_positions[:-1]) == 1) & retain_mask[1:] & ~retain_mask[:-1]
                 retain_mask[:-1][adjacent_and_right_selected] = True
-
-                rightmost_retain_idx = masked_positions[torch.nonzero(retain_mask, as_tuple=True)[0][-1]]
+                rightmost_retain_idx = masked_positions.masked_fill(~retain_mask, -1).max()
                 evicted_before_rightmost = (masked_positions < rightmost_retain_idx) & ~retain_mask
-                evicted_before_rightmost_positions = context.processing_indices[masked_positions[evicted_before_rightmost]]
-                unprocessed_evicted_mask = context.unprocessed_positions[evicted_before_rightmost_positions]
-                if unprocessed_evicted_mask.any():
-                    # Get the indices of evicted tokens that are also unprocessed
-                    unprocessed_evicted_indices = torch.nonzero(evicted_before_rightmost & 
-                                                            torch.isin(context.processing_indices[masked_positions], 
-                                                                        evicted_before_rightmost_positions[unprocessed_evicted_mask]), 
-                                                            as_tuple=True)[0]
-                    # Update retain_mask to include these tokens
-                    retain_mask[unprocessed_evicted_indices] = True
+                if evicted_before_rightmost.any():
+                    unprocessed_mask = context.unprocessed_positions[context.processing_indices[masked_positions]]
+                    reinstate_mask = evicted_before_rightmost & unprocessed_mask
+                    if reinstate_mask.any():
+                        retain_mask |= reinstate_mask
 
-                # Get the actual indices in the sequence
-                evict_token_indices = context.processing_indices[masked_positions[~retain_mask]]
-                retain_block_mask = torch.zeros_like(context.mask_indices[0], dtype=torch.bool, device=context.mask_indices.device)
-                retain_block_mask[context.processing_indices] = True
-                retain_block_mask[evict_token_indices] = False
-
-                processing_mask = torch.ones_like(context.processing_indices, dtype=torch.bool, device=context.processing_indices.device)
-                processing_mask[masked_positions[~retain_mask]] = False
+                processing_mask = torch.ones_like(context.processing_indices, dtype=torch.bool, device=device)
+                processing_mask[masked_positions] = retain_mask
+                retained_processing_indices = context.processing_indices[processing_mask]
 
         if context.is_decode and block_key_values is not None:
             block_key_values[:, self.layer_idx, 0, :, context.processing_indices] = key_states
@@ -353,7 +338,7 @@ class SDARAttention(nn.Module):
             value_states = block_key_values[:, self.layer_idx, 1, :, :end]
 
         if token_evicting and self.layer_idx == 1:
-            context.processing_indices = torch.nonzero(retain_block_mask, as_tuple=True)[0]
+            context.processing_indices = retained_processing_indices
             query_states = query_states[:, :, processing_mask]
             input_shape = torch.Size([input_shape[0], len(context.processing_indices)])
             attention_mask = attention_mask[:, processing_mask]
