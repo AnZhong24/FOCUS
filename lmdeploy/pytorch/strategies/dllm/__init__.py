@@ -83,4 +83,5 @@ class DLLMStrategyFactory(StrategyFactoryBase):
         from .sequence import DLLMSequenceStrategy
         return DLLMSequenceStrategy(block_size=self.dllm_block_length,
                                     dllm_mask_token=self.model_config.dllm_mask_token,
-                                    enable_delayed_cache=self.dllm_config.enable_delayed_cache)
+                                    enable_delayed_cache=self.dllm_config.enable_delayed_cache,
+                                    dllm_config=self.dllm_config)

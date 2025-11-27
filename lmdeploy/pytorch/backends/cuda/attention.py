@@ -96,6 +96,217 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
         self.alibi_num_heads = self.num_heads * world_size
         self.block_sparse_size = block_sparse_size
 
+    def _fill_kv_cache_impl(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        k_scales_zeros: torch.Tensor = None,
+        v_scales_zeros: torch.Tensor = None,
+    ):
+        block_offsets = attn_metadata.block_offsets
+        q_seqlens = attn_metadata.q_seqlens
+        q_start_loc = attn_metadata.q_start_loc
+        fill_q_start_loc = q_start_loc
+        fill_seqlens = q_seqlens
+        kv_seqlens = attn_metadata.kv_seqlens
+        quant_policy = attn_metadata.quant_policy
+        processing_indices = getattr(attn_metadata, 'processing_indices', None)
+        use_delayed_cache = getattr(attn_metadata, 'use_delayed_cache', False)
+        if attn_metadata.is_decoding:
+            if use_delayed_cache and q_seqlens.numel() > 0:
+                max_q_seqlen = int(q_seqlens.max().item())
+            else:
+                max_q_seqlen = self.block_sparse_size
+        else:
+            if key is None:
+                return
+            max_q_seqlen = key.numel() // (key.size(-1) * key.size(-2))
+        fill_max_q_seqlen = max_q_seqlen
+        if attn_metadata.fill_seqlens is not None:
+            fill_seqlens = attn_metadata.fill_seqlens
+            if key is not None:
+                fill_max_q_seqlen = key.numel() // (key.size(-1) * key.size(-2))
+            fill_q_start_loc = fill_seqlens.cumsum(0) - fill_seqlens
+
+        if key is None or value is None:
+            return
+        self.fill_kv_cache(
+            key,
+            value,
+            k_cache,
+            v_cache,
+            fill_q_start_loc,
+            fill_seqlens,
+            kv_seq_length=kv_seqlens,
+            max_q_seq_length=fill_max_q_seqlen,
+            block_offsets=block_offsets,
+            k_scales_zeros=k_scales_zeros,
+            v_scales_zeros=v_scales_zeros,
+            quant_policy=quant_policy,
+            processing_indices=processing_indices if use_delayed_cache else None,
+        )
+
+    def _run_attention_impl(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        k_scales_zeros: torch.Tensor = None,
+        v_scales_zeros: torch.Tensor = None,
+        learnable_sink: torch.Tensor = None,
+        inplace: bool = True,
+    ) -> torch.Tensor:
+        block_offsets = attn_metadata.block_offsets
+        q_start_loc = attn_metadata.q_start_loc
+        q_seqlens = attn_metadata.q_seqlens
+        kv_start_loc = attn_metadata.kv_start_loc
+        kv_seqlens = attn_metadata.kv_seqlens
+        kv_flatten_size = attn_metadata.kv_flatten_size
+        quant_policy = attn_metadata.quant_policy
+        use_delayed_cache = getattr(attn_metadata, 'use_delayed_cache', False)
+        if attn_metadata.is_decoding:
+            if use_delayed_cache and q_seqlens.numel() > 0:
+                max_q_seqlen = int(q_seqlens.max().item())
+            else:
+                max_q_seqlen = self.block_sparse_size
+        else:
+            max_q_seqlen = query.numel() // (query.size(-1) * query.size(-2))
+
+        q_shape = query.shape
+        o_shape = q_shape[:-1] + (self.v_head_size, )
+        attn_output = query.new_empty(o_shape)
+        is_decoding = attn_metadata.is_decoding
+
+        if self.alibi:
+            self.alibi_paged_attention_fwd(
+                query,
+                k_cache,
+                v_cache,
+                attn_output,
+                block_offsets,
+                b_start_loc=q_start_loc,
+                b_seq_len=q_seqlens,
+                b_kv_seq_len=kv_seqlens,
+                max_input_len=max_q_seqlen,
+                head_offset=self.alibi_head_offset,
+                num_heads=self.alibi_num_heads,
+                k_scales_zeros=k_scales_zeros,
+                v_scales_zeros=v_scales_zeros,
+                quant_policy=quant_policy,
+            )
+            return attn_output
+
+        if is_decoding:
+            if use_delayed_cache:
+                self.ragged_paged_attention_fwd(
+                    query,
+                    k_cache,
+                    v_cache,
+                    attn_output,
+                    block_offsets,
+                    kv_seqlens=kv_seqlens,
+                    q_start_loc=q_start_loc,
+                    q_seqlens=q_seqlens,
+                    sm_scale=self.scale,
+                    logit_softcapping=self.logit_softcapping,
+                )
+            else:
+                self.paged_attention_fwd(
+                    query,
+                    k_cache,
+                    v_cache,
+                    attn_output,
+                    block_offsets,
+                    kv_seqlens=kv_seqlens,
+                    k_scales_zeros=k_scales_zeros,
+                    v_scales_zeros=v_scales_zeros,
+                    quant_policy=quant_policy,
+                    window_size=self.sliding_window,
+                    sm_scale=self.scale,
+                    logit_softcapping=self.logit_softcapping,
+                    sinks=learnable_sink,
+                )
+        else:
+            BLOCK_BS = k_cache.size(1)
+            out_size = (_cdiv(kv_flatten_size, BLOCK_BS) * BLOCK_BS + BLOCK_BS)
+            flatten_k, flatten_v = self.flatten_kv_cache(
+                k_cache,
+                v_cache,
+                kv_seqlens,
+                block_offsets,
+                start_loc=kv_start_loc,
+                out_size=out_size,
+                out_dtype=query.dtype,
+                k_scales_zeros=k_scales_zeros,
+                v_scales_zeros=v_scales_zeros,
+                quant_policy=quant_policy,
+            )
+            self.flash_attention_fwd(
+                query,
+                flatten_k,
+                flatten_v,
+                attn_output,
+                q_start_loc=q_start_loc,
+                q_seqlens=q_seqlens,
+                kv_start_loc=kv_start_loc,
+                kv_seqlens=kv_seqlens,
+                max_seqlen=max_q_seqlen,
+                window_size=self.sliding_window,
+                sm_scale=self.scale,
+                logit_softcapping=self.logit_softcapping,
+                sinks=learnable_sink,
+                causal=self.causal,
+                block_sparse_size=self.block_sparse_size,
+            )
+
+        return attn_output
+
+    def forward_only_fill_kv(
+        self,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        k_scales_zeros: torch.Tensor = None,
+        v_scales_zeros: torch.Tensor = None,
+    ):
+        """Expose kv fill stage separately."""
+        self._fill_kv_cache_impl(key, value, k_cache, v_cache, attn_metadata, k_scales_zeros, v_scales_zeros)
+
+    def forward_only_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        k_scales_zeros: torch.Tensor = None,
+        v_scales_zeros: torch.Tensor = None,
+        learnable_sink: torch.Tensor = None,
+        inplace: bool = True,
+    ) -> torch.Tensor:
+        """Run attention without updating cache."""
+        return self._run_attention_impl(
+            query,
+            key,
+            value,
+            k_cache,
+            v_cache,
+            attn_metadata,
+            k_scales_zeros,
+            v_scales_zeros,
+            learnable_sink,
+            inplace,
+        )
+
     def forward(
         self,
         query: torch.Tensor,
@@ -120,9 +331,9 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
         kv_flatten_size = attn_metadata.kv_flatten_size
         quant_policy = attn_metadata.quant_policy
         processing_indices = getattr(attn_metadata, 'processing_indices', None)
-        use_block_cache = getattr(attn_metadata, 'use_block_cache', False)
+        use_delayed_cache = getattr(attn_metadata, 'use_delayed_cache', False)
         if attn_metadata.is_decoding:
-            if use_block_cache and q_seqlens.numel() > 0:
+            if use_delayed_cache and q_seqlens.numel() > 0:
                 max_q_seqlen = int(q_seqlens.max().item())
             else:
                 max_q_seqlen = self.block_sparse_size
@@ -149,7 +360,7 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
                 k_scales_zeros=k_scales_zeros,
                 v_scales_zeros=v_scales_zeros,
                 quant_policy=quant_policy,
-                processing_indices=processing_indices if use_block_cache else None,
+                processing_indices=processing_indices if use_delayed_cache else None,
             )
 
         q_shape = query.shape
@@ -177,7 +388,7 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
             return attn_output
 
         if is_decoding:
-            if use_block_cache:
+            if use_delayed_cache:
                 self.ragged_paged_attention_fwd(
                     query,
                     k_cache,

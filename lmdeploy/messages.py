@@ -351,6 +351,8 @@ class PytorchEngineConfig:
         dllm_confidence_threshold (float): dllm unmasking threshold for
             dynamic unmasking.
         dllm_enable_delayed_cache (bool): enable delayed KV cache flow for DLLM decoding.
+        dllm_enable_focus (bool): enable FOCUS token-eviction refinement for DLLM decoding.
+        dllm_focus_alpha (float): Optional multiplier to derive a dynamic retain count when FOCUS is enabled.
     """
     dtype: str = 'auto'
     tp: int = 1
@@ -398,6 +400,8 @@ class PytorchEngineConfig:
     dllm_denoising_steps: int = None
     dllm_confidence_threshold: float = 0.85
     dllm_enable_delayed_cache: bool = False
+    dllm_enable_focus: bool = False
+    dllm_focus_alpha: Optional[float] = None
 
     role: EngineRole = EngineRole.Hybrid
     migration_backend: MigrationBackend = MigrationBackend.DLSlime
@@ -418,6 +422,10 @@ class PytorchEngineConfig:
         assert self.device_type in ['cuda', 'ascend', 'maca', 'camb'], (f'invalid device_type: {self.device_type}')
         assert self.block_size >= 16 and (self.block_size & (self.block_size - 1)) == 0, \
             f'block_size must be >= 16 and a power of 2, but got {self.block_size}'
+        if self.dllm_enable_focus:
+            assert self.dllm_enable_delayed_cache, '--dllm-enable-focus requires --dllm-enable-delayed-cache.'
+            assert self.dllm_focus_alpha is not None and self.dllm_focus_alpha > 0, \
+                'dllm_enable_focus requires dllm_focus_alpha (>0).'
         if self.quant_policy > 0 and self.device_type not in ['cuda', 'ascend']:
             assert False, \
                    'kv cache quantization only works for CUDA and ASCEND.'

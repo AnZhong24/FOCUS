@@ -89,6 +89,50 @@ class Attention(nn.Module):
             inplace=inplace,
         )
 
+    def forward_only_fill_kv(self,
+                             key: torch.Tensor,
+                             value: torch.Tensor,
+                             k_cache: torch.Tensor,
+                             v_cache: torch.Tensor,
+                             attn_metadata: AttentionMetadata,
+                             k_scales_zeros: torch.Tensor = None,
+                             v_scales_zeros: torch.Tensor = None):
+        """Fill KV cache without running attention."""
+        return self.impl.forward_only_fill_kv(
+            key,
+            value,
+            k_cache,
+            v_cache,
+            attn_metadata=attn_metadata,
+            k_scales_zeros=k_scales_zeros,
+            v_scales_zeros=v_scales_zeros,
+        )
+
+    def forward_only_attention(
+        self,
+        query: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        k_scales_zeros: torch.Tensor = None,
+        v_scales_zeros: torch.Tensor = None,
+        s_aux: torch.Tensor = None,
+        inplace: bool = True,
+    ) -> torch.Tensor:
+        """Run attention assuming KV cache already filled."""
+        return self.impl.forward_only_attention(
+            query,
+            key=None,
+            value=None,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            attn_metadata=attn_metadata,
+            k_scales_zeros=k_scales_zeros,
+            v_scales_zeros=v_scales_zeros,
+            learnable_sink=s_aux,
+            inplace=inplace,
+        )
+
     @staticmethod
     def update_meta_flashmla(attn_metadata: AttentionMetadata, num_attention_heads):
         get_backend().update_meta_flashmla(attn_metadata, num_attention_heads)

@@ -36,7 +36,6 @@ def _quant_int4(val1, val2):
     return q_val, scales, zeros
 
 
-
 @triton.jit
 def _fill_kv_cache_sparse_kernel(
     KStates,

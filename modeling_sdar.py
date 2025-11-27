@@ -415,7 +415,7 @@ class SDARDecoderLayer(GradientCheckpointingLayer):
         # necessary, but kept here for BC
         position_embeddings: Optional[Tuple[torch.Tensor,
                                             torch.Tensor]] = None,
-        use_block_cache: Optional[bool] = False,
+        use_delayed_cache: Optional[bool] = False,
         block_key_values: Optional[torch.Tensor] = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
@@ -431,7 +431,7 @@ class SDARDecoderLayer(GradientCheckpointingLayer):
             use_cache=use_cache,
             store_kv=store_kv,
             position_embeddings=position_embeddings,
-            use_block_cache=use_block_cache,
+            use_delayed_cache=use_delayed_cache,
             block_key_values=block_key_values,
             **kwargs,
         )
@@ -564,7 +564,7 @@ class SDARModel(SDARPreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
-        use_block_cache: Optional[bool] = False,
+        use_delayed_cache: Optional[bool] = False,
         block_key_values: Optional[torch.Tensor] = None,
         **flash_attn_kwargs: Unpack[FlashAttentionKwargs],
     ) -> BaseModelOutputWithPast:
@@ -572,11 +572,11 @@ class SDARModel(SDARPreTrainedModel):
         store_kv (`bool`, *optional*):
             Whether to store key-value pairs in the cache. If True, key-value pairs will be stored in the cache.
             If False, key-value pairs will not be stored.
-        use_block_cache (`bool`, *optional*, defaults to `False`):
+        use_delayed_cache (`bool`, *optional*, defaults to `False`):
             Whether to use block cache for efficient token selection during decoding. When enabled, allows for
             selective processing of tokens based on importance scores.
         block_key_values (`torch.Tensor`, *optional*):
-            Pre-allocated tensor for storing block cache key-value pairs. Used when `use_block_cache` is True.
+            Pre-allocated tensor for storing block cache key-value pairs. Used when `use_delayed_cache` is True.
             Shape: (batch_size, num_hidden_layers, 2, num_key_value_heads, seq_len, head_dim)
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -606,7 +606,7 @@ class SDARModel(SDARPreTrainedModel):
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache()
 
-        if use_block_cache and block_key_values is None:
+        if use_delayed_cache and block_key_values is None:
             block_key_values = torch.empty((input_ids.shape[0], self.config.num_hidden_layers, 2, self.config.num_key_value_heads, input_ids.shape[1], self.config.head_dim), 
                 device=inputs_embeds.device, dtype=inputs_embeds.dtype)
 
@@ -653,7 +653,7 @@ class SDARModel(SDARPreTrainedModel):
                 use_cache=use_cache,
                 store_kv=store_kv,
                 position_embeddings=position_embeddings,
-                use_block_cache=use_block_cache,
+                use_delayed_cache=use_delayed_cache,
                 block_key_values=block_key_values,
                 **flash_attn_kwargs,
             )
@@ -679,7 +679,7 @@ class SDARModel(SDARPreTrainedModel):
             past_key_values=past_key_values if use_cache else None,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
-            block_key_values=block_key_values if use_block_cache else None,
+            block_key_values=block_key_values if use_delayed_cache else None,
         )
 
     def _update_causal_mask(
@@ -906,7 +906,7 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
         output_hidden_states: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         logits_to_keep: Union[int, torch.Tensor] = 0,
-        use_block_cache: Optional[bool] = False,
+        use_delayed_cache: Optional[bool] = False,
         block_key_values: Optional[torch.Tensor] = None,
         **kwargs: Unpack[KwargsForCausalLM],
     ) -> CausalLMOutputWithPast:
@@ -915,11 +915,11 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
             Labels for computing the masked language modeling loss. Indices should either be in `[0, ...,
             config.vocab_size]` or -100 (see `input_ids` docstring). Tokens with indices set to `-100` are ignored
             (masked), the loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`.
-        use_block_cache (`bool`, *optional*, defaults to `False`):
+        use_delayed_cache (`bool`, *optional*, defaults to `False`):
             Whether to use block cache for efficient token selection during decoding. When enabled, allows for
             selective processing of tokens based on importance scores.
         block_key_values (`torch.Tensor`, *optional*):
-            Pre-allocated tensor for storing block cache key-value pairs. Used when `use_block_cache` is True.
+            Pre-allocated tensor for storing block cache key-value pairs. Used when `use_delayed_cache` is True.
             Shape: (batch_size, num_hidden_layers, 2, num_key_value_heads, seq_len, head_dim)
 
         Example:
@@ -954,7 +954,7 @@ class SDARForCausalLM(SDARPreTrainedModel, GenerationMixin):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             cache_position=cache_position,
-            use_block_cache=use_block_cache,
+            use_delayed_cache=use_delayed_cache,
             block_key_values=block_key_values,
             **kwargs,
         )

@@ -12,6 +12,7 @@ from lmdeploy.pytorch.disagg.conn.protocol import MigrationRequest
 from lmdeploy.pytorch.engine.model_agent import BatchedOutputs
 from lmdeploy.pytorch.messages import (HistoryTokenIds, InputEmbeddings, MessageStatus, MultiModalInputs, SamplingParam,
                                        SchedulerSession, UpdateTokenMode, _to_ndarray)
+from lmdeploy.pytorch.config import DLLMConfig
 
 from ..ar.sequence import SchedulerSequenceDefault
 from ..base.sequence import SequenceStrategy
@@ -28,6 +29,13 @@ class HistoryDLLMMask(HistoryTokenIds):
 
     def __init__(self, token_ids: np.ndarray = None, dtype: np.dtype = DLLM_MASK_DTYPE):
         super().__init__(token_ids=token_ids, dtype=dtype)
+
+
+@dataclass
+class FocusInfo:
+    mask_indices: torch.Tensor
+    unprocessed_positions: torch.Tensor
+    avg_decoded_tokens: float
 
 
 @dataclass
@@ -79,10 +87,36 @@ class DelayedCacheState:
 
 
 @dataclass
+class FocusState:
+    block_length: int
+    unprocessed_positions: torch.Tensor
+
+    @classmethod
+    def new(cls, block_length: int):
+        template = torch.ones((block_length, ), dtype=torch.bool, pin_memory=True)
+        return cls(block_length=block_length, unprocessed_positions=template.clone())
+
+    def reset(self):
+        self.unprocessed_positions.fill_(True)
+
+    def mark_processed(self, block_mask: torch.Tensor):
+        tensor = torch.as_tensor(block_mask, dtype=torch.bool)
+        tensor = tensor.to(device=self.unprocessed_positions.device, dtype=torch.bool)
+        self.unprocessed_positions &= ~tensor
+
+    def clone_unprocessed(self) -> torch.Tensor:
+        cloned = self.unprocessed_positions.clone()
+        if not cloned.is_pinned():
+            cloned = cloned.pin_memory()
+        return cloned
+
+
+@dataclass
 class SchedulerSequenceDLLM(SchedulerSequenceDefault):
 
     # For dllm
     history_dllm_mask: HistoryDLLMMask = field(default_factory=HistoryDLLMMask)
+    dllm_config: DLLMConfig | None = None
 
     def __post_init__(self):
         """Post init."""
@@ -92,6 +126,12 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
         self._delayed_cache_state: DelayedCacheState | None = None
         if self._strategy.enable_delayed_cache:
             self._delayed_cache_state = DelayedCacheState.new(self.dllm_block_length)
+        cfg = self.dllm_config
+        focus_enabled = bool(cfg and getattr(cfg, 'enable_focus', False))
+        self._focus_enabled = focus_enabled and self.delayed_cache_enabled
+        self._focus_state: FocusState | None = FocusState.new(self.dllm_block_length) if self._focus_enabled else None
+        self._focus_token_sum: float = 0.0
+        self._focus_steps: int = 0
 
     @property
     def dllm_mask(self):
@@ -128,13 +168,13 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
     def _reset_delayed_cache_state(self):
         if self._delayed_cache_state is not None:
             self._delayed_cache_state.reset()
+        if self._focus_state is not None:
+            self._focus_state.reset()
+        self._focus_token_sum = 0.0
+        self._focus_steps = 0
 
     def _update_delayed_cache_state(self):
-        if not self.delayed_cache_enabled:
-            return
         mask = self.dllm_mask
-        if mask.size == 0:
-            return
         self._delayed_cache_state.update_from_mask(mask)
 
     def get_processing_indices(self) -> Optional[torch.Tensor]:
@@ -145,10 +185,44 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
         # ascending, so keep the natural torch.nonzero ordering.
         return indices
 
-    # def get_uncached_bitmap(self) -> Optional[np.ndarray]:
-    #     if not self.delayed_cache_enabled:
-    #         return None
-    #     return self._delayed_cache_state.uncached_positions.copy()
+    def get_focus_info(self) -> Optional[FocusInfo]:
+        if not self._focus_enabled or self._focus_state is None:
+            return None
+        mask_np = self.dllm_mask
+        mask_tensor = torch.from_numpy(mask_np == DLLM_MASKED)
+        mask_tensor = mask_tensor.to(dtype=torch.bool)
+        if not mask_tensor.is_pinned():
+            mask_tensor = mask_tensor.pin_memory()
+        unprocessed = self._focus_state.clone_unprocessed()
+        avg_tokens = 1.0
+        if self._focus_steps > 0:
+            avg_tokens = self._focus_token_sum / self._focus_steps
+        return FocusInfo(mask_indices=mask_tensor,
+                         unprocessed_positions=unprocessed,
+                         avg_decoded_tokens=avg_tokens)
+
+    def mark_focus_processed(self, processed_positions: Optional[Any]):
+        if (processed_positions is None or not self._focus_enabled or self._focus_state is None):
+            return
+        block_len = self.dllm_block_length
+        mask = torch.zeros((block_len, ), dtype=torch.bool)
+        if isinstance(processed_positions, torch.Tensor):
+            indices = processed_positions.to(dtype=torch.long).flatten()
+        else:
+            indices = torch.as_tensor(processed_positions, dtype=torch.long)
+        if indices.numel() == 0:
+            return
+        valid = (indices >= 0) & (indices < block_len)
+        if valid.numel() == 0:
+            return
+        mask[indices[valid]] = True
+        self._focus_state.mark_processed(mask)
+
+    def update_focus_stats(self, decoded_tokens: Optional[int]):
+        if (not self._focus_enabled or decoded_tokens is None or int(decoded_tokens) <= 0):
+            return
+        self._focus_token_sum += int(decoded_tokens)
+        self._focus_steps += 1
 
     def set_stop_pos(self, pos: int):
         dllm_block_length = self.dllm_block_length
@@ -278,10 +352,15 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
 
 class DLLMSequenceStrategy(SequenceStrategy):
 
-    def __init__(self, block_size: int, dllm_mask_token: int, enable_delayed_cache: bool = False) -> None:
+    def __init__(self,
+                 block_size: int,
+                 dllm_mask_token: int,
+                 enable_delayed_cache: bool = False,
+                 dllm_config: DLLMConfig = None) -> None:
         self.block_size = block_size
         self.dllm_mask_token = dllm_mask_token
         self.enable_delayed_cache = enable_delayed_cache
+        self.dllm_config = dllm_config
 
     def make_sequence(self,
                       seq_id: int,
@@ -298,7 +377,8 @@ class DLLMSequenceStrategy(SequenceStrategy):
                                      adapter_name=adapter_name,
                                      migration_request=migration_request,
                                      resp_cache=resp_cache,
-                                     preserve_cache=preserve_cache)
+                                     preserve_cache=preserve_cache,
+                                     dllm_config=self.dllm_config)
 
     def update_running(self, running: SeqList, batched_outputs: BatchedOutputs, is_decoding: bool) -> None:
         """Update running sequences."""
@@ -324,12 +404,27 @@ class DLLMSequenceStrategy(SequenceStrategy):
             if msg.status != MessageStatus.LOCKED:
                 continue
 
-            if self.enable_delayed_cache and is_decoding:
-                # Update delayed cache state using the pre-unmask mask so each
-                # newly unmasked token is processed at least once more.
-                msg._update_delayed_cache_state()
+            prev_focus_mask = None
+            if is_decoding and msg._focus_enabled:
+                prev_focus_mask = msg.dllm_mask.copy()
+
+            if is_decoding:
+                if self.enable_delayed_cache:
+                    # Refresh delayed-cache bookkeeping using the existing mask
+                    # so newly unmasked tokens still get one more iteration.
+                    msg._update_delayed_cache_state()
+                if msg._focus_enabled:
+                    processed_positions = model_meta.get('focus_processed_indices')
+                    msg.mark_focus_processed(processed_positions)
             # fill token
             msg.update_token_ids(token, dllm_mask=mask, model_meta=model_meta, mode=update_mode)
+            if is_decoding and msg._focus_enabled:
+                curr_mask = msg.dllm_mask
+                decoded_count = None
+                if prev_focus_mask is not None and curr_mask is not None and prev_focus_mask.shape == curr_mask.shape:
+                    newly_unmasked = ((prev_focus_mask == DLLM_MASKED) & (curr_mask == DLLM_UNMASKED))
+                    decoded_count = int(newly_unmasked.sum())
+                msg.update_focus_stats(decoded_count)
             if stop:
                 msg.set_stop_pos(stop_pos[idx])
                 msg.status = MessageStatus.TO_BE_MIGRATED if msg.preserve_cache else MessageStatus.STOPPED

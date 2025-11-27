@@ -25,7 +25,7 @@ def block_diffusion_generate(
         confidence_threshold=0.9, #0.85,
         eb_threshold=None,
         stopping_criteria_idx=None,
-        use_block_cache=False,
+        use_delayed_cache=False,
         block_size=32,
         strategy="none",
         alpha=-1.0,
@@ -68,7 +68,7 @@ def block_diffusion_generate(
               past_key_values=past_key_values,
               use_cache=True,
               store_kv=True,
-              use_block_cache=False,
+              use_delayed_cache=False,
               block_size=block_size)
 
     num_transfer_tokens = get_num_transfer_tokens(
@@ -87,7 +87,7 @@ def block_diffusion_generate(
                                         block_length:(num_block+1)*block_length]
         
         # Initialize delay cache tracking for the current block
-        if use_block_cache:
+        if use_delayed_cache:
             block_key_values = None
             uncached_positions = torch.ones(block_length, dtype=torch.bool, device=cur_x.device)
             unprocessed_positions = torch.ones(block_length, dtype=torch.bool, device=cur_x.device)
@@ -107,11 +107,11 @@ def block_diffusion_generate(
                       past_key_values=past_key_values,
                       use_cache=True,
                       store_kv=True,
-                      use_block_cache=False)
+                      use_delayed_cache=False)
                 break
 
             # Delay cache mechanism
-            if use_block_cache:
+            if use_delayed_cache:
                 # NOTE: kernels rely on these indices being sorted ascending,
                 # torch.nonzero preserves that order so avoid reordering.
                 processing_indices = torch.nonzero(uncached_positions, as_tuple=True)[0]
@@ -126,7 +126,7 @@ def block_diffusion_generate(
                     past_key_values=past_key_values,
                     use_cache=True,
                     store_kv=False,
-                    use_block_cache=True,
+                    use_delayed_cache=True,
                     block_key_values=block_key_values)
                 logits, block_key_values = output.logits, output.block_key_values
 
@@ -153,7 +153,7 @@ def block_diffusion_generate(
                                position_ids=cur_position_ids,
                                past_key_values=past_key_values,
                                use_cache=True,
-                               use_block_cache=False,
+                               use_delayed_cache=False,
                                store_kv=False).logits
                 num_processed_tokens += block_length
                 full_logits = logits
@@ -226,7 +226,7 @@ def parse_args():
                         help="entropy threshold for entropy bounded sampling")
     parser.add_argument("--stopping_criteria_idx", type=int, nargs="+", default=None,
                         help="List of token IDs that stop generation (e.g. eos_token_id)")
-    parser.add_argument("--use_block_cache", action='store_true',
+    parser.add_argument("--use_delayed_cache", action='store_true',
                         help="Enable delay cache mechanism")
     parser.add_argument("--block_size", type=int, default=32,
                         help="Block size for delay cache mechanism")
@@ -303,7 +303,7 @@ if __name__ == "__main__":
     tokens = {k: v.to(model.device) for k, v in tokens.items()}
 
     # Set K and strategy in context for token quitting
-    if args.use_block_cache and args.K is not None and args.strategy is not None:
+    if args.use_delayed_cache and args.K is not None and args.strategy is not None:
         from context import set_context
         set_context(is_decode=True, K=args.K, strategy=args.strategy)
     
@@ -321,7 +321,7 @@ if __name__ == "__main__":
         confidence_threshold=args.confidence_threshold,
         eb_threshold=args.eb_threshold,
         stopping_criteria_idx=args.stopping_criteria_idx,
-        use_block_cache=args.use_block_cache,
+        use_delayed_cache=args.use_delayed_cache,
         block_size=args.block_size,
     )
 

@@ -5,7 +5,7 @@
 - Preserve existing decoding behaviour when the feature is disabled and guard the new pathway behind explicit configuration switches.
 
 ## Key References
-- `modeling_sdar.py`: encoder/decoder changes for delayed cache flow (`use_block_cache`, selective KV updates).
+- `modeling_sdar.py`: encoder/decoder changes for delayed cache flow (`use_delayed_cache`, selective KV updates).
 - `focus_generate.py`: orchestration of delayed cache passes and context updates (`uncached_positions`, span derivation, etc.).
 - LMDeploy components that must cooperate:
   - Sequence management: `lmdeploy/pytorch/strategies/dllm/sequence.py`
@@ -33,7 +33,7 @@
    - When delayed cache is disabled, skip these ragged helpers entirely and re-use the existing `q_seqlens = block_len` contract so we can call the legacy kernels unchanged.
 
 3. **Attention Metadata Extensions**
-   - Avoid the external `context.py`; instead, extend the attention metadata carried in `StepContext.attn_metadata` to transport delayed-cache fields (ragged `q_start_loc`, ragged `q_seqlens`, `use_block_cache`, etc.).
+   - Avoid the external `context.py`; instead, extend the attention metadata carried in `StepContext.attn_metadata` to transport delayed-cache fields (ragged `q_start_loc`, ragged `q_seqlens`, `use_delayed_cache`, etc.).
    - Guarantee that the flattened query tensor respects `[q_start_loc[i], q_start_loc[i] + q_seqlens[i])` so CTAs can compute pointer math without extra bookkeeping.
    - Ensure metadata defaults collapse to “full block” when delayed cache is disabled so existing kernels remain unaffected.
 
@@ -49,7 +49,7 @@
    - Augment `DLLMModelAgentStrategy` (`model_agent.py`) to:
      1. Derive `uncached_positions` and collapse them into contiguous `[start, len]` spans per sequence for denoising steps.
      2. If the block is fully unmaksed, emit the single span `[start=0, len=block_len]` so the kernel flushes the entire block before returning to dense mode.
-     3. Invoke the model with delayed-cache parameters (`use_block_cache=True`) while relying on LMDeploy’s in-place KV storage, merge partial logits, and update `uncached_positions` using the stride-wise check prior to unmasking.
+     3. Invoke the model with delayed-cache parameters (`use_delayed_cache=True`) while relying on LMDeploy’s in-place KV storage, merge partial logits, and update `uncached_positions` using the stride-wise check prior to unmasking.
      4. At the tail of each decode pass, call into the sequence helpers added in Step 2 to (a) mark any tokens that became stable during this pass and (b) regenerate the ragged metadata for the next pass. This ensures the second through Nth passes only touch the newly unstable spans instead of reprocessing the entire block.
 
 7. **Model Runtime Support & Kernel Selection**

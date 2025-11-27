@@ -172,6 +172,55 @@ class DLLMModelAgentStrategy(ModelAgentStrategy):
         full_logits[batch_indices, proc_indices] = assign_logits
         return full_logits.view(-1, vocab_size)
 
+    def _temporarily_cache_unprocessed(self, dllm_mask: torch.Tensor,
+                                       inputs: ModelInputs) -> Optional[List[Optional[torch.Tensor]]]:
+        """Mark unprocessed masked slots as cached before unmasking."""
+        if not self._use_delayed_cache(inputs):
+            return None
+        proc_indices = inputs.processing_indices
+        proc_q_lens = inputs.processing_q_lens
+        if proc_indices is None or proc_q_lens is None:
+            return None
+        block_size = self.block_size
+        mask_view = dllm_mask.view(-1, block_size)
+        device = dllm_mask.device
+        proc_indices = proc_indices.to(device=device, dtype=torch.long)
+        proc_q_lens = proc_q_lens.to(device=device, dtype=torch.long)
+        cached_masks: List[Optional[torch.Tensor]] = []
+        start = 0
+        for seq_id in range(proc_q_lens.numel()):
+            length = int(proc_q_lens[seq_id].item())
+            seq_mask = mask_view[seq_id]
+            if length >= block_size:
+                cached_masks.append(None)
+                start += length
+                continue
+            seq_proc = proc_indices.new_empty((0, ), dtype=torch.long)
+            if length > 0:
+                seq_proc = proc_indices[start:start + length]
+            start += length
+            unprocessed = torch.ones(block_size, dtype=torch.bool, device=device)
+            if seq_proc.numel() > 0:
+                unprocessed.scatter_(0, seq_proc, False)
+            candidate = unprocessed & (seq_mask == consts.DLLM_MASKED)
+            if candidate.any():
+                seq_mask[candidate] = consts.DLLM_CACHED
+                cached_masks.append(candidate.clone())
+            else:
+                cached_masks.append(None)
+        return cached_masks
+
+    def _restore_cached_unprocessed(self, dllm_mask: torch.Tensor, cached_masks: Optional[List[Optional[torch.Tensor]]]):
+        """Restore cached slots to the masked state after unmasking."""
+        if not cached_masks:
+            return
+        block_size = self.block_size
+        mask_view = dllm_mask.view(-1, block_size)
+        for seq_id, mask in enumerate(cached_masks):
+            if mask is None:
+                continue
+            seq_mask = mask_view[seq_id]
+            seq_mask[mask] = consts.DLLM_MASKED
 
     def reshape_logits(self, logits: torch.Tensor, inputs: ModelInputs) -> torch.Tensor:
         if not self._use_delayed_cache(inputs):
@@ -283,7 +332,9 @@ class DLLMModelAgentStrategy(ModelAgentStrategy):
         input_ids = inputs.input_ids
         input_ids = self.slice_outputs(input_ids.flatten(), inputs.seq_length)
 
+        cached_masks = self._temporarily_cache_unprocessed(dllm_mask, inputs)
         dllm_mask, next_token_ids = self.unmasking_processor(logits, input_ids, next_token_ids, dllm_mask)
+        self._restore_cached_unprocessed(dllm_mask, cached_masks)
 
         extra_inputs.dllm_mask = dllm_mask
         return next_token_ids, extra_inputs

@@ -289,6 +289,8 @@ def parse_args():
     ArgumentHelper.dllm_denoising_steps(pt_group)
     ArgumentHelper.dllm_confidence_threshold(pt_group)
     ArgumentHelper.dllm_enable_delayed_cache(pt_group)
+    ArgumentHelper.dllm_enable_focus(pt_group)
+    ArgumentHelper.dllm_focus_alpha(pt_group)
 
     tp_act = ArgumentHelper.tp(pt_group)
     cache_count_act = ArgumentHelper.cache_max_entry_count(pt_group)
@@ -353,6 +355,8 @@ def main():
             dllm_denoising_steps=args.dllm_denoising_steps,
             dllm_confidence_threshold=args.dllm_confidence_threshold,
             dllm_enable_delayed_cache=args.dllm_enable_delayed_cache,
+            dllm_enable_focus=args.dllm_enable_focus,
+            dllm_focus_alpha=args.dllm_focus_alpha,
             max_prefill_token_num=args.concurrency * args.dllm_block_length if args.dllm_block_length is not None else 4096,
         )
 

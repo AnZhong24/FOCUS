@@ -98,6 +98,8 @@ class SubCliServe:
         ArgumentHelper.dllm_denoising_steps(pt_group)
         ArgumentHelper.dllm_confidence_threshold(pt_group)
         ArgumentHelper.dllm_enable_delayed_cache(pt_group)
+        ArgumentHelper.dllm_enable_focus(pt_group)
+        ArgumentHelper.dllm_focus_alpha(pt_group)
         ArgumentHelper.enable_return_routed_experts(pt_group)
 
         # common engine args
@@ -232,6 +234,9 @@ class SubCliServe:
                 dllm_unmasking_strategy=args.dllm_unmasking_strategy,
                 dllm_denoising_steps=args.dllm_denoising_steps,
                 dllm_confidence_threshold=args.dllm_confidence_threshold,
+                dllm_enable_delayed_cache=args.dllm_enable_delayed_cache,
+                dllm_enable_focus=args.dllm_enable_focus,
+                dllm_focus_alpha=args.dllm_focus_alpha,
             )
         else:
             from lmdeploy.messages import TurbomindEngineConfig

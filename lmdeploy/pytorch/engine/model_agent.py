@@ -248,11 +248,21 @@ def model_forward(
                 context=context,
             )
             output = model(**input_dict)
+            focus_processed = context.get_focus_processed_indices()
             if not isinstance(output, Dict):
                 output = dict(hidden_states=output)
             # InternVL-3.5-Flash will change the seqlen, model_metas during forward
             if context.model_metas is not None and context.model_metas[0] is not None:
                 model_metas = context.model_metas
+            if focus_processed is not None:
+                if model_metas is None:
+                    model_metas = [None] * len(focus_processed)
+                new_metas: List[Dict[str, Any]] = []
+                for meta, processed in zip(model_metas, focus_processed):
+                    entry = {} if meta is None else dict(meta)
+                    entry['focus_processed_indices'] = processed
+                    new_metas.append(entry)
+                model_metas = new_metas
             output['model_metas'] = model_metas
             output['seq_length'] = context.q_seqlens[:len(inputs.seq_length)]
             return output
@@ -441,10 +451,10 @@ class BaseModelAgent:
     def _postprocess_forward_output(self, output: dict, inputs: ModelInputs):
         """Post process forward output."""
         hidden_states = output['hidden_states']
-        use_block_cache = bool(inputs.processing_indices is not None and inputs.processing_q_lens is not None)
+        use_delayed_cache = bool(inputs.processing_indices is not None)
         seq_length = output.get('seq_length')
         hidden_tensor = hidden_states[0]
-        if use_block_cache:
+        if use_delayed_cache:
             output['seq_length'] = inputs.seq_length
             output['hidden_states'] = hidden_states
             return output

@@ -1,7 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import enum
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Literal, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 import torch
 
@@ -403,6 +403,8 @@ class DLLMConfig:
     denoising_steps: int = None
     confidence_threshold: float = 0.85
     enable_delayed_cache: bool = False
+    enable_focus: bool = False
+    focus_alpha: Optional[float] = None
 
 
 @dataclass
@@ -425,7 +427,9 @@ class MiscConfig:
                                  unmasking_strategy=dllm_unmasking_strategy,
                                  denoising_steps=engine_config.dllm_denoising_steps,
                                  confidence_threshold=engine_config.dllm_confidence_threshold,
-                                 enable_delayed_cache=engine_config.dllm_enable_delayed_cache)
+                                 enable_delayed_cache=engine_config.dllm_enable_delayed_cache,
+                                 enable_focus=engine_config.dllm_enable_focus,
+                                 focus_alpha=engine_config.dllm_focus_alpha)
         misc_config = cls(
             custom_module_map=engine_config.custom_module_map,
             empty_init=engine_config.empty_init,

@@ -696,6 +696,22 @@ class ArgumentHelper:
                                    help='Enable delayed KV-cache updates for DLLM diffusion decoding.')
 
     @staticmethod
+    def dllm_enable_focus(parser):
+        """Enable FOCUS pruning for DLLM decoding."""
+        return parser.add_argument('--dllm-enable-focus',
+                                   action='store_true',
+                                   default=False,
+                                   help='Enable FOCUS token-importance pruning between the first two SDAR layers.')
+
+    @staticmethod
+    def dllm_focus_alpha(parser):
+        """Focus retain ratio."""
+        return parser.add_argument('--dllm-focus-alpha',
+                                   type=float,
+                                   default=None,
+                                   help='Optional ratio used to derive the number of retained tokens when FOCUS is enabled.')
+
+    @staticmethod
     def enable_return_routed_experts(parser):
         """Add argument return routed experts to parser."""
 
