@@ -100,10 +100,10 @@ class SDARAttention(nn.Module):
         """Rewrite of LlamaAttention.forward."""
         focus_mask = None
         context = self._get_context()
-        focus_active = bool(context and context.focus_enabled() and context.is_decoding)
+        focus_active = bool(context.focus_enabled() and context.is_decoding)
         if focus_active:
             ctx_meta = getattr(context, 'attn_metadata', None)
-            if ctx_meta is not None and ctx_meta is not attn_metadata:
+            if ctx_meta is not attn_metadata:
                 attn_metadata = ctx_meta
 
         # qkv proj
@@ -141,8 +141,6 @@ class SDARAttention(nn.Module):
                 self._apply_focus_pruning(context, hidden_states, query_states, key_states, value_states)
             attn_metadata = context.attn_metadata
 
-        # if context and context.is_decoding and self.layer_idx in [0, 1]:
-        #     print("layer_idx", self.layer_idx, "query_states.shape", query_states.shape, "key_states.shape", key_states.shape)
         # attention
         if focus_fill_only:
             attn_output = self.attn_fwd.forward_only_attention(
@@ -172,17 +170,9 @@ class SDARAttention(nn.Module):
         attn_output = self.o_proj(attn_output)
         return attn_output, focus_mask
 
-    def _get_context(self) -> Optional[StepContext]:
+    def _get_context(self) -> StepContext:
         mgr = get_step_ctx_manager()
         return mgr.current_context()
-
-    def _should_debug_kv_metadata(self, context: Optional[StepContext]) -> bool:
-        """Return True when kv_seqlens should be logged verbosely."""
-        if context is None or not context.is_decoding:
-            return False
-        if not getattr(context, 'use_delayed_cache', False):
-            return False
-        return self.layer_idx <= 2
 
     def _compute_focus_importance(self, context: StepContext, query_states: torch.Tensor, key_states: torch.Tensor):
         view = context.focus_view
@@ -212,24 +202,11 @@ class SDARAttention(nn.Module):
         importance = attn_sum.sum(dim=0)
         return importance.to(dtype=query_states.dtype)
 
-    def _update_rotary_after_prune(self, context: Optional[StepContext], retain_mask: torch.Tensor):
+    def _update_rotary_after_prune(self, context: StepContext, retain_mask: torch.Tensor):
         """Trim cached rotary embeddings to match the retained tokens."""
-        if context is None or retain_mask is None:
-            return
         rotary = getattr(context, 'rotary_pos_emb', None)
-        if rotary is None:
-            return
         cos, sin = rotary
-        if cos is None or sin is None:
-            return
-        num_tokens = retain_mask.numel()
-        if num_tokens == 0 or cos.size(0) != num_tokens:
-            return
-        if bool(retain_mask.all().item()):
-            return
-        keep_idx = torch.nonzero(retain_mask, as_tuple=False).squeeze(-1)
-        if keep_idx.numel() == num_tokens:
-            return
+        keep_idx = torch.arange(retain_mask.numel(), device=retain_mask.device)[retain_mask]
         cos = cos.index_select(0, keep_idx)
         sin = sin.index_select(0, keep_idx)
         context.rotary_pos_emb = (cos, sin)
@@ -243,8 +220,6 @@ class SDARAttention(nn.Module):
         gathered_key = key_states.index_select(0, mask_indices)
         mask_offsets = mask_indptr.to(device=device, dtype=torch.long)
         lengths = mask_offsets[1:] - mask_offsets[:-1]
-        if lengths.numel() == 0:
-            return query_states.new_zeros((0, ), dtype=query_states.dtype)
         num_seq = lengths.size(0)
         max_len_val = lengths.max().item() if lengths.numel() > 0 else 0
         if max_len_val <= 0:
@@ -281,13 +256,12 @@ class SDARAttention(nn.Module):
         key_mask_rows = valid_mask[:, None, None, :].expand(num_seq, self.num_attention_heads, max_len, max_len)
         key_mask_rows = key_mask_rows.reshape(-1, max_len)
         row_probs = logits_flat.new_zeros((logits_flat.size(0), max_len), dtype=query_states.dtype)
-        if query_mask.any():
-            valid_logits = logits_flat[query_mask]
-            pooled = F.max_pool1d(valid_logits.unsqueeze(1), kernel_size=3, stride=1, padding=1).squeeze(1)
-            valid_keys = key_mask_rows[query_mask]
-            pooled = pooled.masked_fill(~valid_keys, float('-inf'))
-            attn_weights = torch.softmax(pooled, dim=-1, dtype=torch.float32)
-            row_probs[query_mask] = attn_weights.to(dtype=query_states.dtype)
+        valid_logits = logits_flat[query_mask]
+        pooled = F.max_pool1d(valid_logits.unsqueeze(1), kernel_size=3, stride=1, padding=1).squeeze(1)
+        valid_keys = key_mask_rows[query_mask]
+        pooled = pooled.masked_fill(~valid_keys, float('-inf'))
+        attn_weights = torch.softmax(pooled, dim=-1, dtype=torch.float32)
+        row_probs[query_mask] = attn_weights.to(dtype=query_states.dtype)
         row_probs = row_probs.view(num_seq, self.num_attention_heads, max_len, max_len)
         importance = row_probs.sum(dim=2)
         importance = importance * valid_mask[:, None, :]
@@ -335,11 +309,9 @@ class SDARAttention(nn.Module):
         mask_lengths = (mask_indptr_dev[1:] - mask_indptr_dev[:-1]).to(device=device)
         avg_tokens = view.avg_decoded_tokens.to(device=device, dtype=torch.float32)
         targets = self._compute_focus_targets(mask_lengths, avg_tokens, context.focus_params)
-        exceed_counts = torch.zeros_like(targets)
         should_prune = (targets > 0) & (mask_lengths > targets)
 
         retain_processing_mask = torch.ones_like(proc_indices, dtype=torch.bool, device=device)
-        any_pruned = False
 
         total_masked = int(mask_lengths.sum().item()) if mask_lengths.numel() > 0 else 0
         should_prune_any = bool(should_prune.numel() > 0 and torch.any(should_prune).item())
@@ -370,23 +342,21 @@ class SDARAttention(nn.Module):
             padded_block_positions[seq_ids, rel_pos] = seq_block_positions_flat
             effective_targets = torch.where(should_prune, targets, torch.zeros_like(targets))
             selection_mask = self._select_focus_mask_batch(padded_delta, valid_mask, effective_targets)
-            exceed_counts = torch.where(should_prune, selection_mask.sum(dim=1).to(targets.dtype),
-                                        torch.zeros_like(targets))
             retain_mask = torch.where(should_prune.unsqueeze(1), selection_mask, valid_mask)
             block_unprocessed = block_unprocessed_view.to(device=device, dtype=torch.bool)
             retain_mask = self._enforce_focus_rules_batch(padded_block_positions, block_unprocessed, retain_mask,
                                                             valid_mask)
             retain_mask_flat = retain_mask[seq_ids, rel_pos]
             retain_processing_mask[token_indices] = retain_mask_flat
-            any_pruned = bool(torch.any(~retain_mask_flat).item())
 
         context.focus_first_layer_scores = None
 
+        retain_idx = torch.arange(retain_processing_mask.size(0), device=device)[retain_processing_mask]
+        any_pruned = retain_idx.numel() != retain_processing_mask.size(0)
         if not any_pruned:
             context.update_focus_processed_mask()
             return query_states, key_states, value_states, hidden_states, None
 
-        retain_idx = torch.arange(retain_processing_mask.size(0), device=device)[retain_processing_mask]
         query_states = query_states.index_select(0, retain_idx)
         key_states = key_states.index_select(0, retain_idx)
         value_states = value_states.index_select(0, retain_idx)
@@ -395,31 +365,26 @@ class SDARAttention(nn.Module):
         lengths_device = orig_q_lens.device
         batch_size = orig_q_lens.size(0)
         new_q_lens = torch.zeros_like(orig_q_lens, device=lengths_device, dtype=orig_q_lens.dtype)
-        total_tokens = int(orig_q_lens.sum().item())
-        if total_tokens > 0:
-            mask_vals = retain_processing_mask.to(dtype=new_q_lens.dtype)
-            seq_lengths = orig_q_lens.to(device=mask_vals.device, dtype=torch.long)
-            token_seq_ids = torch.repeat_interleave(torch.arange(batch_size, device=mask_vals.device, dtype=torch.long),
-                                                    seq_lengths,
-                                                    output_size=total_tokens)
-            seq_sums = torch.zeros(batch_size, dtype=new_q_lens.dtype, device=mask_vals.device)
-            seq_sums.scatter_add_(0, token_seq_ids, mask_vals[:total_tokens])
-            new_q_lens.copy_(seq_sums.to(device=lengths_device, dtype=new_q_lens.dtype))
+        mask_vals = retain_processing_mask.to(dtype=new_q_lens.dtype)
+        seq_lengths = orig_q_lens.to(device=mask_vals.device, dtype=torch.long)
+        token_seq_ids = torch.repeat_interleave(torch.arange(batch_size, device=mask_vals.device, dtype=torch.long),
+                                                seq_lengths)
+        seq_sums = torch.zeros(batch_size, dtype=new_q_lens.dtype, device=mask_vals.device)
+        seq_sums.scatter_add_(0, token_seq_ids, mask_vals)
+        new_q_lens.copy_(seq_sums.to(device=lengths_device, dtype=new_q_lens.dtype))
         new_q_lens = new_q_lens.to(device=context.q_seqlens.device, dtype=context.q_seqlens.dtype)
         new_proc_indices = proc_indices[retain_processing_mask]
 
         context.update_processing_view(new_proc_indices, new_q_lens)
         context.refresh_attention_metadata()
         context.update_focus_processed_mask()
-        if context.position_ids is not None:
-            mask = retain_processing_mask.to(context.position_ids.device)
-            context.position_ids = context.position_ids[:, mask]
+        mask = retain_processing_mask.to(context.input_ids.device)
+        context.input_ids = context.input_ids[:, mask]
+        mask = retain_processing_mask.to(context.position_ids.device)
+        context.position_ids = context.position_ids[:, mask]
         if context.attention_mask is not None:
             mask = retain_processing_mask.to(context.attention_mask.device)
             context.attention_mask = context.attention_mask[:, mask]
-        if context.input_ids is not None:
-            mask = retain_processing_mask.to(context.input_ids.device)
-            context.input_ids = context.input_ids[:, mask]
         if context.input_embeddings is not None:
             mask_gpu = retain_processing_mask.to(context.input_embeddings.device)
             context.input_embeddings = context.input_embeddings[:, mask_gpu, :]
@@ -432,22 +397,19 @@ class SDARAttention(nn.Module):
 
     def _compute_focus_targets(self, mask_lengths: torch.Tensor, avg_tokens: torch.Tensor,
                                focus_params) -> torch.Tensor:
-        targets = mask_lengths.clone()
-        if focus_params.focus_alpha is not None and focus_params.focus_alpha > 0 and avg_tokens is not None:
-            avg_tokens = torch.maximum(avg_tokens, torch.ones_like(avg_tokens))
-            retain = torch.ceil(avg_tokens * focus_params.focus_alpha).to(mask_lengths.dtype)
-            retain = torch.clamp(retain, min=1)
-            targets = torch.minimum(mask_lengths, retain)
+        avg_tokens = torch.maximum(avg_tokens, torch.ones_like(avg_tokens))
+        retain = torch.ceil(avg_tokens * focus_params.focus_alpha).to(mask_lengths.dtype)
+        retain = torch.clamp(retain, min=1)
+        targets = torch.minimum(mask_lengths, retain)
         targets = torch.where(mask_lengths <= 0, torch.zeros_like(targets), targets)
         return targets
 
     def _build_ranked_selection(self, scores: torch.Tensor, valid_mask: torch.Tensor, targets: torch.Tensor,
                                 descending: bool) -> torch.Tensor:
         device = scores.device
-        scores_fp32 = scores.to(torch.float32)
         fill_value = float('-inf') if descending else float('inf')
-        scores_fp32 = scores_fp32.masked_fill(~valid_mask, fill_value)
-        order = torch.argsort(scores_fp32, dim=-1, descending=descending)
+        scores = scores.masked_fill(~valid_mask, fill_value)
+        order = torch.argsort(scores, dim=-1, descending=descending)
         rank_range = torch.arange(scores.size(-1), device=device, dtype=targets.dtype).unsqueeze(0).expand_as(order)
         rank_mask = rank_range < targets.unsqueeze(1)
         selection = torch.zeros(valid_mask.shape, device=device, dtype=torch.int64)
@@ -459,15 +421,14 @@ class SDARAttention(nn.Module):
     def _select_dynamic_mask(self, scores: torch.Tensor, valid_mask: torch.Tensor,
                              targets: torch.Tensor) -> torch.Tensor:
         base_selection = self._build_ranked_selection(scores, valid_mask, targets, descending=True)
-        scores_fp32 = scores.to(torch.float32)
-        masked_scores = scores_fp32.masked_fill(~valid_mask, 0.0)
-        counts = valid_mask.sum(dim=-1).clamp(min=1).to(scores_fp32.dtype)
+        masked_scores = scores.masked_fill(~valid_mask, 0.0)
+        counts = valid_mask.sum(dim=-1).clamp(min=1).to(masked_scores.dtype)
         mean = masked_scores.sum(dim=-1) / counts
         diff = (masked_scores - mean.unsqueeze(1)) * valid_mask
         variance = diff.pow(2).sum(dim=-1) / counts
         std = torch.sqrt(variance)
         threshold = mean + std
-        candidate_mask = (scores_fp32 >= threshold.unsqueeze(1)) & valid_mask
+        candidate_mask = (scores >= threshold.unsqueeze(1)) & valid_mask
         candidate_counts = candidate_mask.sum(dim=-1).to(targets.dtype)
         positive_targets = targets > 0
         use_threshold = positive_targets & (candidate_counts >= targets)
@@ -490,14 +451,10 @@ class SDARAttention(nn.Module):
                                    retain_mask: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
         device = retain_mask.device
         block_unprocessed = block_unprocessed.to(device=device, dtype=torch.bool)
-        if block_unprocessed.dim() == 1:
-            block_unprocessed = block_unprocessed.unsqueeze(0)
-        assert block_unprocessed.size(0) == retain_mask.size(0), 'Focus runtime view does not match sequence count.'
-        if block_positions.size(-1) > 1:
-            adjacency = (block_positions[:, 1:] - block_positions[:, :-1]) == 1
-            adjacency = adjacency & valid_mask[:, 1:] & valid_mask[:, :-1]
-            adjust = adjacency & retain_mask[:, 1:] & (~retain_mask[:, :-1])
-            retain_mask[:, :-1] |= adjust
+        adjacency = (block_positions[:, 1:] - block_positions[:, :-1]) == 1
+        adjacency = adjacency & valid_mask[:, 1:] & valid_mask[:, :-1]
+        adjust = adjacency & retain_mask[:, 1:] & (~retain_mask[:, :-1])
+        retain_mask[:, :-1] |= adjust
         retain_valid = retain_mask & valid_mask
         no_keep = (~retain_valid).all(dim=-1)
         if torch.any(no_keep):
