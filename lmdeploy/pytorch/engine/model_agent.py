@@ -1038,6 +1038,7 @@ class BaseModelAgent:
             dllm_config=self.misc_config.dllm_config,
             strategy_factory=self.strategy_factory,
             enable_return_routed_experts=enable_return_routed_experts,
+            max_batch_size=self.cache_config.max_batches,
         )
         patched_model = build_patched_model(self.model_config,
                                             device=device,

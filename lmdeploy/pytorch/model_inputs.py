@@ -136,6 +136,9 @@ class FocusRuntimeView:
     avg_decoded_tokens: torch.Tensor
     processing_mask_global_indices: torch.LongTensor
     processing_mask_indptr: torch.IntTensor
+    processing_mask_total: int = 0
+    processing_mask_max_len: int = 0
+    processing_mask_prunable: bool = False
 
 
 def get_flatten_multimodals(vision_inputs: VisionModelInputs):
@@ -445,17 +448,12 @@ class StepContext:
 
         def _gather_flat_tensor(tensor: torch.Tensor, full_lengths: torch.Tensor, gathered_lengths: torch.Tensor,
                                 gathered_indices: torch.Tensor):
-            total_gather = int(gathered_lengths.sum().item()) if gathered_lengths.numel() > 0 else 0
-            if total_gather == 0:
-                new_shape = list(tensor.shape)
-                new_shape[-1] = 0
-                return tensor.new_empty(new_shape)
             tensor_device = tensor.device
             full_lengths_dev = full_lengths.to(device=tensor_device)
             gathered_lengths_dev = gathered_lengths.to(device=tensor_device)
             gathered_indices_dev = gathered_indices.to(device=tensor_device)
             offsets = torch.cumsum(full_lengths_dev, dim=0) - full_lengths_dev
-            expanded_offsets = torch.repeat_interleave(offsets, gathered_lengths_dev, output_size=total_gather)
+            expanded_offsets = torch.repeat_interleave(offsets, gathered_lengths_dev)
             absolute_indices = gathered_indices_dev + expanded_offsets
             return tensor.index_select(-1, absolute_indices)
 
@@ -473,8 +471,6 @@ class StepContext:
             if attention_mask_full is not None:
                 attention_mask = _gather_flat_tensor(attention_mask_full.reshape(1, -1), seq_length_full, q_seqlens,
                                                      proc_tensor)
-            else:
-                attention_mask = None
         q_start_loc = q_seqlens.cumsum(0) - q_seqlens
         position_ids = position_ids_flat.reshape(1, -1)
 
@@ -505,23 +501,33 @@ class StepContext:
         focus_view = None
         if focus_params.enabled:
             block_unprocessed = inputs.focus_block_unprocessed.to(device=device, dtype=torch.bool, non_blocking=True)
-            avg_tokens = inputs.focus_avg_tokens
-            if avg_tokens is None:
-                avg_tokens = torch.zeros((block_unprocessed.size(0), ), dtype=torch.float32)
-            avg_tokens = avg_tokens.to(device=device, dtype=torch.float32, non_blocking=True)
+            avg_tokens_host = inputs.focus_avg_tokens.to(device='cpu', dtype=torch.float32)
+            avg_tokens = avg_tokens_host.to(device=device, dtype=torch.float32, non_blocking=True)
             mask_global_indices = inputs.focus_mask_global_indices
             mask_seq_offsets = inputs.focus_mask_seq_offsets
-            if (mask_global_indices is None or mask_seq_offsets is None):
-                focus_params.enabled = False
-            else:
-                mask_global_indices = mask_global_indices.to(device=device, dtype=torch.long, non_blocking=True)
-                mask_seq_offsets = mask_seq_offsets.to(device=device, dtype=torch.int32, non_blocking=True)
-                focus_view = FocusRuntimeView(
-                    block_unprocessed=block_unprocessed,
-                    avg_decoded_tokens=avg_tokens,
-                    processing_mask_global_indices=mask_global_indices,
-                    processing_mask_indptr=mask_seq_offsets,
-                )
+            mask_seq_offsets_cpu = mask_seq_offsets.to(device='cpu', dtype=torch.long)
+            mask_lengths_cpu = mask_seq_offsets_cpu[1:] - mask_seq_offsets_cpu[:-1]
+            processing_mask_total = int(mask_seq_offsets_cpu[-1].item()) if mask_seq_offsets_cpu.numel() > 0 else 0
+            processing_mask_max_len = int(mask_lengths_cpu.max().item()) if mask_lengths_cpu.numel() > 0 else 0
+            focus_alpha = getattr(focus_params, 'focus_alpha', None)
+            avg_tokens_clamped = torch.maximum(avg_tokens_host, torch.ones_like(avg_tokens_host))
+            retain_cpu = torch.ceil(avg_tokens_clamped * focus_alpha).to(dtype=mask_lengths_cpu.dtype)
+            retain_cpu = torch.clamp(retain_cpu, min=1)
+            targets_cpu = torch.minimum(mask_lengths_cpu, retain_cpu)
+            zeros_cpu = torch.zeros_like(targets_cpu)
+            targets_cpu = torch.where(mask_lengths_cpu <= 0, zeros_cpu, targets_cpu)
+            should_prune = bool(((targets_cpu > 0) & (mask_lengths_cpu > targets_cpu)).any().item())
+            mask_global_indices = mask_global_indices.to(device=device, dtype=torch.long, non_blocking=True)
+            mask_seq_offsets = mask_seq_offsets.to(device=device, dtype=torch.int32, non_blocking=True)
+            focus_view = FocusRuntimeView(
+                block_unprocessed=block_unprocessed,
+                avg_decoded_tokens=avg_tokens,
+                processing_mask_global_indices=mask_global_indices,
+                processing_mask_indptr=mask_seq_offsets,
+                processing_mask_total=processing_mask_total,
+                processing_mask_max_len=processing_mask_max_len,
+                processing_mask_prunable=should_prune,
+            )
 
         ret = StepContext(
             input_ids=input_ids_tensor,
@@ -704,6 +710,8 @@ class BuildModelContext:
     dllm_config: DLLMConfig = None
     strategy_factory: 'StrategyFactoryBase' = None
     enable_return_routed_experts: bool = False
+    # Maximum batch size configured for the engine (used for buffer preallocation).
+    max_batch_size: int = 1
 
 
 class StepContextManager(CtxMgrBase[StepContext]):

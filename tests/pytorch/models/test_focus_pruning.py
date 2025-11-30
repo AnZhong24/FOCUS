@@ -3,6 +3,9 @@ import pytest
 
 from lmdeploy.pytorch.models.sdar import SDARAttention
 
+_TEST_FOCUS_MAX_BATCH = 8
+_TEST_FOCUS_BLOCK_LEN = 16
+
 
 def _make_focus_attention(num_heads: int = 4, num_kv_heads: int = 2, head_dim: int = 8) -> SDARAttention:
     """Build a lightweight SDARAttention with only the fields required for FOCUS helpers."""
@@ -12,10 +15,13 @@ def _make_focus_attention(num_heads: int = 4, num_kv_heads: int = 2, head_dim: i
     module.num_key_value_groups = max(1, num_heads // num_kv_heads)
     module.head_dim = head_dim
     module.scale = head_dim**-0.5
-    module._focus_delta_buffer = None
-    module._focus_blockpos_buffer = None
-    module._focus_qpad_buffer = None
-    module._focus_kpad_buffer = None
+    max_batch = _TEST_FOCUS_MAX_BATCH
+    block_len = _TEST_FOCUS_BLOCK_LEN
+    dtype = torch.float32
+    module._focus_delta_buffer = torch.zeros((max_batch, block_len), dtype=dtype)
+    module._focus_blockpos_buffer = torch.zeros((max_batch, block_len), dtype=torch.long)
+    module._focus_qpad_buffer = torch.zeros((max_batch, block_len, num_heads, head_dim), dtype=dtype)
+    module._focus_kpad_buffer = torch.zeros((max_batch, block_len, num_kv_heads, head_dim), dtype=dtype)
     return module
 
 
@@ -32,6 +38,14 @@ def _build_mask(seq_lengths, masked_counts):
     mask_indices = torch.cat(mask_indices_parts) if total_masked > 0 else torch.empty(0, dtype=torch.long)
     mask_indptr = torch.tensor(mask_indptr, dtype=torch.int32)
     return mask_indices, mask_indptr
+
+
+def _mask_max_len(mask_indptr: torch.Tensor) -> int:
+    """Return the maximum ragged sequence length encoded by mask_indptr."""
+    if mask_indptr.numel() <= 1:
+        return 0
+    lengths = mask_indptr[1:] - mask_indptr[:-1]
+    return int(lengths.max().item()) if lengths.numel() > 0 else 0
 
 
 def _reference_importance(attn: SDARAttention, query_states: torch.Tensor, key_states: torch.Tensor,
@@ -69,8 +83,10 @@ def test_focus_importance_matches_iterative_reference(seq_lengths, masked_counts
     query_states = torch.randn(total_tokens, attn.num_attention_heads, attn.head_dim)
     key_states = torch.randn(total_tokens, attn.num_key_value_heads, attn.head_dim)
     mask_indices, mask_indptr = _build_mask(seq_lengths, masked_counts)
+    max_mask_len = _mask_max_len(mask_indptr)
 
-    batched_scores = attn._calc_focus_importance_ragged(query_states, key_states, mask_indices, mask_indptr)
+    batched_scores = attn._calc_focus_importance_ragged(query_states, key_states, mask_indices, mask_indptr,
+                                                        max_mask_len)
     iterative_scores = _reference_importance(attn, query_states, key_states, mask_indices, mask_indptr)
 
     torch.testing.assert_close(batched_scores, iterative_scores)
@@ -88,7 +104,9 @@ def test_focus_importance_randomized_regression():
         query_states = torch.randn(total_tokens, attn.num_attention_heads, attn.head_dim)
         key_states = torch.randn(total_tokens, attn.num_key_value_heads, attn.head_dim)
         mask_indices, mask_indptr = _build_mask(seq_lengths, masked_counts)
-        batched_scores = attn._calc_focus_importance_ragged(query_states, key_states, mask_indices, mask_indptr)
+        max_mask_len = _mask_max_len(mask_indptr)
+        batched_scores = attn._calc_focus_importance_ragged(query_states, key_states, mask_indices, mask_indptr,
+                                                            max_mask_len)
         iterative_scores = _reference_importance(attn, query_states, key_states, mask_indices, mask_indptr)
         torch.testing.assert_close(batched_scores, iterative_scores)
 

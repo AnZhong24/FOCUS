@@ -31,6 +31,8 @@ class SDARAttention(nn.Module):
     def __init__(self,
                  config: PretrainedConfig,
                  layer_idx: int,
+                 focus_enabled: bool = False,
+                 focus_max_batch_size: Optional[int] = 0,
                  dtype: torch.dtype = None,
                  device: torch.device = None):
         super().__init__()
@@ -84,11 +86,22 @@ class SDARAttention(nn.Module):
         # q, k norm
         self.q_norm = RMSNorm(head_dim, config.rms_norm_eps, dtype=dtype, device=device)
         self.k_norm = RMSNorm(head_dim, config.rms_norm_eps, dtype=dtype, device=device)
-        # buffers reused when padding ragged focus metadata
-        self._focus_delta_buffer: Optional[torch.Tensor] = None
-        self._focus_blockpos_buffer: Optional[torch.Tensor] = None
-        self._focus_qpad_buffer: Optional[torch.Tensor] = None
-        self._focus_kpad_buffer: Optional[torch.Tensor] = None
+        # Pre-allocate focus buffers when FOCUS is enabled so later calls
+        # can slice from a fixed (max_batch_size, dllm_block_length, ...) view.
+        if focus_enabled:
+            # q/k related buffers use the same dtype as attention inputs.
+            self._focus_delta_buffer = torch.zeros((focus_max_batch_size, dllm_block_length),
+                                                    dtype=dtype, 
+                                                    device=device)
+            self._focus_blockpos_buffer = torch.zeros((focus_max_batch_size, dllm_block_length), 
+                                                       dtype=torch.long, 
+                                                       device=device)
+            self._focus_qpad_buffer = torch.zeros((focus_max_batch_size, dllm_block_length, num_heads, head_dim),
+                                                    dtype=dtype, 
+                                                    device=device)
+            self._focus_kpad_buffer = torch.zeros((focus_max_batch_size, dllm_block_length, num_key_value_heads, head_dim),
+                                                    dtype=dtype, 
+                                                    device=device)
 
     def forward(
         self,
@@ -181,7 +194,12 @@ class SDARAttention(nn.Module):
         proc_view = context.processing_indices
         device = query_states.device
         mask_indices = mask_indices.to(device=device)
-        importance_flat = self._calc_focus_importance_ragged(query_states, key_states, mask_indices, mask_indptr)
+        max_mask_len = getattr(view, 'processing_mask_max_len', None)
+        importance_flat = self._calc_focus_importance_ragged(query_states,
+                                                             key_states,
+                                                             mask_indices,
+                                                             mask_indptr,
+                                                             max_mask_len)
         num_tokens = proc_view.numel()
         importance = torch.zeros((num_tokens, ), dtype=query_states.dtype, device=device)
         importance.index_copy_(0, mask_indices, importance_flat)
@@ -211,8 +229,12 @@ class SDARAttention(nn.Module):
         sin = sin.index_select(0, keep_idx)
         context.rotary_pos_emb = (cos, sin)
 
-    def _calc_focus_importance_ragged(self, query_states: torch.Tensor, key_states: torch.Tensor,
-                                      mask_indices: torch.Tensor, mask_indptr: torch.Tensor) -> torch.Tensor:
+    def _calc_focus_importance_ragged(self,
+                                      query_states: torch.Tensor,
+                                      key_states: torch.Tensor,
+                                      mask_indices: torch.Tensor,
+                                      mask_indptr: torch.Tensor,
+                                      max_mask_len: int) -> torch.Tensor:
         """Vectorized importance computation over ragged sequences."""
         device = query_states.device
         # Gather masked tokens in ragged order.
@@ -221,29 +243,23 @@ class SDARAttention(nn.Module):
         mask_offsets = mask_indptr.to(device=device, dtype=torch.long)
         lengths = mask_offsets[1:] - mask_offsets[:-1]
         num_seq = lengths.size(0)
-        max_len_val = lengths.max().item() if lengths.numel() > 0 else 0
-        if max_len_val <= 0:
+        if max_mask_len <= 0:
             return query_states.new_zeros((0, ), dtype=query_states.dtype)
-        max_len = int(max_len_val)
         seq_offsets = mask_offsets[:-1]
         seq_ids = torch.repeat_interleave(torch.arange(num_seq, device=device), lengths)
         rel_pos = torch.arange(mask_indices.numel(), device=device) - seq_offsets.repeat_interleave(lengths)
         # Pad sequences to batched tensor for attention computation.
         padded_q = self._get_focus_padding_buffer(
             '_focus_qpad_buffer',
-            (num_seq, max_len, gathered_query.size(1), gathered_query.size(2)),
-            gathered_query.dtype,
-            device,
+            (num_seq, max_mask_len, gathered_query.size(1), gathered_query.size(2)),
         )
         padded_k = self._get_focus_padding_buffer(
             '_focus_kpad_buffer',
-            (num_seq, max_len, gathered_key.size(1), gathered_key.size(2)),
-            gathered_key.dtype,
-            device,
+            (num_seq, max_mask_len, gathered_key.size(1), gathered_key.size(2)),
         )
         padded_q[seq_ids, rel_pos] = gathered_query
         padded_k[seq_ids, rel_pos] = gathered_key
-        valid_mask = torch.arange(max_len, device=device).unsqueeze(0) < lengths.unsqueeze(1)
+        valid_mask = torch.arange(max_mask_len, device=device).unsqueeze(0) < lengths.unsqueeze(1)
         q = padded_q.transpose(1, 2)  # (num_seq, num_heads, max_len, head_dim)
         k = padded_k.transpose(1, 2)  # (num_seq, num_kv_heads, max_len, head_dim)
         if self.num_key_value_groups > 1:
@@ -251,18 +267,18 @@ class SDARAttention(nn.Module):
         attn_logits = torch.matmul(q, k.transpose(-1, -2)) * self.scale
         attn_logits = attn_logits.to(torch.float32)
         attn_logits = attn_logits.masked_fill(~valid_mask[:, None, None, :], float('-inf'))
-        logits_flat = attn_logits.reshape(-1, max_len)
-        query_mask = valid_mask[:, None, :].expand(num_seq, self.num_attention_heads, max_len).reshape(-1)
-        key_mask_rows = valid_mask[:, None, None, :].expand(num_seq, self.num_attention_heads, max_len, max_len)
-        key_mask_rows = key_mask_rows.reshape(-1, max_len)
-        row_probs = logits_flat.new_zeros((logits_flat.size(0), max_len), dtype=query_states.dtype)
+        logits_flat = attn_logits.reshape(-1, max_mask_len)
+        query_mask = valid_mask[:, None, :].expand(num_seq, self.num_attention_heads, max_mask_len).reshape(-1)
+        key_mask_rows = valid_mask[:, None, None, :].expand(num_seq, self.num_attention_heads, max_mask_len, max_mask_len)
+        key_mask_rows = key_mask_rows.reshape(-1, max_mask_len)
+        row_probs = logits_flat.new_zeros((logits_flat.size(0), max_mask_len), dtype=query_states.dtype)
         valid_logits = logits_flat[query_mask]
         pooled = F.max_pool1d(valid_logits.unsqueeze(1), kernel_size=3, stride=1, padding=1).squeeze(1)
         valid_keys = key_mask_rows[query_mask]
         pooled = pooled.masked_fill(~valid_keys, float('-inf'))
         attn_weights = torch.softmax(pooled, dim=-1, dtype=torch.float32)
         row_probs[query_mask] = attn_weights.to(dtype=query_states.dtype)
-        row_probs = row_probs.view(num_seq, self.num_attention_heads, max_len, max_len)
+        row_probs = row_probs.view(num_seq, self.num_attention_heads, max_mask_len, max_mask_len)
         importance = row_probs.sum(dim=2)
         importance = importance * valid_mask[:, None, :]
         importance = importance.sum(dim=1)
@@ -270,19 +286,9 @@ class SDARAttention(nn.Module):
 
     def _get_focus_padding_buffer(self,
                                   attr_name: str,
-                                  shape: Tuple[int, ...],
-                                  dtype: torch.dtype,
-                                  device: torch.device) -> torch.Tensor:
+                                  shape: Tuple[int, ...]) -> torch.Tensor:
         """Return a zeroed slice of a reusable buffer for padded tensors."""
-        if any(dim <= 0 for dim in shape):
-            raise ValueError('Focus padding buffer requires positive shape.')
         buf = getattr(self, attr_name, None)
-        need_alloc = (buf is None or buf.device != device or buf.dtype != dtype
-                      or any(buf.size(i) < shape[i] for i in range(len(shape))))
-        if need_alloc:
-            new_shape = tuple(max(dim, 1) for dim in shape)
-            buf = torch.zeros(new_shape, dtype=dtype, device=device)
-            setattr(self, attr_name, buf)
         view = buf
         for dim, length in enumerate(shape):
             view = view.narrow(dim, 0, length)
@@ -306,21 +312,24 @@ class SDARAttention(nn.Module):
         block_unprocessed_view = view.block_unprocessed
         mask_indptr = getattr(view, 'processing_mask_indptr', None)
         mask_indptr_dev = mask_indptr.to(device=device, dtype=torch.long)
-        mask_lengths = (mask_indptr_dev[1:] - mask_indptr_dev[:-1]).to(device=device)
+        mask_lengths = (mask_indptr_dev[1:] - mask_indptr_dev[:-1])
         avg_tokens = view.avg_decoded_tokens.to(device=device, dtype=torch.float32)
         targets = self._compute_focus_targets(mask_lengths, avg_tokens, context.focus_params)
         should_prune = (targets > 0) & (mask_lengths > targets)
 
         retain_processing_mask = torch.ones_like(proc_indices, dtype=torch.bool, device=device)
 
-        total_masked = int(mask_lengths.sum().item()) if mask_lengths.numel() > 0 else 0
-        should_prune_any = bool(should_prune.numel() > 0 and torch.any(should_prune).item())
+        total_masked = getattr(view, 'processing_mask_total', None)
+        should_prune_any = getattr(view, 'processing_mask_prunable', None)
         if total_masked > 0 and should_prune_any:
             mask_globals = mask_globals_cpu.to(device=device, dtype=torch.long)
-            mask_importance_flat = self._calc_focus_importance_ragged(query_states, key_states, mask_globals,
-                                                                      mask_indptr)
+            max_mask_len = getattr(view, 'processing_mask_max_len', None)
+            mask_importance_flat = self._calc_focus_importance_ragged(query_states,
+                                                                      key_states,
+                                                                      mask_globals,
+                                                                      mask_indptr,
+                                                                      max_mask_len)
             num_seq = mask_lengths.size(0)
-            max_mask_len = int(mask_lengths.max().item())
             seq_ids = torch.repeat_interleave(torch.arange(num_seq, device=device, dtype=torch.long), mask_lengths)
             seq_offsets = mask_indptr_dev[:-1]
             rel_pos = torch.arange(total_masked, device=device, dtype=torch.long)
@@ -330,15 +339,13 @@ class SDARAttention(nn.Module):
             prev_selected = prev_scores.index_select(0, prev_indices).to(device=device,
                                                                           dtype=mask_importance_flat.dtype)
             seq_delta_flat = mask_importance_flat - prev_selected
-            padded_delta = self._get_focus_padding_buffer('_focus_delta_buffer', padded_shape,
-                                                            mask_importance_flat.dtype, device)
+            padded_delta = self._get_focus_padding_buffer('_focus_delta_buffer', padded_shape)
             padded_delta[seq_ids, rel_pos] = seq_delta_flat
             valid_mask = torch.arange(max_mask_len, device=device, dtype=torch.long).unsqueeze(0)
             valid_mask = valid_mask < mask_lengths.unsqueeze(1)
             token_indices = mask_globals
             seq_block_positions_flat = proc_indices.index_select(0, token_indices)
-            padded_block_positions = self._get_focus_padding_buffer('_focus_blockpos_buffer', padded_shape,
-                                                                    seq_block_positions_flat.dtype, device)
+            padded_block_positions = self._get_focus_padding_buffer('_focus_blockpos_buffer', padded_shape)
             padded_block_positions[seq_ids, rel_pos] = seq_block_positions_flat
             effective_targets = torch.where(should_prune, targets, torch.zeros_like(targets))
             selection_mask = self._select_focus_mask_batch(padded_delta, valid_mask, effective_targets)
@@ -512,6 +519,8 @@ class SDARDecoderLayer(nn.Module):
     def __init__(self,
                  config: PretrainedConfig,
                  layer_idx: int,
+                 focus_enabled: bool = False,
+                 focus_max_batch_size: Optional[int] = 0,
                  dtype: torch.dtype = None,
                  device: torch.device = None):
         super().__init__()
@@ -519,7 +528,12 @@ class SDARDecoderLayer(nn.Module):
         quantization_config = getattr(config, 'quantization_config', None)
 
         # build attention layer
-        self.self_attn = SDARAttention(config, layer_idx=layer_idx, dtype=dtype, device=device)
+        self.self_attn = SDARAttention(config,
+                                       layer_idx=layer_idx,
+                                       focus_enabled=focus_enabled,
+                                       focus_max_batch_size=focus_max_batch_size,
+                                       dtype=dtype,
+                                       device=device)
 
         # build MLP
         self.mlp = SDARMLP(config, dtype=dtype, device=device)
@@ -574,7 +588,12 @@ class SDARDecoderLayer(nn.Module):
 class SDARModel(nn.Module):
     """model."""
 
-    def __init__(self, config: PretrainedConfig, dtype: torch.dtype = None, device: torch.device = None):
+    def __init__(self,
+                 config: PretrainedConfig,
+                 focus_enabled: bool = False,
+                 focus_max_batch_size: Optional[int] = 0,
+                 dtype: torch.dtype = None,
+                 device: torch.device = None):
         super().__init__()
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -587,7 +606,12 @@ class SDARModel(nn.Module):
 
         # build all decode layers
         self.layers = nn.ModuleList([
-            SDARDecoderLayer(config, layer_idx, dtype=dtype, device=device)
+            SDARDecoderLayer(config,
+                             layer_idx,
+                             focus_enabled=focus_enabled,
+                             focus_max_batch_size=focus_max_batch_size,
+                             dtype=dtype,
+                             device=device)
             for layer_idx in range(config.num_hidden_layers)
         ])
 
@@ -670,9 +694,17 @@ class SDARForCausalLM(nn.Module, CudaGraphMixin):
         super().__init__()
         self.config = config
         self.ctx_mgr = ctx_mgr
-        config.dllm_block_length = ctx_mgr.build_ctx.dllm_config.block_length
+        dllm_cfg = ctx_mgr.build_ctx.dllm_config
+        if dllm_cfg is not None:
+            config.dllm_block_length = dllm_cfg.block_length
+        focus_enabled = bool(dllm_cfg is not None and getattr(dllm_cfg, 'enable_focus', False))
+        focus_max_batch_size = getattr(ctx_mgr.build_ctx, 'max_batch_size', None)
         # build model
-        self.model = SDARModel(config, dtype=dtype, device=device)
+        self.model = SDARModel(config,
+                               focus_enabled=focus_enabled,
+                               focus_max_batch_size=focus_max_batch_size,
+                               dtype=dtype,
+                               device=device)
         # build lm_head
         self.lm_head = build_rowwise_linear(config.hidden_size,
                                             config.vocab_size,
