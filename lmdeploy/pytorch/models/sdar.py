@@ -213,9 +213,8 @@ class SDARAttention(nn.Module):
             k = k.repeat_interleave(self.num_key_value_groups, dim=0)
 
         attn_logits = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-        attn_logits = attn_logits.to(torch.float32)
         pooled_logits = F.max_pool1d(attn_logits, kernel_size=3, stride=1, padding=1)
-        attn_weights = torch.softmax(pooled_logits, dim=-1, dtype=torch.float32)
+        attn_weights = torch.softmax(pooled_logits, dim=-1)
         attn_sum = attn_weights.sum(dim=-2)
         importance = attn_sum.sum(dim=0)
         return importance.to(dtype=query_states.dtype)
@@ -265,7 +264,6 @@ class SDARAttention(nn.Module):
         if self.num_key_value_groups > 1:
             k = k.repeat_interleave(self.num_key_value_groups, dim=1)
         attn_logits = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-        attn_logits = attn_logits.to(torch.float32)
         attn_logits = attn_logits.masked_fill(~valid_mask[:, None, None, :], float('-inf'))
         logits_flat = attn_logits.reshape(-1, max_mask_len)
         query_mask = valid_mask[:, None, :].expand(num_seq, self.num_attention_heads, max_mask_len).reshape(-1)
@@ -276,7 +274,7 @@ class SDARAttention(nn.Module):
         pooled = F.max_pool1d(valid_logits.unsqueeze(1), kernel_size=3, stride=1, padding=1).squeeze(1)
         valid_keys = key_mask_rows[query_mask]
         pooled = pooled.masked_fill(~valid_keys, float('-inf'))
-        attn_weights = torch.softmax(pooled, dim=-1, dtype=torch.float32)
+        attn_weights = torch.softmax(pooled, dim=-1)
         row_probs[query_mask] = attn_weights.to(dtype=query_states.dtype)
         row_probs = row_probs.view(num_seq, self.num_attention_heads, max_mask_len, max_mask_len)
         importance = row_probs.sum(dim=2)
@@ -313,7 +311,7 @@ class SDARAttention(nn.Module):
         mask_indptr = getattr(view, 'processing_mask_indptr', None)
         mask_indptr_dev = mask_indptr.to(device=device, dtype=torch.long)
         mask_lengths = (mask_indptr_dev[1:] - mask_indptr_dev[:-1])
-        avg_tokens = view.avg_decoded_tokens.to(device=device, dtype=torch.float32)
+        avg_tokens = view.avg_decoded_tokens.to(device=device)
         targets = self._compute_focus_targets(mask_lengths, avg_tokens, context.focus_params)
         should_prune = (targets > 0) & (mask_lengths > targets)
 
