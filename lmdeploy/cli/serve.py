@@ -101,6 +101,7 @@ class SubCliServe:
         ArgumentHelper.dllm_enable_delayed_cache(pt_group)
         ArgumentHelper.dllm_enable_focus(pt_group)
         ArgumentHelper.dllm_focus_alpha(pt_group)
+        ArgumentHelper.dllm_track(pt_group)
         ArgumentHelper.enable_return_routed_experts(pt_group)
         ArgumentHelper.distributed_executor_backend(pt_group)
 
@@ -242,6 +243,7 @@ class SubCliServe:
                 dllm_enable_delayed_cache=args.dllm_enable_delayed_cache,
                 dllm_enable_focus=args.dllm_enable_focus,
                 dllm_focus_alpha=args.dllm_focus_alpha,
+                dllm_track=args.dllm_track,
             )
         else:
             from lmdeploy.messages import TurbomindEngineConfig

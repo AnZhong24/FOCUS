@@ -995,7 +995,15 @@ class Engine(EngineBase):
                 num_draft_tokens = self.specdecode_config.num_speculative_tokens
                 num_accepted_tokens = (batched_outputs.next_token_ids[idx] > -1).sum() - 1
                 spec_info = dict(num_draft_tokens=num_draft_tokens, num_accepted_tokens=num_accepted_tokens)
-            req_metrics = RequestMetrics(new_token_timestamp, msg.engine_events, spec_info=spec_info)
+            dllm_stats = None
+            if finish:
+                stats_getter = getattr(msg, 'get_dllm_request_stats', None)
+                if callable(stats_getter):
+                    dllm_stats = stats_getter()
+            req_metrics = RequestMetrics(new_token_timestamp,
+                                         msg.engine_events,
+                                         spec_info=spec_info,
+                                         dllm_stats=dllm_stats)
             routed_experts = msg.routed_experts if msg.return_routed_experts and finish else None
             if routed_experts is not None and self.engine_config.enable_transfer_obj_ref:
                 # only serialize for api server

@@ -353,6 +353,7 @@ class PytorchEngineConfig:
         dllm_enable_delayed_cache (bool): enable delayed KV cache flow for DLLM decoding.
         dllm_enable_focus (bool): enable FOCUS token-eviction refinement for DLLM decoding.
         dllm_focus_alpha (float): Optional multiplier to derive a dynamic retain count when FOCUS is enabled.
+        dllm_track (bool): Enable processed-token tracking for DLLM decode steps.
     """
     dtype: str = 'auto'
     tp: int = 1
@@ -402,6 +403,7 @@ class PytorchEngineConfig:
     dllm_enable_delayed_cache: bool = False
     dllm_enable_focus: bool = False
     dllm_focus_alpha: float = 1.0
+    dllm_track: bool = False
 
     role: EngineRole = EngineRole.Hybrid
     migration_backend: MigrationBackend = MigrationBackend.DLSlime
@@ -568,6 +570,7 @@ class RequestMetrics:
     token_timestamp: float = 0.0
     engine_events: List[EngineEvent] = field(default_factory=list)
     spec_info: Optional[Dict[str, Any]] = None
+    dllm_stats: Optional[Dict[str, Any]] = None
 
 
 @dataclass

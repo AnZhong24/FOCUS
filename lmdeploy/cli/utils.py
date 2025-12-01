@@ -725,6 +725,14 @@ class ArgumentHelper:
                                    help='Optional ratio used to derive the number of retained tokens when FOCUS is enabled.')
 
     @staticmethod
+    def dllm_track(parser):
+        """Enable DLLM processed-token tracking."""
+        return parser.add_argument('--dllm-track',
+                                   action='store_true',
+                                   default=False,
+                                   help='Enable DLLM processed-token tracking.')
+
+    @staticmethod
     def enable_return_routed_experts(parser):
         """Add argument return routed experts to parser."""
 

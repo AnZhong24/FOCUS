@@ -390,6 +390,7 @@ class StepContext:
     source_inputs: 'ModelInputs' = None
     focus_params: FocusParams = None
     focus_view: FocusRuntimeView = None
+    dllm_track: bool = False
 
     # states for ssm
     state_caches: List = None
@@ -420,9 +421,8 @@ class StepContext:
         history_seqlens = inputs.history_lengths.to(device=device)
         processing_indices = inputs.processing_indices
         processing_q_lens = inputs.processing_q_lens
-        focus_params = FocusParams()
-        if build_ctx is not None and getattr(build_ctx, 'dllm_config', None) is not None:
-            dllm_cfg = build_ctx.dllm_config
+        dllm_cfg = getattr(build_ctx, 'dllm_config', None) if build_ctx is not None else None
+        if dllm_cfg is not None:
             focus_enabled = bool(getattr(dllm_cfg, 'enable_focus', False))
             focus_params = FocusParams(enabled=focus_enabled, focus_alpha=getattr(dllm_cfg, 'focus_alpha', None))
 
@@ -529,6 +529,10 @@ class StepContext:
                 processing_mask_prunable=should_prune,
             )
 
+        dllm_track = False
+        if dllm_cfg is not None:
+            dllm_track = dllm_cfg.track
+
         ret = StepContext(
             input_ids=input_ids_tensor,
             model_config=model_config,
@@ -562,6 +566,7 @@ class StepContext:
             source_inputs=inputs,
             focus_params=focus_params,
             focus_view=focus_view,
+            dllm_track=dllm_track,
         )
 
         ret = get_backend().update_step_context(ret)

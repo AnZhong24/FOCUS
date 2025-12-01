@@ -5,7 +5,7 @@ import json
 import os
 import random
 from queue import Queue
-from typing import List, Union, Tuple
+from typing import List, Union, Tuple, Optional
 
 import numpy as np
 from tqdm import tqdm
@@ -124,9 +124,43 @@ def _earliest_completed_sessions(profiler: Profiler, count: int):
     return completed[:min(count, len(completed))]
 
 
+class RepetitionDetector:
+    """Detect repeated blocks of generated tokens."""
+
+    MIN_CHECK_BLOCK = 4
+
+    def __init__(self, block_size: int, repeats: int):
+        self.block_size = block_size
+        self.repeats = repeats
+
+    def should_stop(self, generated: List[int]) -> bool:
+        """Return True if a repeated block is detected."""
+        total = len(generated)
+        max_block = min(self.block_size, total // self.repeats)
+        if max_block <= 0:
+            return False
+        min_block = self.MIN_CHECK_BLOCK if max_block >= self.MIN_CHECK_BLOCK else 1
+        for block_size in range(max_block, min_block - 1, -1):
+            tail_start = total - block_size
+            if tail_start < 0:
+                break
+            tail = generated[tail_start:]
+            repeated = True
+            for idx in range(2, self.repeats + 1):
+                start = total - block_size * idx
+                if start < 0 or generated[start:start + block_size] != tail:
+                    repeated = False
+                    break
+            if repeated:
+                return True
+        return False
+
 class Engine:
 
-    def __init__(self, model_path: str, engine_config: Union[PytorchEngineConfig, TurbomindEngineConfig]):
+    def __init__(self,
+                 model_path: str,
+                 engine_config: Union[PytorchEngineConfig, TurbomindEngineConfig],
+                 repetition_detector: Optional[RepetitionDetector] = None):
         self.tokenizer = Tokenizer(model_path)
         
         # Automatically detect and use the model's corresponding chat template
@@ -148,10 +182,23 @@ class Engine:
 
         self.tm_model = tm_model
         self.pbar = None
+        self.dllm_processed_tokens = 0
+        self.dllm_decode_steps = 0
+        self.repetition_detector = repetition_detector
+        self.repetition_stops = 0
 
-    async def _inference(self, req_queue: Queue, session_id: int, temperature: float, top_p: float, top_k: int,
-                     stream_output: bool, skip_tokenize: bool, skip_detokenize: bool, concurrency: int,
-                     max_new_tokens: int):
+    async def _inference(self,
+                         req_queue: Queue,
+                         session_id: int,
+                         temperature: float,
+                         top_p: float,
+                         top_k: int,
+                         stream_output: bool,
+                         skip_tokenize: bool,
+                         skip_detokenize: bool,
+                         concurrency: int,
+                         max_new_tokens: int,
+                         repetition_detector: Optional[RepetitionDetector] = None):
         model_inst = self.tm_model.create_instance()
         sess: Session = None
         for prompt, input_len, cancel_after, sess in iter(req_queue.get_nowait, None):
@@ -169,6 +216,8 @@ class Engine:
 
             n_token = 0
             token_ids = input_ids.copy()
+            generated_ids: List[int] = []
+            stop_due_to_repetition = False
 
             generator = model_inst.async_stream_infer(session_id,
                                                       input_ids=input_ids,
@@ -184,15 +233,31 @@ class Engine:
                 async for outputs in generator:
                     n_token += len(outputs.token_ids)
                     token_ids += outputs.token_ids
+                    generated_ids.extend(outputs.token_ids)
                     if not skip_detokenize:
                         # _, state = self.tokenizer.detokenize_incrementally(token_ids, state)
                         text, state = self.tokenizer.detokenize_incrementally(token_ids, state)
                         print(text, end='')
                     sess.tick(n_token)
+                    stats = getattr(outputs.req_metrics, 'dllm_stats', None) if outputs.req_metrics else None
+                    if stats:
+                        processed = stats.get('processed_tokens', 0)
+                        steps = stats.get('decode_steps', 0)
+                        self.dllm_processed_tokens += processed
+                        self.dllm_decode_steps += steps
                     # No need to check for cancel_after since we're generating until EOS
+                    if repetition_detector and repetition_detector.should_stop(generated_ids):
+                        stop_due_to_repetition = True
+                        if not skip_detokenize:
+                            print()
+                            print('[INFO] Early stop: repetitive output detected.')
+                        await model_inst.async_cancel(session_id)
+                        break
                 sess.finish(Session.SUCCESS)
                 if not skip_detokenize:
                     print()
+                if stop_due_to_repetition:
+                    self.repetition_stops += 1
             finally:
                 await generator.aclose()
 
@@ -206,6 +271,8 @@ class Engine:
     def process_request(self, requests, profiler: Profiler, concurrency, temperature, top_p, top_k, stream_output,
                         skip_tokenize, skip_detokenize, max_new_tokens):
         req_queue = Queue()
+        self.dllm_processed_tokens = 0
+        self.dllm_decode_steps = 0
 
         # feed request to q
         for prompt, input_len in requests:
@@ -223,7 +290,7 @@ class Engine:
         tasks = []
         for i in range(concurrency):
             task = self._inference(req_queue, i, temperature, top_p, top_k, stream_output, skip_tokenize,
-                                   skip_detokenize, concurrency, max_new_tokens)
+                                   skip_detokenize, concurrency, max_new_tokens, self.repetition_detector)
             tasks.append(task)
 
         async def _gather_tasks(tasks):
@@ -275,6 +342,19 @@ def parse_args():
         default=16384,
         help='Maximum number of new tokens to generate for each request.',
     )
+    parser.add_argument(
+        '--repeat-block-detect',
+        action='store_true',
+        help='Stop requests early when repetitive output blocks are detected (defaults to dllm-block-length unless --repeat-block-window is set).',
+    )
+    parser.add_argument('--repeat-block-window',
+                        type=int,
+                        default=None,
+                        help='Optional block size for repetition detection; defaults to dllm-block-length when unset.')
+    parser.add_argument('--repeat-block-threshold',
+                        type=int,
+                        default=2,
+                        help='Number of consecutive repeated blocks required to trigger early stop.')
     # other args
     ArgumentHelper.top_p(parser)
     ArgumentHelper.temperature(parser)
@@ -291,6 +371,7 @@ def parse_args():
     ArgumentHelper.dllm_enable_delayed_cache(pt_group)
     ArgumentHelper.dllm_enable_focus(pt_group)
     ArgumentHelper.dllm_focus_alpha(pt_group)
+    ArgumentHelper.dllm_track(pt_group)
 
     tp_act = ArgumentHelper.tp(pt_group)
     cache_count_act = ArgumentHelper.cache_max_entry_count(pt_group)
@@ -316,6 +397,23 @@ def parse_args():
     ArgumentHelper.communicator(tb_group)
 
     args = parser.parse_args()
+
+    if args.repeat_block_threshold < 2:
+        parser.error('--repeat-block-threshold must be >= 2.')
+
+    if args.repeat_block_window is not None and args.repeat_block_window <= 0:
+        parser.error('--repeat-block-window must be a positive integer when provided.')
+
+    if args.repeat_block_detect:
+        block_window = args.repeat_block_window
+        if block_window is None:
+            block_window = args.dllm_block_length
+        if block_window is None or block_window <= 0:
+            parser.error('--repeat-block-detect requires a positive block size via --repeat-block-window or --dllm-block-length.')
+        args.repeat_block_window = block_window
+    else:
+        args.repeat_block_window = None
+
     return args
 
 
@@ -357,6 +455,7 @@ def main():
             dllm_enable_delayed_cache=args.dllm_enable_delayed_cache,
             dllm_enable_focus=args.dllm_enable_focus,
             dllm_focus_alpha=args.dllm_focus_alpha,
+            dllm_track=args.dllm_track,
             max_prefill_token_num=args.concurrency * args.dllm_block_length if args.dllm_block_length is not None else 4096,
         )
 
@@ -364,7 +463,11 @@ def main():
         import uvloop
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
-    engine = Engine(args.model_path, engine_config)
+    repetition_detector = None
+    if args.repeat_block_detect:
+        repetition_detector = RepetitionDetector(args.repeat_block_window, args.repeat_block_threshold)
+
+    engine = Engine(args.model_path, engine_config, repetition_detector=repetition_detector)
 
     requests = sample_requests(
         dataset_path=args.dataset,
@@ -396,7 +499,13 @@ def main():
                    ('Stream output', str(stream_output).lower()),
                    ('Skip tokenize', str(args.skip_tokenize).lower()),
                    ('Skip detokenize', str(args.skip_detokenize).lower()),
-                   ('Chat template', chat_template_name)]
+                   ('Chat template', chat_template_name),
+                   ('Repeat block detect', 'true' if args.repeat_block_detect else 'false')]
+    if args.repeat_block_detect:
+        hyperparams.extend([
+            ('Repeat block window', args.repeat_block_window),
+            ('Repeat block threshold', args.repeat_block_threshold),
+        ])
     total_requests = len(requests)
     completion_target = _full_batch_completion_target(total_requests, effective_concurrency)
     subset_sessions = _earliest_completed_sessions(profiler, completion_target)
@@ -409,13 +518,32 @@ def main():
 
     profiler.compute_metrics()
     profiler.summarize(title='Profile LLM Throughput', hyperparams=hyperparams)
+    if getattr(engine, 'repetition_stops', 0):
+        print(f'Requests stopped early due to repetition: {engine.repetition_stops}')
+    dllm_processed = getattr(engine, 'dllm_processed_tokens', 0)
+    dllm_steps = getattr(engine, 'dllm_decode_steps', 0)
+    total_generated = getattr(profiler, 'total_output', 0)
+    if dllm_processed > 0 or dllm_steps > 0:
+        processed_ratio = (dllm_processed / total_generated)
+        gen_per_step = (total_generated / dllm_steps)
+        print('\nDLLM Metrics')
+        print(f'  Processed tokens            : {dllm_processed}')
+        print(f'  Generated tokens            : {total_generated}')
+        print(f'  Decode steps                : {dllm_steps}')
+        print(f'  processed/generated         : {processed_ratio:.3f}')
+        print(f'  generated tokens per step   : {gen_per_step:.3f}')
     if args.csv:
+        repeat_window_str = args.repeat_block_window if args.repeat_block_detect else '-'
+        repeat_threshold = args.repeat_block_threshold if args.repeat_block_detect else '-'
         profiler.save_csv(args.csv, (
             ('backend', args.backend),
             ('bs', args.concurrency),
             ('max_new_tokens', args.max_new_tokens),
             ('num_prompts', args.num_prompts),
             ('chat_template', chat_template_name),
+            ('repeat_block_detect', str(args.repeat_block_detect).lower()),
+            ('repeat_block_window', repeat_window_str),
+            ('repeat_block_threshold', repeat_threshold),
         ))
 
 

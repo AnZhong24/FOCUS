@@ -122,6 +122,8 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
         self._focus_state: FocusState | None = FocusState.new(self.dllm_block_length) if self._focus_enabled else None
         self._focus_token_sum: float = 0.0
         self._focus_steps: int = 0
+        self._dllm_processed_tokens: int = 0
+        self._dllm_decode_steps: int = 0
 
     @property
     def dllm_mask(self):
@@ -201,6 +203,14 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
             return
         self._focus_token_sum += int(decoded_tokens)
         self._focus_steps += 1
+
+    def record_decode_stats(self, processed_tokens: int):
+        self._dllm_decode_steps += 1
+        self._dllm_processed_tokens += processed_tokens
+
+    def get_dllm_request_stats(self) -> Dict[str, int]:
+        return dict(processed_tokens=self._dllm_processed_tokens,
+                    decode_steps=self._dllm_decode_steps)
 
     def set_stop_pos(self, pos: int):
         dllm_block_length = self.dllm_block_length
@@ -339,6 +349,9 @@ class DLLMSequenceStrategy(SequenceStrategy):
         self.dllm_mask_token = dllm_mask_token
         self.enable_delayed_cache = enable_delayed_cache
         self.dllm_config = dllm_config
+        self.track = False
+        if dllm_config is not None:
+            self.track = dllm_config.track
 
     def make_sequence(self,
                       seq_id: int,
@@ -387,6 +400,9 @@ class DLLMSequenceStrategy(SequenceStrategy):
                 prev_focus_mask = msg.dllm_mask.copy()
 
             if is_decoding:
+                if self.track:
+                    processed_tokens = model_meta.get(consts.DLLM_META_PROCESSED_TOKENS)
+                    msg.record_decode_stats(processed_tokens)
                 if self.enable_delayed_cache:
                     # Refresh delayed-cache bookkeeping using the existing mask
                     # so newly unmasked tokens still get one more iteration.

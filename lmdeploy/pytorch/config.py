@@ -425,6 +425,7 @@ class DLLMConfig:
     enable_delayed_cache: bool = False
     enable_focus: bool = False
     focus_alpha: Optional[float] = None
+    track: bool = False
 
 
 @dataclass
@@ -449,7 +450,8 @@ class MiscConfig:
                                  confidence_threshold=engine_config.dllm_confidence_threshold,
                                  enable_delayed_cache=engine_config.dllm_enable_delayed_cache,
                                  enable_focus=engine_config.dllm_enable_focus,
-                                 focus_alpha=engine_config.dllm_focus_alpha)
+                                 focus_alpha=engine_config.dllm_focus_alpha,
+                                 track=engine_config.dllm_track)
         misc_config = cls(
             custom_module_map=engine_config.custom_module_map,
             empty_init=engine_config.empty_init,

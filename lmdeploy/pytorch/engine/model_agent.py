@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 from torch.profiler import ProfilerActivity, profile, record_function
 
+from lmdeploy.pytorch.consts import DLLM_META_PROCESSED_TOKENS
 from lmdeploy.pytorch.disagg.config import EngineRole
 from lmdeploy.serve.openai.protocol import UpdateParamsRequest
 from lmdeploy.tokenizer import Tokenizer
@@ -263,6 +264,17 @@ def model_forward(
                 for meta, processed in zip(model_metas, focus_processed):
                     entry = {} if meta is None else dict(meta)
                     entry['focus_processed_indices'] = processed
+                    new_metas.append(entry)
+                model_metas = new_metas
+            if context.is_decoding and context.dllm_track:
+                seq_lens = context.q_seqlens[:len(inputs.seq_length)]
+                proc_counts = seq_lens.detach().to('cpu', dtype=torch.long).tolist()
+                if model_metas is None:
+                    model_metas = [None] * len(proc_counts)
+                new_metas: List[Dict[str, Any]] = []
+                for meta, proc in zip(model_metas, proc_counts):
+                    entry = {} if meta is None else dict(meta)
+                    entry[DLLM_META_PROCESSED_TOKENS] = proc
                     new_metas.append(entry)
                 model_metas = new_metas
             output['model_metas'] = model_metas
