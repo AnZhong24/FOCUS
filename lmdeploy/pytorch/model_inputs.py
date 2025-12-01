@@ -582,8 +582,6 @@ class StepContext:
 
     def update_processing_view(self, new_proc_indices: torch.Tensor, new_q_lens: torch.Tensor):
         """Replace ragged processing view and refresh derived metadata."""
-        if new_proc_indices is None or new_q_lens is None:
-            return
         device = new_proc_indices.device
 
         self.processing_indices = new_proc_indices
@@ -591,12 +589,8 @@ class StepContext:
         self.q_seqlens = new_q_lens
         self.q_start_loc = q_start_loc
         batch_size = new_q_lens.size(0)
-        rightmost_vals = new_proc_indices.new_full((batch_size, ), -1)
-        valid_mask = new_q_lens > 0
-        if valid_mask.any():
-            end_offsets = q_start_loc + new_q_lens - 1
-            gathered = new_proc_indices.index_select(0, end_offsets[valid_mask])
-            rightmost_vals[valid_mask] = gathered
+        end_offsets = q_start_loc + new_q_lens - 1
+        rightmost_vals = new_proc_indices.index_select(0, end_offsets)
         zeros = rightmost_vals.new_zeros((batch_size, ))
         rightmost_plus_one = torch.where(rightmost_vals < 0, zeros, rightmost_vals + 1)
         history = self.history_lengths.to(device=device, dtype=new_q_lens.dtype)
@@ -624,26 +618,17 @@ class StepContext:
     def update_focus_processed_mask(self):
         """Record which tokens were processed this round based on trimmed indices."""
         view = self.focus_view
-        if view is None:
-            return
         block_template = getattr(view, 'block_unprocessed', None)
         processing_indices = self.processing_indices
         q_lens = self.q_seqlens
-        if block_template is None or processing_indices is None or q_lens is None or q_lens.numel() == 0:
-            return
         block_device = block_template.device
         block_mask = torch.zeros_like(block_template, dtype=torch.bool, device=block_device)
         proc_indices = processing_indices.to(device=block_device, dtype=torch.long, non_blocking=True)
         lengths = q_lens.to(device=block_device, dtype=torch.long)
-        if int(lengths.sum().item()) != proc_indices.numel():
-            return
         seq_ids = torch.repeat_interleave(torch.arange(lengths.size(0), device=block_device),
                                           lengths,
                                           output_size=int(proc_indices.numel()))
-        if proc_indices.numel() > 0:
-            block_mask[seq_ids, proc_indices] = True
-        if view.block_unprocessed.device != block_device:
-            view.block_unprocessed = view.block_unprocessed.to(device=block_device, dtype=torch.bool)
+        block_mask[seq_ids, proc_indices] = True
         view.block_unprocessed = view.block_unprocessed & (~block_mask)
 
     def get_focus_processed_indices(self) -> Optional[List[List[int]]]:
