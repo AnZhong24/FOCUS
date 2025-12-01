@@ -635,10 +635,9 @@ class StepContext:
         """Return per-sequence lists of processed positions."""
         if not self.focus_enabled():
             return None
-        proc_indices = self.processing_indices
-        q_lens = self.q_seqlens
-        lengths_cpu = q_lens.detach().to('cpu')
-        proc_cpu = proc_indices.detach().to('cpu')
+        source_inputs = getattr(self, 'source_inputs', None)
+        proc_cpu = getattr(source_inputs, 'processing_indices', None)
+        lengths_cpu = getattr(source_inputs, 'processing_q_lens', None)
         lengths_list = [int(length) for length in lengths_cpu.tolist()]
         seq_slices = torch.split(proc_cpu, lengths_list)
         return [seq.tolist() for seq in seq_slices]
