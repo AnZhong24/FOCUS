@@ -926,6 +926,7 @@ def ragged_paged_attention_fwd(
     kv_seqlens: Tensor,
     q_start_loc: Tensor,
     q_seqlens: Tensor,
+    max_q_seqlen: int,
     sm_scale: float = None,
     logit_softcapping: float = None,
     kv_layout: str = 'bshd',
@@ -966,10 +967,6 @@ def ragged_paged_attention_fwd(
     num_kv_heads = k.shape[h_dim]
     kv_group_num = head // num_kv_heads
 
-    max_q_len = int(q_seqlens.max().item()) if q_seqlens.numel() > 0 else 0
-    if max_q_len <= 0:
-        return
-
     BLOCK = k.size(s_dim)
     assert BLOCK >= 16
     if Lq > 512 and BLOCK > 32:
@@ -978,22 +975,22 @@ def ragged_paged_attention_fwd(
                        'Please reduce `block_size`.')
 
     BLOCK_DMODEL, BLOCK_DMODEL1, BLOCK_DV = _get_block_d(Lq)
-    heads_per_req_max = kv_group_num * max_q_len
+    heads_per_req_max = kv_group_num * max_q_seqlen
     if heads_per_req_max <= 0:
         return
     BLOCK_H = max(16, min(BLOCK, triton.next_power_of_2(heads_per_req_max)))
 
     heads_per_req = q_seqlens * kv_group_num
     tiles_per_seq = (heads_per_req + BLOCK_H - 1) // BLOCK_H
-    total_tiles = int(tiles_per_seq.sum().item())
 
     tile_offsets = torch.nn.functional.pad(tiles_per_seq.cumsum(0), (1, 0))
-    tile_offsets = tile_offsets.to(dtype=torch.int32, device=q.device).contiguous()
+    tile_offsets = tile_offsets.to(dtype=torch.int32)
     seq_tile_offsets = tile_offsets[:-1].contiguous()
 
     seq_ids = torch.arange(batch, device=q.device, dtype=torch.int32)
     tile_to_seq = torch.repeat_interleave(seq_ids, tiles_per_seq).contiguous()
 
+    total_tiles = tile_to_seq.size(0)
     grid_1 = total_tiles * num_kv_heads
 
     if _nv_cap[0] < 8:

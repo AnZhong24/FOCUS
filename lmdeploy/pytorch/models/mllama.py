@@ -1240,6 +1240,7 @@ class MllamaForConditionalGeneration(nn.Module, CudaGraphMixin, DeployModelMixin
         cross_attn_metadata.q_start_loc = input_buffers['q_start_loc'][:new_batch_size]
         cross_attn_metadata.q_seqlens = input_buffers['q_seqlens'][:new_batch_size]
         cross_attn_metadata.kv_seqlens = input_buffers['cross_kv_seqlens'][:new_batch_size]
+        cross_attn_metadata.max_q_seqlen = attn_metadata.max_q_seqlen
 
         new_inputs['cross_attn_metadata'] = cross_attn_metadata
         return new_inputs

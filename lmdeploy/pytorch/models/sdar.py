@@ -131,13 +131,17 @@ class SDARAttention(nn.Module):
         v_scales = None if not has_scales else past_key_value[3]
         focus_fill_only = focus_active and self.layer_idx == 1
         if focus_active and self.layer_idx == 0:
+            torch.cuda.nvtx.range_push("self._compute_focus_importance")
             self._compute_focus_importance(context, query_states, key_states)
+            torch.cuda.nvtx.range_pop()
         elif focus_fill_only:
             # Preserve the original ragged view for KV fill before pruning.
             self.attn_fwd.forward_only_fill_kv(key_states, value_states, k_cache, v_cache, attn_metadata,
                                                k_scales_zeros=k_scales, v_scales_zeros=v_scales)
+            torch.cuda.nvtx.range_push("self._apply_focus_pruning")
             query_states, key_states, value_states, hidden_states, focus_mask = \
                 self._apply_focus_pruning(context, hidden_states, query_states, key_states, value_states)
+            torch.cuda.nvtx.range_pop()
             attn_metadata = context.attn_metadata
 
         # attention

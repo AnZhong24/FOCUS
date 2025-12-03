@@ -35,6 +35,7 @@ class TritonAttentionMetadata(AttentionMetadata):
     kv_start_loc: torch.Tensor = None
     kv_seqlens: torch.Tensor = None
     fill_seqlens: torch.Tensor = None
+    max_q_seqlen: int = None
     quant_policy: Literal[0, 4, 8] = 0
     kv_flatten_size: int = None
     # flash mla
@@ -120,7 +121,7 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
         use_delayed_cache = getattr(attn_metadata, 'use_delayed_cache', False)
         if attn_metadata.is_decoding:
             if use_delayed_cache and q_seqlens.numel() > 0:
-                max_q_seqlen = int(q_seqlens.max().item())
+                max_q_seqlen = attn_metadata.max_q_seqlen
             else:
                 max_q_seqlen = self.block_sparse_size
         else:
@@ -175,7 +176,7 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
         use_delayed_cache = getattr(attn_metadata, 'use_delayed_cache', False)
         if attn_metadata.is_decoding:
             if use_delayed_cache and q_seqlens.numel() > 0:
-                max_q_seqlen = int(q_seqlens.max().item())
+                max_q_seqlen = attn_metadata.max_q_seqlen
             else:
                 max_q_seqlen = self.block_sparse_size
         else:
@@ -216,6 +217,7 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
                     kv_seqlens=kv_seqlens,
                     q_start_loc=q_start_loc,
                     q_seqlens=q_seqlens,
+                    max_q_seqlen=max_q_seqlen,
                     sm_scale=self.scale,
                     logit_softcapping=self.logit_softcapping,
                 )
@@ -337,7 +339,7 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
         use_delayed_cache = getattr(attn_metadata, 'use_delayed_cache', False)
         if attn_metadata.is_decoding:
             if use_delayed_cache and q_seqlens.numel() > 0:
-                max_q_seqlen = int(q_seqlens.max().item())
+                max_q_seqlen = attn_metadata.max_q_seqlen
             else:
                 max_q_seqlen = self.block_sparse_size
         else:
@@ -401,6 +403,7 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
                     kv_seqlens=kv_seqlens,
                     q_start_loc=q_start_loc,
                     q_seqlens=q_seqlens,
+                    max_q_seqlen=max_q_seqlen,
                     sm_scale=self.scale,
                     logit_softcapping=self.logit_softcapping,
                 )

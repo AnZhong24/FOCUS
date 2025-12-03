@@ -372,6 +372,7 @@ class StepContext:
     is_decoding: bool
     sum_kv_seqlen: int
     max_kv_seqlen: int = None
+    max_q_seqlen: int = None
     local_adapter_ids: torch.LongTensor = None
     input_embeddings: torch.Tensor = None
     input_embedding_indexing: torch.Tensor = None
@@ -422,6 +423,7 @@ class StepContext:
         processing_indices = inputs.processing_indices
         processing_q_lens = inputs.processing_q_lens
         dllm_cfg = getattr(build_ctx, 'dllm_config', None) if build_ctx is not None else None
+        focus_params = FocusParams()
         if dllm_cfg is not None:
             focus_enabled = getattr(dllm_cfg, 'enable_focus', False)
             focus_params = FocusParams(enabled=focus_enabled, focus_alpha=getattr(dllm_cfg, 'focus_alpha', None))
@@ -467,6 +469,13 @@ class StepContext:
                                                      proc_tensor)
         q_start_loc = q_seqlens.cumsum(0) - q_seqlens
         position_ids = position_ids_flat.reshape(1, -1)
+
+        host_q_lens = processing_q_lens if use_delayed_cache else seq_length_full
+        if host_q_lens is not None and host_q_lens.numel() > 0:
+            host_q_lens_cpu = host_q_lens if not host_q_lens.is_cuda else host_q_lens.to('cpu', non_blocking=True)
+            max_q_len_host = int(host_q_lens_cpu.max().item())
+        else:
+            max_q_len_host = 0
 
         # cross
         cross_seqlens = inputs.cross_length
@@ -541,6 +550,7 @@ class StepContext:
             is_decoding=inputs.is_decoding,
             sum_kv_seqlen=inputs.sum_kv_seqlen,
             max_kv_seqlen=inputs.max_kv_seqlen,
+            max_q_seqlen=max_q_len_host,
             local_adapter_ids=inputs.local_adapter_ids,
             vision_inputs=inputs.vision_inputs,
             kv_quant_policy=kv_quant_policy,
@@ -569,14 +579,22 @@ class StepContext:
 
     def commit_processing_view(self):
         """Sync current processing indices/q_lens back to originating ModelInputs."""
-        self.source_inputs.processing_indices = self.processing_indices.detach().to('cpu')
-        self.source_inputs.processing_q_lens = self.q_seqlens.detach().to('cpu')
+        self.source_inputs.processing_indices = self.processing_indices.detach().to('cpu', non_blocking=True)
+        self.source_inputs.processing_q_lens = self.q_seqlens.detach().to('cpu', non_blocking=True)
 
     def update_processing_view(self, new_proc_indices: torch.Tensor, new_q_lens: torch.Tensor):
         """Replace ragged processing view and refresh derived metadata."""
         self.processing_indices = new_proc_indices
         q_start_loc = new_q_lens.cumsum(0) - new_q_lens
         self.q_seqlens = new_q_lens
+        if new_q_lens.numel() > 0:
+            lens_for_max = new_q_lens.detach()
+            if lens_for_max.is_cuda:
+                lens_for_max = lens_for_max.to('cpu', non_blocking=True)
+            max_q_len_host = int(lens_for_max.max().item())
+        else:
+            max_q_len_host = 0
+        self.max_q_seqlen = max_q_len_host
         self.q_start_loc = q_start_loc
         batch_size = new_q_lens.size(0)
         end_offsets = q_start_loc + new_q_lens - 1
@@ -589,6 +607,7 @@ class StepContext:
         if self.attn_metadata is not None:
             self.attn_metadata.q_seqlens = new_q_lens
             self.attn_metadata.q_start_loc = q_start_loc
+            self.attn_metadata.max_q_seqlen = max_q_len_host
             if hasattr(self.attn_metadata, 'cu_seqlens_q'):
                 cu_q = F.pad(torch.cumsum(new_q_lens, dim=0, dtype=torch.int32), (1, 0))
                 self.attn_metadata.cu_seqlens_q = cu_q

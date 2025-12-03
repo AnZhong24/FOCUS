@@ -209,6 +209,7 @@ class CudaOpsBackend(DefaultOpsBackend):
             kv_start_loc=kv_start_loc,
             kv_seqlens=kv_seqlens,
             kv_flatten_size=kv_flatten_size,
+            max_q_seqlen=step_context.max_q_seqlen,
             quant_policy=step_context.kv_quant_policy,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
@@ -245,6 +246,7 @@ class CudaOpsBackend(DefaultOpsBackend):
                 kv_seqlens=cross_kv_seqlens,
                 kv_flatten_size=cross_kv_flatten_size,
                 fill_seqlens=fill_seqlens,
+                max_q_seqlen=step_context.max_q_seqlen,
                 quant_policy=step_context.kv_quant_policy,
             )
 

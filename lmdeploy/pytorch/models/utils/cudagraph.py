@@ -146,6 +146,7 @@ class CudaGraphMixin:
         attn_metadata.kv_seqlens = input_buffers['kv_seqlens']
         attn_metadata.cu_seqlens_q = input_buffers['cu_seqlens_q']
         attn_metadata.cu_seqlens_k = input_buffers['cu_seqlens_k']
+        attn_metadata.max_q_seqlen = graph_meta.max_tokens // graph_meta.max_batchs
 
         if graph_meta.use_flash_mla is True:
             import flash_mla

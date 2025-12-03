@@ -276,6 +276,7 @@ class TestDelayedCacheSparseKernels:
 
         data = dense_paged_attention_inputs
         q = data['q']
+        max_q_len = int(data['q_seqlens'].max().item()) if data['q_seqlens'].numel() > 0 else 0
         out_dense = torch.empty(q.size(0), q.size(1), data['head_dim_v'], dtype=q.dtype, device=q.device)
         paged_attention_fwd(q,
                             data['k_cache'],
@@ -292,5 +293,6 @@ class TestDelayedCacheSparseKernels:
                                    block_offsets=data['block_offsets'],
                                    kv_seqlens=data['kv_seqlens'],
                                    q_start_loc=data['q_start_loc'],
-                                   q_seqlens=data['q_seqlens'])
+                                   q_seqlens=data['q_seqlens'],
+                                   max_q_seqlen=max_q_len)
         torch.testing.assert_close(out_sparse, out_dense, atol=3e-3, rtol=3e-3)

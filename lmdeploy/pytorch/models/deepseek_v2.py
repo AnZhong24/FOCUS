@@ -184,6 +184,13 @@ def get_new_meta(attn_metadata, start_idx: int, end_idx: int):
         if attn_metadata.kv_seqlens is not None else None
     new_attn_metadata.kv_flatten_size = sum(new_attn_metadata.kv_seqlens.tolist()) \
         if attn_metadata.kv_flatten_size is not None else None
+    if new_attn_metadata.q_seqlens is not None and new_attn_metadata.q_seqlens.numel() > 0:
+        q_lens_for_max = new_attn_metadata.q_seqlens.detach()
+        if q_lens_for_max.is_cuda:
+            q_lens_for_max = q_lens_for_max.to('cpu', non_blocking=True)
+        new_attn_metadata.max_q_seqlen = int(q_lens_for_max.max().item())
+    else:
+        new_attn_metadata.max_q_seqlen = 0
     # create buffers for flash mla
     if attn_metadata.num_splits is not None:
         Attention.update_meta_flashmla(new_attn_metadata,
