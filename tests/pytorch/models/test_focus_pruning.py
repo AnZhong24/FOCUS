@@ -1,7 +1,7 @@
 import torch
 import pytest
 
-from lmdeploy.pytorch.models.sdar import SDARAttention
+from lmdeploy.pytorch.models.sdar_backup import SDARAttention
 
 _TEST_FOCUS_MAX_BATCH = 8
 _TEST_FOCUS_BLOCK_LEN = 16

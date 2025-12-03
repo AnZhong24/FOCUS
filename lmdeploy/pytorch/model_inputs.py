@@ -418,19 +418,19 @@ class StepContext:
         """
         seq_length_full = inputs.seq_length
         device = seq_length_full.device
-        history_seqlens = inputs.history_lengths.to(device=device)
+        history_seqlens = inputs.history_lengths
         processing_indices = inputs.processing_indices
         processing_q_lens = inputs.processing_q_lens
         dllm_cfg = getattr(build_ctx, 'dllm_config', None) if build_ctx is not None else None
         if dllm_cfg is not None:
-            focus_enabled = bool(getattr(dllm_cfg, 'enable_focus', False))
+            focus_enabled = getattr(dllm_cfg, 'enable_focus', False)
             focus_params = FocusParams(enabled=focus_enabled, focus_alpha=getattr(dllm_cfg, 'focus_alpha', None))
 
         use_delayed_cache = bool(inputs.is_decoding and processing_indices is not None and processing_q_lens is not None)
         if focus_params.enabled and not use_delayed_cache:
             focus_params.enabled = False
         q_seqlens = seq_length_full
-        num_ignored_history = inputs.num_ignored_history.to(device=device)
+        num_ignored_history = inputs.num_ignored_history
 
         input_multimodals = None
         if inputs.vision_inputs is not None:
@@ -448,23 +448,17 @@ class StepContext:
 
         def _gather_flat_tensor(tensor: torch.Tensor, full_lengths: torch.Tensor, gathered_lengths: torch.Tensor,
                                 gathered_indices: torch.Tensor):
-            tensor_device = tensor.device
-            full_lengths_dev = full_lengths.to(device=tensor_device)
-            gathered_lengths_dev = gathered_lengths.to(device=tensor_device)
-            gathered_indices_dev = gathered_indices.to(device=tensor_device)
-            offsets = torch.cumsum(full_lengths_dev, dim=0) - full_lengths_dev
-            expanded_offsets = torch.repeat_interleave(offsets, gathered_lengths_dev)
-            absolute_indices = gathered_indices_dev + expanded_offsets
+            offsets = torch.cumsum(full_lengths, dim=0) - full_lengths
+            expanded_offsets = torch.repeat_interleave(offsets, gathered_lengths)
+            absolute_indices = gathered_indices + expanded_offsets
             return tensor.index_select(-1, absolute_indices)
 
         input_ids_tensor = inputs.input_ids
         attention_mask = attention_mask_full
         proc_tensor = None
-        processing_tensor = None
         if use_delayed_cache:
-            q_seqlens = processing_q_lens.to(device=device, dtype=seq_length_full.dtype)
-            proc_tensor = processing_indices.to(device=device, dtype=torch.long)
-            processing_tensor = proc_tensor
+            q_seqlens = processing_q_lens
+            proc_tensor = processing_indices
             input_ids_tensor = _gather_flat_tensor(inputs.input_ids, seq_length_full, q_seqlens, proc_tensor)
             position_ids_flat = _gather_flat_tensor(position_ids_flat.unsqueeze(0), seq_length_full, q_seqlens,
                                                     proc_tensor).squeeze(0)
@@ -490,7 +484,6 @@ class StepContext:
             rightmost_vals[valid_mask] = gathered
             zeros = rightmost_vals.new_zeros((batch_size, ))
             rightmost_plus_one = torch.where(rightmost_vals < 0, zeros, rightmost_vals + 1)
-            rightmost_plus_one = rightmost_plus_one.to(device=history_seqlens.device, dtype=history_seqlens.dtype)
             kv_seqlens = history_seqlens + rightmost_plus_one
         else:
             kv_seqlens = q_seqlens + history_seqlens
@@ -500,12 +493,12 @@ class StepContext:
 
         focus_view = None
         if focus_params.enabled:
-            block_unprocessed = inputs.focus_block_unprocessed.to(device=device, dtype=torch.bool, non_blocking=True)
-            avg_tokens_host = inputs.focus_avg_tokens.to(device='cpu', dtype=torch.float32)
-            avg_tokens = avg_tokens_host.to(device=device, dtype=torch.float32, non_blocking=True)
+            block_unprocessed = inputs.focus_block_unprocessed
+            avg_tokens_host = inputs.focus_avg_tokens.to(device='cpu', non_blocking=True)
+            avg_tokens = avg_tokens_host.to(device=device, non_blocking=True)
             mask_global_indices = inputs.focus_mask_global_indices
             mask_seq_offsets = inputs.focus_mask_seq_offsets
-            mask_seq_offsets_cpu = mask_seq_offsets.to(device='cpu', dtype=torch.long)
+            mask_seq_offsets_cpu = mask_seq_offsets.to(device='cpu', non_blocking=True)
             mask_lengths_cpu = mask_seq_offsets_cpu[1:] - mask_seq_offsets_cpu[:-1]
             processing_mask_total = int(mask_seq_offsets_cpu[-1].item()) if mask_seq_offsets_cpu.numel() > 0 else 0
             processing_mask_max_len = int(mask_lengths_cpu.max().item()) if mask_lengths_cpu.numel() > 0 else 0
@@ -517,8 +510,7 @@ class StepContext:
             zeros_cpu = torch.zeros_like(targets_cpu)
             targets_cpu = torch.where(mask_lengths_cpu <= 0, zeros_cpu, targets_cpu)
             should_prune = bool(((targets_cpu > 0) & (mask_lengths_cpu > targets_cpu)).any().item())
-            mask_global_indices = mask_global_indices.to(device=device, dtype=torch.long, non_blocking=True)
-            mask_seq_offsets = mask_seq_offsets.to(device=device, dtype=torch.int32, non_blocking=True)
+            mask_global_indices = mask_global_indices.to(dtype=torch.long, non_blocking=True)
             focus_view = FocusRuntimeView(
                 block_unprocessed=block_unprocessed,
                 avg_decoded_tokens=avg_tokens,
@@ -559,7 +551,7 @@ class StepContext:
             enable_microbatch=inputs.enable_microbatch,
             state_caches=state_caches,
             state_offsets=inputs.state_offsets,
-            processing_indices=processing_tensor,
+            processing_indices=proc_tensor,
             use_delayed_cache=use_delayed_cache,
             history_lengths=history_seqlens,
             num_ignored_history=num_ignored_history,
@@ -582,8 +574,6 @@ class StepContext:
 
     def update_processing_view(self, new_proc_indices: torch.Tensor, new_q_lens: torch.Tensor):
         """Replace ragged processing view and refresh derived metadata."""
-        device = new_proc_indices.device
-
         self.processing_indices = new_proc_indices
         q_start_loc = new_q_lens.cumsum(0) - new_q_lens
         self.q_seqlens = new_q_lens
@@ -593,10 +583,8 @@ class StepContext:
         rightmost_vals = new_proc_indices.index_select(0, end_offsets)
         zeros = rightmost_vals.new_zeros((batch_size, ))
         rightmost_plus_one = torch.where(rightmost_vals < 0, zeros, rightmost_vals + 1)
-        history = self.history_lengths.to(device=device, dtype=new_q_lens.dtype)
-        ignore_hist = self.num_ignored_history.to(device=device, dtype=new_q_lens.dtype)
-        kv_seqlens = history + rightmost_plus_one.to(new_q_lens.dtype)
-        kv_seqlens -= ignore_hist
+        kv_seqlens = self.history_lengths + rightmost_plus_one
+        kv_seqlens -= self.num_ignored_history
         self.kv_seqlens = kv_seqlens
         if self.attn_metadata is not None:
             self.attn_metadata.q_seqlens = new_q_lens
@@ -619,16 +607,12 @@ class StepContext:
         """Record which tokens were processed this round based on trimmed indices."""
         view = self.focus_view
         block_template = getattr(view, 'block_unprocessed', None)
-        processing_indices = self.processing_indices
-        q_lens = self.q_seqlens
         block_device = block_template.device
         block_mask = torch.zeros_like(block_template, dtype=torch.bool, device=block_device)
-        proc_indices = processing_indices.to(device=block_device, dtype=torch.long, non_blocking=True)
-        lengths = q_lens.to(device=block_device, dtype=torch.long)
-        seq_ids = torch.repeat_interleave(torch.arange(lengths.size(0), device=block_device),
-                                          lengths,
-                                          output_size=int(proc_indices.numel()))
-        block_mask[seq_ids, proc_indices] = True
+        seq_ids = torch.repeat_interleave(torch.arange(self.q_seqlens.size(0), device=block_device),
+                                          self.q_seqlens,
+                                          output_size=int(self.processing_indices.numel()))
+        block_mask[seq_ids, self.processing_indices] = True
         view.block_unprocessed = view.block_unprocessed & (~block_mask)
 
     def get_focus_processed_indices(self) -> Optional[List[List[int]]]:
