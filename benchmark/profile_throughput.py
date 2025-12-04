@@ -5,7 +5,7 @@ import json
 import os
 import random
 from queue import Queue
-from typing import List, Union, Tuple, Optional
+from typing import Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 from tqdm import tqdm
@@ -124,31 +124,95 @@ def _earliest_completed_sessions(profiler: Profiler, count: int):
     return completed[:min(count, len(completed))]
 
 
+class _UInt64RollingHasher:
+    """Simple rolling hash helper that works modulo 2**64."""
+
+    __slots__ = ('base', 'mask', 'powers', 'prefix')
+
+    def __init__(self, base: int):
+        self.base = base
+        self.mask = (1 << 64) - 1
+        self.prefix = [0]
+        self.powers = [1]
+
+    def append(self, value: int):
+        mask = self.mask
+        next_prefix = (self.prefix[-1] * self.base + value + 1) & mask
+        self.prefix.append(next_prefix)
+        self.powers.append((self.powers[-1] * self.base) & mask)
+
+    def range_hash(self, start: int, end: int) -> int:
+        mask = self.mask
+        prefix = self.prefix
+        power = self.powers[end - start]
+        return (prefix[end] - (prefix[start] * power & mask)) & mask
+
+
 class RepetitionDetector:
-    """Detect repeated blocks of generated tokens."""
+    """Detect repeated blocks of generated tokens using rolling hashes."""
 
     MIN_CHECK_BLOCK = 4
+    HASH_BASES = (911382323, 972663749)
 
     def __init__(self, block_size: int, repeats: int):
         self.block_size = block_size
         self.repeats = repeats
 
+    def create_state(self):
+        """Return a new incremental detector state for a single request."""
+        return _RepetitionState(self)
+
     def should_stop(self, generated: List[int]) -> bool:
-        """Return True if a repeated block is detected."""
-        total = len(generated)
-        max_block = min(self.block_size, total // self.repeats)
+        """Compatibility helper that runs the detector on a full sequence."""
+        state = self.create_state()
+        return state.observe(generated)
+
+
+class _RepetitionState:
+    """Track rolling hashes for a single decoding stream."""
+
+    __slots__ = ('detector', 'hashers', 'token_count')
+
+    def __init__(self, detector: RepetitionDetector):
+        self.detector = detector
+        self.token_count = 0
+        self.hashers = [_UInt64RollingHasher(base) for base in detector.HASH_BASES]
+
+    def observe(self, tokens: Iterable[int]) -> bool:
+        for token in tokens:
+            if self.observe_token(token):
+                return True
+        return False
+
+    def observe_token(self, token: int) -> bool:
+        self.token_count += 1
+        for hasher in self.hashers:
+            hasher.append(token)
+        return self._detect_tail()
+
+    def _hash_range(self, start: int, end: int):
+        return tuple(hasher.range_hash(start, end) for hasher in self.hashers)
+
+    def _detect_tail(self) -> bool:
+        detector = self.detector
+        total = self.token_count
+        if total < detector.repeats:
+            return False
+        max_block = min(detector.block_size, total // detector.repeats)
         if max_block <= 0:
             return False
-        min_block = self.MIN_CHECK_BLOCK if max_block >= self.MIN_CHECK_BLOCK else 1
+        min_block = detector.MIN_CHECK_BLOCK if max_block >= detector.MIN_CHECK_BLOCK else 1
+        if max_block < min_block:
+            return False
         for block_size in range(max_block, min_block - 1, -1):
-            tail_start = total - block_size
-            if tail_start < 0:
-                break
-            tail = generated[tail_start:]
+            tail_hash = self._hash_range(total - block_size, total)
             repeated = True
-            for idx in range(2, self.repeats + 1):
-                start = total - block_size * idx
-                if start < 0 or generated[start:start + block_size] != tail:
+            for idx in range(2, detector.repeats + 1):
+                block_start = total - block_size * idx
+                if block_start < 0:
+                    repeated = False
+                    break
+                if self._hash_range(block_start, block_start + block_size) != tail_hash:
                     repeated = False
                     break
             if repeated:
@@ -216,8 +280,8 @@ class Engine:
 
             n_token = 0
             token_ids = input_ids.copy()
-            generated_ids: List[int] = []
             stop_due_to_repetition = False
+            repetition_state = repetition_detector.create_state() if repetition_detector else None
 
             generator = model_inst.async_stream_infer(session_id,
                                                       input_ids=input_ids,
@@ -231,13 +295,23 @@ class Engine:
                                                       stream_output=stream_output)
             try:
                 async for outputs in generator:
-                    n_token += len(outputs.token_ids)
-                    token_ids += outputs.token_ids
-                    generated_ids.extend(outputs.token_ids)
-                    if not skip_detokenize:
-                        # _, state = self.tokenizer.detokenize_incrementally(token_ids, state)
+                    chunk_tokens = outputs.token_ids
+                    processed_count = 0
+                    repetition_hit = False
+                    if repetition_state:
+                        for token in chunk_tokens:
+                            token_ids.append(token)
+                            processed_count += 1
+                            if repetition_state.observe_token(token):
+                                repetition_hit = True
+                                break
+                    else:
+                        token_ids.extend(chunk_tokens)
+                        processed_count = len(chunk_tokens)
+                    if processed_count and not skip_detokenize:
                         text, state = self.tokenizer.detokenize_incrementally(token_ids, state)
                         print(text, end='')
+                    n_token += processed_count
                     sess.tick(n_token)
                     stats = getattr(outputs.req_metrics, 'dllm_stats', None) if outputs.req_metrics else None
                     if stats:
@@ -245,8 +319,7 @@ class Engine:
                         steps = stats.get('decode_steps', 0)
                         self.dllm_processed_tokens += processed
                         self.dllm_decode_steps += steps
-                    # No need to check for cancel_after since we're generating until EOS
-                    if repetition_detector and repetition_detector.should_stop(generated_ids):
+                    if repetition_hit:
                         stop_due_to_repetition = True
                         if not skip_detokenize:
                             print()
