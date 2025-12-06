@@ -250,6 +250,9 @@ class CudaOpsBackend(DefaultOpsBackend):
                 quant_policy=step_context.kv_quant_policy,
             )
 
+        if getattr(step_context, 'use_delayed_cache', False):
+            attn_metadata.tile_to_seq = getattr(step_context, 'ragged_tile_to_seq', None)
+            attn_metadata.seq_tile_offsets = getattr(step_context, 'ragged_seq_tile_offsets', None)
         step_context.attn_metadata = attn_metadata
         step_context.cross_attn_metadata = cross_attn_metadata
         return step_context

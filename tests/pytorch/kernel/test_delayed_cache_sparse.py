@@ -35,6 +35,42 @@ def _div_up(val, other):
     return (val + other - 1) // other
 
 
+def _next_power_of_two(val):
+    if val <= 1:
+        return 1
+    return 1 << (val - 1).bit_length()
+
+
+def _build_ragged_tile_metadata(q_seqlens, num_heads_q, num_heads_k, block_size, max_q_len):
+    """Mirror backend metadata builder for tests."""
+    device = q_seqlens.device
+    if q_seqlens.numel() == 0 or max_q_len <= 0:
+        empty = torch.empty((0, ), dtype=torch.int32, device=device)
+        return empty, empty
+    kv_group_num = max(1, num_heads_q // num_heads_k)
+    heads_per_req_max = kv_group_num * max_q_len
+    if heads_per_req_max <= 0:
+        empty = torch.empty((0, ), dtype=torch.int32, device=device)
+        return empty, empty
+    block_h = max(16, min(block_size, _next_power_of_two(heads_per_req_max)))
+    q_cpu = q_seqlens.detach().to(device='cpu')
+    heads_per_req = q_cpu * kv_group_num
+    tiles_per_seq = (heads_per_req + block_h - 1) // block_h
+    tiles_per_seq = tiles_per_seq.to(torch.int32)
+    total_tiles = int(tiles_per_seq.sum().item())
+    seq_tile_offsets_cpu = torch.cumsum(tiles_per_seq, dim=0, dtype=torch.int32)
+    seq_tile_offsets_cpu = torch.cat([seq_tile_offsets_cpu.new_zeros((1, )), seq_tile_offsets_cpu[:-1]])
+    seq_tile_offsets_cpu = seq_tile_offsets_cpu.contiguous()
+    if total_tiles == 0:
+        tile_to_seq = torch.empty((0, ), dtype=torch.int32, device=device)
+    else:
+        seq_ids = torch.arange(q_cpu.numel(), dtype=torch.int32)
+        tile_to_seq_cpu = torch.repeat_interleave(seq_ids, tiles_per_seq, output_size=total_tiles)
+        tile_to_seq = tile_to_seq_cpu.to(device=device, non_blocking=True)
+    seq_tile_offsets = seq_tile_offsets_cpu.to(device=device, non_blocking=True)
+    return tile_to_seq, seq_tile_offsets
+
+
 def _make_block_offsets(num_blocks_per_seq, batch_size, device):
     max_blocks = max(num_blocks_per_seq)
     block_ids = torch.arange(max_blocks, device=device, dtype=torch.long)
@@ -242,6 +278,9 @@ def dense_paged_attention_inputs():
         'q_start_loc': q_start_loc,
         'processing_indices': processing_indices,
         'head_dim_v': head_dim_v,
+        'block_size': block_size,
+        'num_heads_q': num_heads_q,
+        'num_heads_k': num_heads_k,
     }
 
 
@@ -286,6 +325,8 @@ class TestDelayedCacheSparseKernels:
                             kv_seqlens=data['kv_seqlens'])
 
         out_sparse = torch.empty_like(out_dense)
+        tile_to_seq, seq_tile_offsets = _build_ragged_tile_metadata(data['q_seqlens'], data['num_heads_q'],
+                                                                    data['num_heads_k'], data['block_size'], max_q_len)
         ragged_paged_attention_fwd(q,
                                    data['k_cache'],
                                    data['v_cache'],
@@ -294,5 +335,7 @@ class TestDelayedCacheSparseKernels:
                                    kv_seqlens=data['kv_seqlens'],
                                    q_start_loc=data['q_start_loc'],
                                    q_seqlens=data['q_seqlens'],
+                                   tile_to_seq=tile_to_seq,
+                                   seq_tile_offsets=seq_tile_offsets,
                                    max_q_seqlen=max_q_len)
         torch.testing.assert_close(out_sparse, out_dense, atol=3e-3, rtol=3e-3)

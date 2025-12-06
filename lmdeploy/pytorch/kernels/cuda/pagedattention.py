@@ -926,6 +926,8 @@ def ragged_paged_attention_fwd(
     kv_seqlens: Tensor,
     q_start_loc: Tensor,
     q_seqlens: Tensor,
+    tile_to_seq: Tensor,
+    seq_tile_offsets: Tensor,
     max_q_seqlen: int,
     sm_scale: float = None,
     logit_softcapping: float = None,
@@ -979,16 +981,6 @@ def ragged_paged_attention_fwd(
     if heads_per_req_max <= 0:
         return
     BLOCK_H = max(16, min(BLOCK, triton.next_power_of_2(heads_per_req_max)))
-
-    heads_per_req = q_seqlens * kv_group_num
-    tiles_per_seq = (heads_per_req + BLOCK_H - 1) // BLOCK_H
-
-    tile_offsets = torch.nn.functional.pad(tiles_per_seq.cumsum(0), (1, 0))
-    tile_offsets = tile_offsets.to(dtype=torch.int32)
-    seq_tile_offsets = tile_offsets[:-1].contiguous()
-
-    seq_ids = torch.arange(batch, device=q.device, dtype=torch.int32)
-    tile_to_seq = torch.repeat_interleave(seq_ids, tiles_per_seq).contiguous()
 
     total_tiles = tile_to_seq.size(0)
     grid_1 = total_tiles * num_kv_heads

@@ -190,6 +190,9 @@ class ModelInputs:
     target_position_ids: torch.Tensor = None
     processing_indices: torch.LongTensor = None
     processing_q_lens: torch.LongTensor = None
+    processing_max_q_len: int = 0
+    ragged_tile_to_seq: torch.IntTensor = None
+    ragged_seq_tile_offsets: torch.IntTensor = None
     focus_block_unprocessed: torch.BoolTensor = None
     focus_avg_tokens: torch.FloatTensor = None
     focus_mask_global_indices: torch.LongTensor = None
@@ -208,6 +211,9 @@ class ModelInputs:
         self.input_ids = input_ids
         self.processing_indices = None
         self.processing_q_lens = None
+        self.processing_max_q_len = 0
+        self.ragged_tile_to_seq = None
+        self.ragged_seq_tile_offsets = None
         self.focus_block_unprocessed = None
         self.focus_avg_tokens = None
         self.focus_mask_global_indices = None
@@ -354,6 +360,18 @@ class ModelInputs:
         return ret
 
 
+def _gather_flat_tensor(tensor: torch.Tensor, full_lengths: torch.Tensor, gathered_lengths: torch.Tensor,
+                        gathered_indices: torch.Tensor) -> torch.Tensor:
+    """Gather ragged per-sequence slices from ``tensor`` using length metadata."""
+    offsets = torch.cumsum(full_lengths, dim=0) - full_lengths
+    seq_boundaries = torch.cumsum(gathered_lengths, dim=0)
+    positions = torch.arange(gathered_indices.size(0), device=tensor.device, dtype=torch.long)
+    seq_ids = torch.bucketize(positions, seq_boundaries, right=True)
+    expanded_offsets = offsets.index_select(0, seq_ids)
+    absolute_indices = gathered_indices + expanded_offsets
+    return tensor.index_select(-1, absolute_indices)
+
+
 @dataclass
 class StepContext:
     """Context of Model.
@@ -392,6 +410,8 @@ class StepContext:
     focus_params: FocusParams = None
     focus_view: FocusRuntimeView = None
     dllm_track: bool = False
+    ragged_tile_to_seq: torch.IntTensor = None
+    ragged_seq_tile_offsets: torch.IntTensor = None
 
     # states for ssm
     state_caches: List = None
@@ -448,13 +468,6 @@ class StepContext:
         attention_mask_full, position_ids_full = cls.get_mask_and_position_ids(inputs)
         position_ids_flat = position_ids_full.reshape(-1)
 
-        def _gather_flat_tensor(tensor: torch.Tensor, full_lengths: torch.Tensor, gathered_lengths: torch.Tensor,
-                                gathered_indices: torch.Tensor):
-            offsets = torch.cumsum(full_lengths, dim=0) - full_lengths
-            expanded_offsets = torch.repeat_interleave(offsets, gathered_lengths)
-            absolute_indices = gathered_indices + expanded_offsets
-            return tensor.index_select(-1, absolute_indices)
-
         input_ids_tensor = inputs.input_ids
         attention_mask = attention_mask_full
         proc_tensor = None
@@ -470,12 +483,9 @@ class StepContext:
         q_start_loc = q_seqlens.cumsum(0) - q_seqlens
         position_ids = position_ids_flat.reshape(1, -1)
 
-        host_q_lens = processing_q_lens if use_delayed_cache else seq_length_full
-        if host_q_lens is not None and host_q_lens.numel() > 0:
-            host_q_lens_cpu = host_q_lens if not host_q_lens.is_cuda else host_q_lens.to('cpu', non_blocking=True)
-            max_q_len_host = int(host_q_lens_cpu.max().item())
-        else:
-            max_q_len_host = 0
+        ragged_tile_to_seq = inputs.ragged_tile_to_seq
+        ragged_seq_tile_offsets = inputs.ragged_seq_tile_offsets
+        max_q_len_host = inputs.max_q_seqlen
 
         # cross
         cross_seqlens = inputs.cross_length
@@ -489,8 +499,10 @@ class StepContext:
             rightmost_vals = proc_tensor.new_full((batch_size, ), -1)
             valid_mask = q_seqlens > 0
             end_offsets = q_start_loc + q_seqlens - 1
-            gathered = proc_tensor.index_select(0, end_offsets[valid_mask])
-            rightmost_vals[valid_mask] = gathered
+            if proc_tensor.numel() > 0:
+                safe_end_offsets = torch.where(valid_mask, end_offsets, end_offsets.new_zeros(end_offsets.size()))
+                gathered = proc_tensor.index_select(0, safe_end_offsets)
+                rightmost_vals = torch.where(valid_mask, gathered, rightmost_vals)
             zeros = rightmost_vals.new_zeros((batch_size, ))
             rightmost_plus_one = torch.where(rightmost_vals < 0, zeros, rightmost_vals + 1)
             kv_seqlens = history_seqlens + rightmost_plus_one
@@ -507,7 +519,7 @@ class StepContext:
             avg_tokens = avg_tokens_host.to(device=device, non_blocking=True)
             mask_global_indices = inputs.focus_mask_global_indices
             mask_seq_offsets = inputs.focus_mask_seq_offsets
-            mask_seq_offsets_cpu = mask_seq_offsets.to(device='cpu', non_blocking=True)
+            mask_seq_offsets_cpu = mask_seq_offsets.to(device='cpu', non_blocking=False)
             mask_lengths_cpu = mask_seq_offsets_cpu[1:] - mask_seq_offsets_cpu[:-1]
             processing_mask_total = int(mask_seq_offsets_cpu[-1].item()) if mask_seq_offsets_cpu.numel() > 0 else 0
             processing_mask_max_len = int(mask_lengths_cpu.max().item()) if mask_lengths_cpu.numel() > 0 else 0
@@ -569,6 +581,8 @@ class StepContext:
             focus_params=focus_params,
             focus_view=focus_view,
             dllm_track=dllm_track,
+            ragged_tile_to_seq=ragged_tile_to_seq,
+            ragged_seq_tile_offsets=ragged_seq_tile_offsets,
         )
 
         ret = get_backend().update_step_context(ret)
@@ -587,13 +601,22 @@ class StepContext:
         self.processing_indices = new_proc_indices
         q_start_loc = new_q_lens.cumsum(0) - new_q_lens
         self.q_seqlens = new_q_lens
+        host_q_lens_cpu = None
         if new_q_lens.numel() > 0:
             lens_for_max = new_q_lens.detach()
             if lens_for_max.is_cuda:
-                lens_for_max = lens_for_max.to('cpu', non_blocking=True)
-            max_q_len_host = int(lens_for_max.max().item())
-        else:
-            max_q_len_host = 0
+                lens_for_max = lens_for_max.to('cpu')
+            host_q_lens_cpu = lens_for_max
+
+        block_size = self.kv_caches[0][0].size(1) if self.kv_caches else None
+        from lmdeploy.pytorch.engine.engine import build_delayed_cache_ragged_metadata
+        ragged_tile_to_seq, ragged_seq_tile_offsets, max_q_len_host = build_delayed_cache_ragged_metadata(
+            host_q_lens_cpu,
+            self.model_config,
+            block_size,
+        )
+        self.ragged_tile_to_seq = ragged_tile_to_seq.to(self.q_seqlens.device)
+        self.ragged_seq_tile_offsets = ragged_seq_tile_offsets.to(self.q_seqlens.device)
         self.max_q_seqlen = max_q_len_host
         self.q_start_loc = q_start_loc
         batch_size = new_q_lens.size(0)

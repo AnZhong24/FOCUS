@@ -152,10 +152,10 @@ class DLLMModelAgentStrategy(ModelAgentStrategy):
         device = flat_logits.device
         proc_indices = inputs.processing_indices.to(device=device, dtype=torch.long)
         seq_lengths_src = inputs.processing_q_lens if inputs.processing_q_lens is not None else inputs.seq_length
-        seq_lengths = seq_lengths_src.to(device=device, dtype=torch.long)
         num_proc = proc_indices.numel()
-
-        batch_indices = torch.arange(batch_size, device=device).repeat_interleave(seq_lengths)
+        seq_lengths = seq_lengths_src.to(device=device, dtype=torch.long)
+        seq_ids = torch.arange(batch_size, device=device, dtype=torch.long)
+        batch_indices = torch.repeat_interleave(seq_ids, seq_lengths, output_size=int(num_proc))
         dense_row_indices = batch_indices * block_size + proc_indices
         total_logits = flat_logits.size(0)
         # Kernels may output ragged logits (one row per processing index) or dense block
@@ -169,8 +169,9 @@ class DLLMModelAgentStrategy(ModelAgentStrategy):
                 f'Unexpected logits rows: got {total_logits}, '
                 f'but need either {num_proc} (sparse) or {batch_size * block_size} (dense).')
 
-        full_logits[batch_indices, proc_indices] = assign_logits
-        return full_logits.view(-1, vocab_size)
+        flat_full = full_logits.view(-1, vocab_size)
+        flat_full.index_copy_(0, dense_row_indices, assign_logits)
+        return flat_full
 
     def _temporarily_cache_unprocessed(self, dllm_mask: torch.Tensor,
                                        inputs: ModelInputs) -> Optional[torch.Tensor]:
@@ -189,20 +190,24 @@ class DLLMModelAgentStrategy(ModelAgentStrategy):
         seq_count = proc_q_lens.numel()
 
         seq_mask_view = mask_view[:seq_count]
-        processed_mask = torch.zeros((seq_count, block_size), dtype=torch.bool, device=device)
+        processed_mask = torch.zeros(seq_count * block_size, dtype=torch.bool, device=device)
         if proc_indices.numel() > 0:
-            seq_ids = torch.repeat_interleave(torch.arange(seq_count, device=device, dtype=torch.long), proc_q_lens)
-            processed_mask[seq_ids, proc_indices] = True
+            seq_ids = torch.repeat_interleave(torch.arange(seq_count, device=device, dtype=torch.long),
+                                              proc_q_lens,
+                                              output_size=int(proc_indices.numel()))
+            dense_offsets = seq_ids * block_size + proc_indices
+            processed_mask.index_fill_(0, dense_offsets, True)
+        processed_mask = processed_mask.view(seq_count, block_size)
 
         masked_slots = (seq_mask_view == consts.DLLM_MASKED)
         cached_mask = (~processed_mask) & masked_slots
         cached_mask &= (proc_q_lens < block_size).view(-1, 1)
-        seq_mask_view[cached_mask] = consts.DLLM_CACHED
+        seq_mask_view.masked_fill_(cached_mask, consts.DLLM_CACHED)
 
         if seq_count == total_seqs:
             return cached_mask
         cached_mask_full = torch.zeros_like(mask_view, dtype=torch.bool)
-        cached_mask_full[:seq_count] = cached_mask
+        cached_mask_full[:seq_count].copy_(cached_mask)
         return cached_mask_full
 
     def _restore_cached_unprocessed(self, dllm_mask: torch.Tensor, cached_masks: Optional[torch.Tensor]):
@@ -211,7 +216,7 @@ class DLLMModelAgentStrategy(ModelAgentStrategy):
             return
         block_size = self.block_size
         mask_view = dllm_mask.view(-1, block_size)
-        mask_view[cached_masks] = consts.DLLM_MASKED
+        mask_view.masked_fill_(cached_masks, consts.DLLM_MASKED)
 
     def reshape_logits(self, logits: torch.Tensor, inputs: ModelInputs) -> torch.Tensor:
         if not self._use_delayed_cache(inputs):

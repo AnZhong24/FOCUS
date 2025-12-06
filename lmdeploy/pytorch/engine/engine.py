@@ -75,6 +75,37 @@ def _tensorlize_block_offsets(block_offsets, dtype=torch.int32):
     return torch.as_tensor(out, dtype=dtype)
 
 
+def _next_power_of_two(val: int) -> int:
+    """Return the next power of two >= val."""
+    if val <= 1:
+        return 1
+    return 1 << (val - 1).bit_length()
+
+
+def build_delayed_cache_ragged_metadata(
+    host_q_seqlens: torch.Tensor,
+    model_config: ModelConfig,
+    block_size: int,
+):
+    """Build ragged delayed-cache metadata on host."""
+    host_q_seqlens = host_q_seqlens
+    num_heads = model_config.num_attention_heads
+    num_kv_heads = model_config.num_key_value_heads
+    kv_group_num = max(1, num_heads // num_kv_heads)
+    max_q = int(host_q_seqlens.max().item())
+    heads_per_req_max = kv_group_num * max_q
+    block_h = max(16, min(block_size, _next_power_of_two(heads_per_req_max)))
+    heads_per_req = host_q_seqlens * kv_group_num
+    tiles_per_seq = ((heads_per_req + block_h - 1) // block_h).to(torch.int32)
+    seq_tile_offsets = torch.cumsum(tiles_per_seq, dim=0, dtype=torch.int32)
+    seq_tile_offsets = torch.cat([seq_tile_offsets.new_zeros((1, )), seq_tile_offsets[:-1]])
+    seq_tile_offsets = seq_tile_offsets.contiguous()
+    total_tiles = int(tiles_per_seq.sum().item())
+    seq_ids = torch.arange(host_q_seqlens.numel(), dtype=torch.int32)
+    tile_to_seq = torch.repeat_interleave(seq_ids, tiles_per_seq, output_size=total_tiles)
+    return tile_to_seq, seq_tile_offsets, max_q
+
+
 def _update_engine_config(engine_config: PytorchEngineConfig):
     """Update pytorch engine config."""
     # make sure engine exits
@@ -896,6 +927,14 @@ class Engine(EngineBase):
         if processing_indices is not None:
             model_inputs.processing_indices = processing_indices
             model_inputs.processing_q_lens = processing_q_lens
+            tile_to_seq, seq_tile_offsets, max_proc_q_len = build_delayed_cache_ragged_metadata(
+                processing_q_lens,
+                self.model_config,
+                self.cache_config.block_size,
+            )
+            model_inputs.processing_max_q_len = max_proc_q_len
+            model_inputs.ragged_tile_to_seq = tile_to_seq
+            model_inputs.ragged_seq_tile_offsets = seq_tile_offsets
             if focus_enabled:
                 model_inputs.focus_block_unprocessed = focus_block_unprocessed
                 model_inputs.focus_avg_tokens = focus_avg_tensor

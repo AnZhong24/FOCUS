@@ -46,6 +46,8 @@ class TritonAttentionMetadata(AttentionMetadata):
     # flash attn
     scheduler_metadata: torch.Tensor = None
     max_kv_seqlen: int = None
+    tile_to_seq: torch.Tensor = None
+    seq_tile_offsets: torch.Tensor = None
 
 
 def _cdiv(a, b):
@@ -208,6 +210,8 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
 
         if is_decoding:
             if use_delayed_cache:
+                tile_to_seq = attn_metadata.tile_to_seq
+                seq_tile_offsets = attn_metadata.seq_tile_offsets
                 self.ragged_paged_attention_fwd(
                     query,
                     k_cache,
@@ -217,6 +221,8 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
                     kv_seqlens=kv_seqlens,
                     q_start_loc=q_start_loc,
                     q_seqlens=q_seqlens,
+                    tile_to_seq=tile_to_seq,
+                    seq_tile_offsets=seq_tile_offsets,
                     max_q_seqlen=max_q_seqlen,
                     sm_scale=self.scale,
                     logit_softcapping=self.logit_softcapping,
@@ -394,6 +400,8 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
 
         if is_decoding:
             if use_delayed_cache:
+                tile_to_seq = attn_metadata.tile_to_seq
+                seq_tile_offsets = attn_metadata.seq_tile_offsets
                 self.ragged_paged_attention_fwd(
                     query,
                     k_cache,
@@ -403,6 +411,8 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
                     kv_seqlens=kv_seqlens,
                     q_start_loc=q_start_loc,
                     q_seqlens=q_seqlens,
+                    tile_to_seq=tile_to_seq,
+                    seq_tile_offsets=seq_tile_offsets,
                     max_q_seqlen=max_q_seqlen,
                     sm_scale=self.scale,
                     logit_softcapping=self.logit_softcapping,
