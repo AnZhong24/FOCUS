@@ -883,7 +883,7 @@ class Engine(EngineBase):
             processing_indices = (torch.cat(proc_tensors)
                                   if len(proc_tensors) > 0 else torch.empty((0, ), dtype=torch.long))
             processing_q_lens = torch.tensor(proc_lengths, dtype=torch.long)
-            if focus_enabled and len(focus_block_unprocessed) == len(messages):
+            if focus_enabled:
                 total_masked = focus_mask_indptr[-1]
                 if total_masked > 0:
                     mask_global_tensor = torch.cat(focus_mask_globals).pin_memory()
@@ -894,8 +894,6 @@ class Engine(EngineBase):
                 focus_avg_tensor = torch.tensor(focus_avg_tokens, dtype=torch.float32).pin_memory()
                 focus_mask_global_indices = mask_global_tensor
                 focus_mask_seq_offsets = mask_indptr_tensor
-            else:
-                focus_enabled = False
 
         kv_seqlens = seq_length + history_lengths
         max_kv_seqlen = kv_seqlens.max().item()

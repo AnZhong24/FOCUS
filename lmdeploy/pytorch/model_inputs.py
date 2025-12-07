@@ -12,6 +12,9 @@ from lmdeploy.pytorch.config import DLLMConfig, ModelConfig
 from lmdeploy.pytorch.multimodal.data_type import MultiModalTensor
 from lmdeploy.pytorch.utils import CtxMgrBase, singleton
 
+# Focus metadata that should remain on host to avoid device-to-host syncs during context build.
+FOCUS_HOST_TENSORS = {'focus_mask_seq_offsets', 'focus_avg_tokens'}
+
 if TYPE_CHECKING:
     from lmdeploy.pytorch.strategies.base import StrategyFactoryBase
 
@@ -342,7 +345,11 @@ class ModelInputs:
             k = f.name
             v = getattr(self, k)
             if isinstance(v, torch.Tensor):
-                v = v.to(device, non_blocking=non_blocking)
+                if device != 'cpu' and k in FOCUS_HOST_TENSORS:
+                    if v.device.type != 'cpu':
+                        v = v.to('cpu', non_blocking=False)
+                else:
+                    v = v.to(device, non_blocking=non_blocking)
             elif isinstance(v, VisionModelInputs):
                 v = v.to_device(device, non_blocking=non_blocking)
             out_dict[k] = v
@@ -515,23 +522,18 @@ class StepContext:
         focus_view = None
         if focus_params.enabled:
             block_unprocessed = inputs.focus_block_unprocessed
-            avg_tokens_host = inputs.focus_avg_tokens.to(device='cpu', non_blocking=True)
-            avg_tokens = avg_tokens_host.to(device=device, non_blocking=True)
+            avg_tokens_cpu = inputs.focus_avg_tokens
+            avg_tokens = avg_tokens_cpu.to(device=device, non_blocking=True)
             mask_global_indices = inputs.focus_mask_global_indices
-            mask_seq_offsets = inputs.focus_mask_seq_offsets
-            mask_seq_offsets_cpu = mask_seq_offsets.to(device='cpu', non_blocking=False)
+            mask_seq_offsets_cpu = inputs.focus_mask_seq_offsets
+            mask_seq_offsets = mask_seq_offsets_cpu.to(device=device, non_blocking=True)
             mask_lengths_cpu = mask_seq_offsets_cpu[1:] - mask_seq_offsets_cpu[:-1]
-            processing_mask_total = int(mask_seq_offsets_cpu[-1].item()) if mask_seq_offsets_cpu.numel() > 0 else 0
-            processing_mask_max_len = int(mask_lengths_cpu.max().item()) if mask_lengths_cpu.numel() > 0 else 0
+            processing_mask_total = int(mask_seq_offsets_cpu[-1].item())
+            processing_mask_max_len = int(mask_lengths_cpu.max().item())
             focus_alpha = getattr(focus_params, 'focus_alpha', None)
-            avg_tokens_clamped = torch.maximum(avg_tokens_host, torch.ones_like(avg_tokens_host))
-            retain_cpu = torch.ceil(avg_tokens_clamped * focus_alpha).to(dtype=mask_lengths_cpu.dtype)
-            retain_cpu = torch.clamp(retain_cpu, min=1)
+            retain_cpu = torch.ceil(avg_tokens_cpu * focus_alpha).to(dtype=mask_lengths_cpu.dtype)
             targets_cpu = torch.minimum(mask_lengths_cpu, retain_cpu)
-            zeros_cpu = torch.zeros_like(targets_cpu)
-            targets_cpu = torch.where(mask_lengths_cpu <= 0, zeros_cpu, targets_cpu)
             should_prune = bool(((targets_cpu > 0) & (mask_lengths_cpu > targets_cpu)).any().item())
-            mask_global_indices = mask_global_indices.to(dtype=torch.long, non_blocking=True)
             focus_view = FocusRuntimeView(
                 block_unprocessed=block_unprocessed,
                 avg_decoded_tokens=avg_tokens,

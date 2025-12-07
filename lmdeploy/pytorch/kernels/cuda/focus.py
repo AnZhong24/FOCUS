@@ -644,6 +644,20 @@ def focus_compact_states(retain_indices: torch.Tensor,
     input_ids_out = input_ids.new_empty((ids_shape[0], keep_tokens))
     position_ids_out = position_ids.new_empty((pos_shape[0], keep_tokens))
     new_proc_indices = proc_indices.new_empty((keep_tokens, ))
+    # q_out = torch.empty((keep_tokens, q_shape[1], q_shape[2]), dtype=query_states.dtype,
+    #                      pin_memory=True).to(device=device, non_blocking=True)
+    # k_out = torch.empty((keep_tokens, k_shape[1], k_shape[2]), dtype=key_states.dtype,
+    #                      pin_memory=True).to(device=device, non_blocking=True)
+    # v_out = torch.empty((keep_tokens, v_shape[1], v_shape[2]), dtype=value_states.dtype,
+    #                      pin_memory=True).to(device=device, non_blocking=True)
+    # hidden_out = torch.empty((hidden_shape[0], keep_tokens, hidden_shape[2]), dtype=hidden_states.dtype,
+    #                           pin_memory=True).to(device=device, non_blocking=True)
+    # input_ids_out = torch.empty((ids_shape[0], keep_tokens), dtype=input_ids.dtype,
+    #                              pin_memory=True).to(device=device, non_blocking=True)
+    # position_ids_out = torch.empty((pos_shape[0], keep_tokens), dtype=position_ids.dtype,
+    #                                 pin_memory=True).to(device=device, non_blocking=True)
+    # new_proc_indices = torch.empty((keep_tokens, ), dtype=proc_indices.dtype,
+    #                                 pin_memory=True).to(device=device, non_blocking=True)
 
     orig_q_lens_i32 = orig_q_lens.to(dtype=torch.int32)
     seq_ids = torch.arange(orig_q_lens_i32.size(0), device=device, dtype=torch.int32)
