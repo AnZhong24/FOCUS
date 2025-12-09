@@ -2,6 +2,7 @@ import torch
 
 import triton
 import triton.language as tl
+from typing import Tuple
 
 
 @triton.jit
@@ -140,13 +141,12 @@ def _focus_importance_ragged_kernel(
 @triton.jit
 def _focus_enforce_rules_kernel(
     BLOCK_POS,
-    BLOCK_UNPROCESSED,
+    BLOCK_PROGRESS,
     RETAIN,
     VALID,
     stride_bp,
     stride_bc,
-    stride_up,
-    stride_uc,
+    stride_prog,
     stride_rb,
     stride_rc,
     stride_vb,
@@ -189,10 +189,9 @@ def _focus_enforce_rules_kernel(
     not_retain = retain == 0
     evicted_before = less_than_rightmost & not_retain & valid
 
-    gather_indices = tl.where(positions >= 0, positions, 0)
-    block_ptrs = BLOCK_UNPROCESSED + row * stride_up + gather_indices * stride_uc
-    block_flags = tl.load(block_ptrs, mask=in_bounds, other=0).to(tl.int1)
-    need_keep = block_flags & evicted_before
+    progress = tl.load(BLOCK_PROGRESS + row * stride_prog).to(tl.int32)
+    is_unprocessed = positions > progress
+    need_keep = is_unprocessed & evicted_before
     retain = retain | need_keep
 
     tl.store(retain_ptrs, retain, mask=in_bounds)
@@ -207,18 +206,15 @@ def _focus_select_enforce_ragged_kernel(
     INDPTR,
     TARGETS,
     SHOULD,
-    BLOCK_UNPROCESSED,
+    BLOCK_PROGRESS,
     OUTPUT,
-    stride_bp,
-    stride_bc,
+    stride_prog,
     BLOCK: tl.constexpr,
 ):
     seq = tl.program_id(0)
     start = tl.load(INDPTR + seq).to(tl.int64)
     end = tl.load(INDPTR + seq + 1).to(tl.int64)
     seq_len = end - start
-    if seq_len <= 0:
-        return
     offs = tl.arange(0, BLOCK)
     in_bounds = offs < seq_len
 
@@ -304,33 +300,73 @@ def _focus_select_enforce_ragged_kernel(
     not_retain = retain == 0
     evicted_before = less_than_rightmost & not_retain & valid_row
 
-    gather_indices = tl.where(positions >= 0, positions, 0)
-    row_block_ptr = BLOCK_UNPROCESSED + seq * stride_bp
-    block_ptrs = row_block_ptr + gather_indices * stride_bc
-    block_flags = tl.load(block_ptrs, mask=in_bounds, other=0).to(tl.int1)
-    need_keep = block_flags & evicted_before
+    progress = tl.load(BLOCK_PROGRESS + seq * stride_prog).to(tl.int32)
+    is_unprocessed = positions > progress
+    need_keep = is_unprocessed & evicted_before
     retain = retain | need_keep
 
     tl.store(retain_ptr + offs, retain, mask=in_bounds)
 
 
 @triton.jit
+def _focus_keep_offsets_kernel(RETAIN_MASK, KEEP_OFFSETS, n_tokens, num_blocks, BLOCK: tl.constexpr):
+    offsets = tl.arange(0, BLOCK)
+    carry = tl.zeros((), dtype=tl.int32)
+    for block_idx in range(0, num_blocks):
+        block_start = block_idx * BLOCK
+        idx = block_start + offsets
+        mask = idx < n_tokens
+        keep = tl.load(RETAIN_MASK + idx, mask=mask, other=0).to(tl.int32)
+        keep = keep * mask.to(tl.int32)
+        inclusive = tl.cumsum(keep)
+        exclusive = inclusive - keep + carry
+        keep_mask = keep == 1
+        out = tl.where(keep_mask, exclusive, -1)
+        tl.store(KEEP_OFFSETS + idx, out, mask=mask)
+        block_total = tl.sum(keep, axis=0)
+        carry += block_total
+
+
+def _focus_compute_keep_offsets(retain_mask: torch.Tensor, block_size: int = 256) -> torch.Tensor:
+    total_tokens = retain_mask.numel()
+    keep_offsets = retain_mask.new_empty((total_tokens, ), dtype=torch.int32)
+
+    num_blocks = triton.cdiv(total_tokens, block_size)
+    grid = (1, )
+    _focus_keep_offsets_kernel[grid](retain_mask,
+                                     keep_offsets,
+                                     total_tokens,
+                                     num_blocks,
+                                     BLOCK=block_size,
+                                     num_warps=4,
+                                     num_stages=1)
+    return keep_offsets
+
+
+@triton.jit
 def _focus_compact_states_kernel(
-    RETAIN_IDX,
+    RETAIN_MASK,
+    KEEP_OFFSETS,
     PROC_IN,
-    TOKEN_SEQ_IDS,
+    ORIG_Q_LENS,
     Q,
     K,
     V,
     H,
+    RESIDUAL,
     INPUT_IDS,
     POS_IDS,
+    ROTARY_COS,
+    ROTARY_SIN,
     INPUT_IDS_OUT,
     POS_IDS_OUT,
+    ROTARY_COS_OUT,
+    ROTARY_SIN_OUT,
     Q_OUT,
     K_OUT,
     V_OUT,
     H_OUT,
+    RESIDUAL_OUT,
     PROC_OUT,
     NEW_Q_LENS,
     stride_qt,
@@ -357,6 +393,12 @@ def _focus_compact_states_kernel(
     stride_hob,
     stride_hot,
     stride_hod,
+    stride_res_b,
+    stride_res_t,
+    stride_res_d,
+    stride_res_ob,
+    stride_res_ot,
+    stride_res_od,
     stride_ib,
     stride_it,
     stride_iob,
@@ -365,7 +407,16 @@ def _focus_compact_states_kernel(
     stride_pt,
     stride_pob,
     stride_pot,
-    n_keep,
+    stride_cos_t,
+    stride_cos_d,
+    stride_sin_t,
+    stride_sin_d,
+    stride_cos_ot,
+    stride_cos_od,
+    stride_sin_ot,
+    stride_sin_od,
+    stride_seq,
+    n_tokens,
     hidden_batch,
     input_batch,
     pos_batch,
@@ -376,6 +427,10 @@ def _focus_compact_states_kernel(
     v_num_heads,
     v_head_dim,
     hidden_dim,
+    residual_batch,
+    residual_dim,
+    rotary_dim,
+    num_seqs,
     BLOCK_Q_HEAD: tl.constexpr,
     BLOCK_Q_DIM: tl.constexpr,
     BLOCK_K_HEAD: tl.constexpr,
@@ -384,23 +439,38 @@ def _focus_compact_states_kernel(
     BLOCK_H_DIM: tl.constexpr,
     BLOCK_ID_BATCH: tl.constexpr,
     BLOCK_POS_BATCH: tl.constexpr,
+    BLOCK_ROT_DIM: tl.constexpr,
 ):
     token_idx = tl.program_id(0)
-    if token_idx >= n_keep:
+    keep = tl.load(RETAIN_MASK + token_idx).to(tl.int1)
+    if keep == 0:
         return
 
-    src_idx = tl.load(RETAIN_IDX + token_idx).to(tl.int32)
+    dst_idx = tl.load(KEEP_OFFSETS + token_idx).to(tl.int32)
+    if dst_idx < 0:
+        return
 
-    seq = tl.load(TOKEN_SEQ_IDS + src_idx).to(tl.int32)
+    src_idx = token_idx
+
+    seq_val = tl.zeros((), dtype=tl.int32)
+    seq_found = tl.zeros((), dtype=tl.int32)
+    prefix = tl.zeros((), dtype=tl.int32)
+    for seq_idx in tl.range(0, num_seqs):
+        length = tl.load(ORIG_Q_LENS + seq_idx * stride_seq).to(tl.int32)
+        prefix += length
+        in_seq = (seq_found == 0) & (token_idx < prefix)
+        seq_val = tl.where(in_seq, seq_idx, seq_val)
+        seq_found = tl.where(in_seq, seq_found + 1, seq_found)
+    seq = tl.where(seq_found == 1, seq_val, tl.zeros((), dtype=tl.int32))
     tl.atomic_add(NEW_Q_LENS + seq, 1)
 
     proc_val = tl.load(PROC_IN + src_idx)
-    tl.store(PROC_OUT + token_idx, proc_val)
+    tl.store(PROC_OUT + dst_idx, proc_val)
 
     offs_head = tl.arange(0, BLOCK_Q_HEAD)
     offs_dim = tl.arange(0, BLOCK_Q_DIM)
     q_ptr = Q + src_idx * stride_qt
-    q_out_ptr = Q_OUT + token_idx * stride_qot
+    q_out_ptr = Q_OUT + dst_idx * stride_qot
     for head_start in range(0, q_num_heads, BLOCK_Q_HEAD):
         head_offsets = head_start + offs_head
         head_mask = head_offsets < q_num_heads
@@ -417,7 +487,7 @@ def _focus_compact_states_kernel(
 
     offs_k_head = tl.arange(0, BLOCK_K_HEAD)
     k_ptr = K + src_idx * stride_kt
-    k_out_ptr = K_OUT + token_idx * stride_kot
+    k_out_ptr = K_OUT + dst_idx * stride_kot
     for head_start in range(0, k_num_heads, BLOCK_K_HEAD):
         head_offsets = head_start + offs_k_head
         head_mask = head_offsets < k_num_heads
@@ -434,7 +504,7 @@ def _focus_compact_states_kernel(
 
     offs_v_head = tl.arange(0, BLOCK_V_HEAD)
     v_ptr = V + src_idx * stride_vt
-    v_out_ptr = V_OUT + token_idx * stride_vot
+    v_out_ptr = V_OUT + dst_idx * stride_vot
     for head_start in range(0, v_num_heads, BLOCK_V_HEAD):
         head_offsets = head_start + offs_v_head
         head_mask = head_offsets < v_num_heads
@@ -455,7 +525,7 @@ def _focus_compact_states_kernel(
         batch_offsets = batch_start + offs_batch
         batch_mask = batch_offsets < hidden_batch
         h_ptr = H + batch_offsets[:, None] * stride_hb + src_idx * stride_ht
-        h_out_ptr = H_OUT + batch_offsets[:, None] * stride_hob + token_idx * stride_hot
+        h_out_ptr = H_OUT + batch_offsets[:, None] * stride_hob + dst_idx * stride_hot
         for dim_start in range(0, hidden_dim, BLOCK_H_DIM):
             dim_offsets = dim_start + offs_hidden
             dim_mask = dim_offsets < hidden_dim
@@ -463,13 +533,25 @@ def _focus_compact_states_kernel(
             vals = tl.load(h_ptr + dim_offsets[None, :] * stride_hd, mask=mask, other=0.0)
             tl.store(h_out_ptr + dim_offsets[None, :] * stride_hod, vals, mask=mask)
 
+    for batch_start in range(0, residual_batch, BLOCK_H_BATCH):
+        batch_offsets = batch_start + offs_batch
+        batch_mask = batch_offsets < residual_batch
+        r_ptr = RESIDUAL + batch_offsets[:, None] * stride_res_b + src_idx * stride_res_t
+        r_out_ptr = RESIDUAL_OUT + batch_offsets[:, None] * stride_res_ob + dst_idx * stride_res_ot
+        for dim_start in range(0, residual_dim, BLOCK_H_DIM):
+            dim_offsets = dim_start + offs_hidden
+            dim_mask = dim_offsets < residual_dim
+            mask = batch_mask[:, None] & dim_mask[None, :]
+            vals = tl.load(r_ptr + dim_offsets[None, :] * stride_res_d, mask=mask, other=0.0)
+            tl.store(r_out_ptr + dim_offsets[None, :] * stride_res_od, vals, mask=mask)
+
     offs_ib = tl.arange(0, BLOCK_ID_BATCH)
     for batch_start in range(0, input_batch, BLOCK_ID_BATCH):
         batch_offsets = batch_start + offs_ib
         batch_mask = batch_offsets < input_batch
         inp_ptr = INPUT_IDS + batch_offsets * stride_ib + src_idx * stride_it
         inp_vals = tl.load(inp_ptr, mask=batch_mask, other=0)
-        inp_out_ptr = INPUT_IDS_OUT + batch_offsets * stride_iob + token_idx * stride_iot
+        inp_out_ptr = INPUT_IDS_OUT + batch_offsets * stride_iob + dst_idx * stride_iot
         tl.store(inp_out_ptr, inp_vals, mask=batch_mask)
 
     offs_pb = tl.arange(0, BLOCK_POS_BATCH)
@@ -478,8 +560,21 @@ def _focus_compact_states_kernel(
         batch_mask = batch_offsets < pos_batch
         pos_ptr = POS_IDS + batch_offsets * stride_pb + src_idx * stride_pt
         pos_vals = tl.load(pos_ptr, mask=batch_mask, other=0)
-        pos_out_ptr = POS_IDS_OUT + batch_offsets * stride_pob + token_idx * stride_pot
+        pos_out_ptr = POS_IDS_OUT + batch_offsets * stride_pob + dst_idx * stride_pot
         tl.store(pos_out_ptr, pos_vals, mask=batch_mask)
+
+    offs_rot = tl.arange(0, BLOCK_ROT_DIM)
+    cos_ptr = ROTARY_COS + src_idx * stride_cos_t
+    cos_out_ptr = ROTARY_COS_OUT + dst_idx * stride_cos_ot
+    sin_ptr = ROTARY_SIN + src_idx * stride_sin_t
+    sin_out_ptr = ROTARY_SIN_OUT + dst_idx * stride_sin_ot
+    for rot_start in range(0, rotary_dim, BLOCK_ROT_DIM):
+        rot_offsets = rot_start + offs_rot
+        rot_mask = rot_offsets < rotary_dim
+        cos_vals = tl.load(cos_ptr + rot_offsets * stride_cos_d, mask=rot_mask, other=0.0)
+        sin_vals = tl.load(sin_ptr + rot_offsets * stride_sin_d, mask=rot_mask, other=0.0)
+        tl.store(cos_out_ptr + rot_offsets * stride_cos_od, cos_vals, mask=rot_mask)
+        tl.store(sin_out_ptr + rot_offsets * stride_sin_od, sin_vals, mask=rot_mask)
 
 
 def focus_importance_ragged(query_states: torch.Tensor,
@@ -555,7 +650,7 @@ def focus_compute_targets(mask_lengths: torch.Tensor, avg_tokens: torch.Tensor, 
     return targets
 
 
-def focus_enforce_rules(block_positions: torch.Tensor, block_unprocessed: torch.Tensor,
+def focus_enforce_rules(block_positions: torch.Tensor, block_progress: torch.Tensor,
                         retain_mask: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
     """Fuse rule enforcement into a Triton kernel."""
     batch, width = block_positions.shape
@@ -563,13 +658,12 @@ def focus_enforce_rules(block_positions: torch.Tensor, block_unprocessed: torch.
     BLOCK = triton.next_power_of_2(max(1, width))
     num_warps, num_stages = _pick_focus_enforce_meta(width)
     _focus_enforce_rules_kernel[grid](block_positions,
-                                      block_unprocessed,
+                                      block_progress,
                                       retain_mask,
                                       valid_mask,
                                       block_positions.stride(0),
                                       block_positions.stride(1),
-                                      block_unprocessed.stride(0),
-                                      block_unprocessed.stride(1),
+                                      block_progress.stride(0),
                                       retain_mask.stride(0),
                                       retain_mask.stride(1),
                                       valid_mask.stride(0),
@@ -588,7 +682,7 @@ def focus_select_and_enforce_ragged(importance: torch.Tensor,
                                     mask_indptr: torch.Tensor,
                                     targets: torch.Tensor,
                                     should_prune: torch.Tensor,
-                                    block_unprocessed: torch.Tensor,
+                                    block_progress: torch.Tensor,
                                     max_len: int) -> torch.Tensor:
     """Ragged variant that also computes delta/block positions inside the Triton kernel."""
     num_seq = mask_indptr.numel() - 1
@@ -606,17 +700,17 @@ def focus_select_and_enforce_ragged(importance: torch.Tensor,
                                               mask_indptr,
                                               targets_i32,
                                               should_prune_i32,
-                                              block_unprocessed,
+                                              block_progress,
                                               output,
-                                              block_unprocessed.stride(0),
-                                              block_unprocessed.stride(1),
+                                              block_progress.stride(0),
                                               BLOCK=block,
                                               num_warps=num_warps,
                                               num_stages=num_stages)
     return output
 
 
-def focus_compact_states(retain_indices: torch.Tensor,
+def focus_compact_states(keep_tokens: int,
+                         retain_mask: torch.Tensor,
                          query_states: torch.Tensor,
                          key_states: torch.Tensor,
                          value_states: torch.Tensor,
@@ -624,12 +718,20 @@ def focus_compact_states(retain_indices: torch.Tensor,
                          input_ids: torch.Tensor,
                          position_ids: torch.Tensor,
                          proc_indices: torch.Tensor,
-                         orig_q_lens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
-                                                             torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fuse state compaction (q/k/v, hidden, indices, q_lens) into a Triton kernel."""
-    device = query_states.device
+                         orig_q_lens: torch.Tensor,
+                         rotary_cos: torch.Tensor,
+                         rotary_sin: torch.Tensor,
+                         residual_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+                                                                  torch.Tensor, torch.Tensor, torch.Tensor,
+                                                                  torch.Tensor, torch.Tensor,
+                                                                  Tuple[torch.Tensor, torch.Tensor],
+                                                                  torch.Tensor]:
+    """Fuse state compaction (q/k/v, hidden, indices, q_lens) into a Triton kernel.
+    Rotary embeddings (cos/sin) are compacted alongside the other tensors when provided.
+    """
+    total_tokens = retain_mask.numel()
+    keep_offsets = _focus_compute_keep_offsets(retain_mask)
 
-    keep_tokens = retain_indices.numel()
     q_shape = query_states.shape
     k_shape = key_states.shape
     v_shape = value_states.shape
@@ -637,32 +739,26 @@ def focus_compact_states(retain_indices: torch.Tensor,
     ids_shape = input_ids.shape
     pos_shape = position_ids.shape
 
+    orig_q_lens_i32 = orig_q_lens.to(dtype=torch.int32).contiguous()
+    new_q_lens = torch.zeros_like(orig_q_lens)
     q_out = query_states.new_empty((keep_tokens, q_shape[1], q_shape[2]))
     k_out = key_states.new_empty((keep_tokens, k_shape[1], k_shape[2]))
     v_out = value_states.new_empty((keep_tokens, v_shape[1], v_shape[2]))
     hidden_out = hidden_states.new_empty((hidden_shape[0], keep_tokens, hidden_shape[2]))
+    residual_shape = residual_states.shape
+    residual_out = residual_states.new_empty((residual_shape[0], keep_tokens, residual_shape[2]))
     input_ids_out = input_ids.new_empty((ids_shape[0], keep_tokens))
     position_ids_out = position_ids.new_empty((pos_shape[0], keep_tokens))
     new_proc_indices = proc_indices.new_empty((keep_tokens, ))
-    # q_out = torch.empty((keep_tokens, q_shape[1], q_shape[2]), dtype=query_states.dtype,
-    #                      pin_memory=True).to(device=device, non_blocking=True)
-    # k_out = torch.empty((keep_tokens, k_shape[1], k_shape[2]), dtype=key_states.dtype,
-    #                      pin_memory=True).to(device=device, non_blocking=True)
-    # v_out = torch.empty((keep_tokens, v_shape[1], v_shape[2]), dtype=value_states.dtype,
-    #                      pin_memory=True).to(device=device, non_blocking=True)
-    # hidden_out = torch.empty((hidden_shape[0], keep_tokens, hidden_shape[2]), dtype=hidden_states.dtype,
-    #                           pin_memory=True).to(device=device, non_blocking=True)
-    # input_ids_out = torch.empty((ids_shape[0], keep_tokens), dtype=input_ids.dtype,
-    #                              pin_memory=True).to(device=device, non_blocking=True)
-    # position_ids_out = torch.empty((pos_shape[0], keep_tokens), dtype=position_ids.dtype,
-    #                                 pin_memory=True).to(device=device, non_blocking=True)
-    # new_proc_indices = torch.empty((keep_tokens, ), dtype=proc_indices.dtype,
-    #                                 pin_memory=True).to(device=device, non_blocking=True)
-
-    orig_q_lens_i32 = orig_q_lens.to(dtype=torch.int32)
-    seq_ids = torch.arange(orig_q_lens_i32.size(0), device=device, dtype=torch.int32)
-    token_seq_ids = torch.repeat_interleave(seq_ids, orig_q_lens_i32, output_size=int(proc_indices.numel()))
-    new_q_lens = torch.zeros_like(orig_q_lens_i32)
+    cos_out = rotary_cos.new_empty((keep_tokens, ) + rotary_cos.shape[1:])
+    sin_out = torch.empty_like(cos_out)
+    rotary_cos_view = rotary_cos.reshape(total_tokens, -1)
+    rotary_sin_view = rotary_sin.reshape(total_tokens, -1)
+    cos_out_view = cos_out.reshape(keep_tokens, -1)
+    sin_out_view = sin_out.reshape(keep_tokens, -1)
+    rotary_dim = rotary_cos_view.shape[1]
+    residual_batch = residual_shape[0]
+    residual_dim = residual_shape[2]
 
     stride_qt, stride_qh, stride_qd = query_states.stride()
     stride_qot, stride_qoh, stride_qod = q_out.stride()
@@ -672,85 +768,123 @@ def focus_compact_states(retain_indices: torch.Tensor,
     stride_vot, stride_voh, stride_vod = v_out.stride()
     stride_hb, stride_ht, stride_hd = hidden_states.stride()
     stride_hob, stride_hot, stride_hod = hidden_out.stride()
+    stride_res_b, stride_res_t, stride_res_d = residual_states.stride()
+    stride_res_ob, stride_res_ot, stride_res_od = residual_out.stride()
     stride_ib, stride_it = input_ids.stride()
     stride_iob, stride_iot = input_ids_out.stride()
     stride_pb, stride_pt = position_ids.stride()
     stride_pob, stride_pot = position_ids_out.stride()
+    stride_cos_t, stride_cos_d = rotary_cos_view.stride()
+    stride_sin_t, stride_sin_d = rotary_sin_view.stride()
+    stride_cos_ot, stride_cos_od = cos_out_view.stride()
+    stride_sin_ot, stride_sin_od = sin_out_view.stride()
 
-    grid = (keep_tokens, )
-    num_warps, num_stages = _pick_focus_compact_meta(q_shape[1], q_shape[2], hidden_shape[0])
-    _focus_compact_states_kernel[grid](retain_indices,
-                                       proc_indices,
-                                       token_seq_ids,
-                                       query_states,
-                                       key_states,
-                                       value_states,
-                                       hidden_states,
-                                       input_ids,
-                                       position_ids,
-                                       input_ids_out,
-                                       position_ids_out,
-                                       q_out,
-                                       k_out,
-                                       v_out,
-                                       hidden_out,
-                                       new_proc_indices,
-                                       new_q_lens,
-                                       stride_qt,
-                                       stride_qh,
-                                       stride_qd,
-                                       stride_qot,
-                                       stride_qoh,
-                                       stride_qod,
-                                       stride_kt,
-                                       stride_kh,
-                                       stride_kd,
-                                       stride_kot,
-                                       stride_koh,
-                                       stride_kod,
-                                       stride_vt,
-                                       stride_vh,
-                                       stride_vd,
-                                       stride_vot,
-                                       stride_voh,
-                                       stride_vod,
-                                       stride_hb,
-                                       stride_ht,
-                                       stride_hd,
-                                       stride_hob,
-                                       stride_hot,
-                                       stride_hod,
-                                       stride_ib,
-                                       stride_it,
-                                       stride_iob,
-                                       stride_iot,
-                                       stride_pb,
-                                       stride_pt,
-                                       stride_pob,
-                                       stride_pot,
-                                       keep_tokens,
-                                       hidden_shape[0],
-                                       ids_shape[0],
-                                       pos_shape[0],
-                                       q_shape[1],
-                                       q_shape[2],
-                                       k_shape[1],
-                                       k_shape[2],
-                                       v_shape[1],
-                                       v_shape[2],
-                                       hidden_shape[2],
-                                       BLOCK_Q_HEAD=4,
-                                       BLOCK_Q_DIM=64,
-                                       BLOCK_K_HEAD=4,
-                                       BLOCK_V_HEAD=4,
-                                       BLOCK_H_BATCH=4,
-                                       BLOCK_H_DIM=64,
-                                       BLOCK_ID_BATCH=4,
-                                       BLOCK_POS_BATCH=4,
-                                       num_warps=num_warps,
-                                       num_stages=num_stages)
+    grid = (total_tokens, )
+    # Focus compaction runs every decode step; fixed launch params avoid repeated
+    # device capability queries without impacting throughput on modern GPUs.
+    num_warps, num_stages = 4, 3
+    _focus_compact_states_kernel[grid](retain_mask,
+                                        keep_offsets,
+                                        proc_indices,
+                                        orig_q_lens_i32,
+                                        query_states,
+                                        key_states,
+                                        value_states,
+                                        hidden_states,
+                                        residual_states,
+                                        input_ids,
+                                        position_ids,
+                                        rotary_cos_view,
+                                        rotary_sin_view,
+                                        input_ids_out,
+                                        position_ids_out,
+                                        cos_out_view,
+                                        sin_out_view,
+                                        q_out,
+                                        k_out,
+                                        v_out,
+                                        hidden_out,
+                                        residual_out,
+                                        new_proc_indices,
+                                        new_q_lens,
+                                        stride_qt,
+                                        stride_qh,
+                                        stride_qd,
+                                        stride_qot,
+                                        stride_qoh,
+                                        stride_qod,
+                                        stride_kt,
+                                        stride_kh,
+                                        stride_kd,
+                                        stride_kot,
+                                        stride_koh,
+                                        stride_kod,
+                                        stride_vt,
+                                        stride_vh,
+                                        stride_vd,
+                                        stride_vot,
+                                        stride_voh,
+                                        stride_vod,
+                                        stride_hb,
+                                        stride_ht,
+                                        stride_hd,
+                                        stride_hob,
+                                        stride_hot,
+                                        stride_hod,
+                                        stride_res_b,
+                                        stride_res_t,
+                                        stride_res_d,
+                                        stride_res_ob,
+                                        stride_res_ot,
+                                        stride_res_od,
+                                        stride_ib,
+                                        stride_it,
+                                        stride_iob,
+                                        stride_iot,
+                                        stride_pb,
+                                        stride_pt,
+                                        stride_pob,
+                                        stride_pot,
+                                        stride_cos_t,
+                                        stride_cos_d,
+                                        stride_sin_t,
+                                        stride_sin_d,
+                                        stride_cos_ot,
+                                        stride_cos_od,
+                                        stride_sin_ot,
+                                        stride_sin_od,
+                                        orig_q_lens_i32.stride(0),
+                                        total_tokens,
+                                        hidden_shape[0],
+                                        ids_shape[0],
+                                        pos_shape[0],
+                                        q_shape[1],
+                                        q_shape[2],
+                                        k_shape[1],
+                                        k_shape[2],
+                                        v_shape[1],
+                                        v_shape[2],
+                                        hidden_shape[2],
+                                        residual_batch,
+                                        residual_dim,
+                                        rotary_dim,
+                                        orig_q_lens_i32.size(0),
+                                        BLOCK_Q_HEAD=4,
+                                        BLOCK_Q_DIM=64,
+                                        BLOCK_K_HEAD=4,
+                                        BLOCK_V_HEAD=4,
+                                        BLOCK_H_BATCH=4,
+                                        BLOCK_H_DIM=64,
+                                        BLOCK_ID_BATCH=4,
+                                        BLOCK_POS_BATCH=4,
+                                        BLOCK_ROT_DIM=64,
+                                        num_warps=num_warps,
+                                        num_stages=num_stages)
+
+    new_rotary = (cos_out, sin_out)
+
     return (q_out, k_out, v_out, hidden_out, input_ids_out, position_ids_out, new_q_lens.to(orig_q_lens.dtype),
-            new_proc_indices)
+            new_proc_indices, new_rotary, residual_out)
 
 
 def _pick_focus_enforce_meta(width: int) -> tuple[int, int]:
@@ -829,14 +963,3 @@ def _pick_focus_kernel_meta(block_d: int, block_row: int) -> tuple[int, int]:
             return 4, 2
         return 2, 2
     return 2, 2
-
-
-def _pick_focus_compact_meta(num_heads: int, head_dim: int, hidden_batch: int) -> tuple[int, int]:
-    """Simple heuristic for the compact kernel launch config."""
-    major, _ = torch.cuda.get_device_capability()
-    big_tensor = (num_heads * head_dim) >= 1024 or hidden_batch >= 4
-    if major >= 9:
-        return (4, 3) if big_tensor else (2, 2)
-    if major >= 8:
-        return (2, 2) if big_tensor else (1, 2)
-    return 1, 1

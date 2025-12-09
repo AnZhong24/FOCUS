@@ -88,7 +88,6 @@ def build_delayed_cache_ragged_metadata(
     block_size: int,
 ):
     """Build ragged delayed-cache metadata on host."""
-    host_q_seqlens = host_q_seqlens
     num_heads = model_config.num_attention_heads
     num_kv_heads = model_config.num_key_value_heads
     kv_group_num = max(1, num_heads // num_kv_heads)
@@ -844,13 +843,13 @@ class Engine(EngineBase):
         processing_indices = None
         processing_q_lens = None
         dllm_cfg = getattr(self.misc_config, 'dllm_config', None)
-        enable_delayed = bool(dllm_cfg and dllm_cfg.enable_delayed_cache and is_decoding)
-        focus_enabled = bool(enable_delayed and dllm_cfg and getattr(dllm_cfg, 'enable_focus', False))
+        enable_delayed = dllm_cfg and dllm_cfg.enable_delayed_cache and is_decoding
+        focus_enabled = enable_delayed and dllm_cfg and dllm_cfg.enable_focus
         focus_avg_tensor = None
         if enable_delayed:
             proc_tensors = []
             proc_lengths = []
-            focus_block_unprocessed = []
+            focus_block_progress = []
             focus_avg_tokens = []
             focus_mask_globals = []
             focus_mask_indptr = [0]
@@ -859,27 +858,25 @@ class Engine(EngineBase):
             running_proc_offset = 0
             for msg in messages:
                 indices = msg.get_processing_indices()
-                indices_tensor = indices.to(device='cpu', dtype=torch.long).contiguous()
-                proc_tensors.append(indices_tensor)
-                proc_lengths.append(indices_tensor.numel())
+                proc_tensors.append(indices)
+                proc_lengths.append(indices.numel())
                 if focus_enabled:
                     focus_info = msg.get_focus_info()
                     if focus_info is None:
                         focus_enabled = False
-                        focus_block_unprocessed = []
+                        focus_block_progress = []
                         focus_avg_tokens = []
                         focus_mask_globals = []
                         focus_mask_indptr = [0]
                     else:
                         mask_tensor = focus_info.mask_indices.to('cpu', non_blocking=False)
-                        unprocessed_tensor = focus_info.unprocessed_positions.to('cpu', non_blocking=False)
-                        focus_block_unprocessed.append(unprocessed_tensor)
-                        ragged_mask = mask_tensor.index_select(0, indices_tensor)
+                        focus_block_progress.append(int(focus_info.rightmost_processed))
+                        ragged_mask = mask_tensor.index_select(0, indices)
                         focus_avg_tokens.append(float(focus_info.avg_decoded_tokens))
                         local_indices = torch.nonzero(ragged_mask, as_tuple=False).squeeze(-1).to(torch.long)
                         focus_mask_globals.append(local_indices + running_proc_offset)
                         focus_mask_indptr.append(focus_mask_indptr[-1] + local_indices.numel())
-                running_proc_offset += indices_tensor.numel()
+                running_proc_offset += indices.numel()
             processing_indices = (torch.cat(proc_tensors)
                                   if len(proc_tensors) > 0 else torch.empty((0, ), dtype=torch.long))
             processing_q_lens = torch.tensor(proc_lengths, dtype=torch.long)
@@ -890,7 +887,7 @@ class Engine(EngineBase):
                 else:
                     mask_global_tensor = torch.empty((0, ), dtype=torch.long).pin_memory()
                 mask_indptr_tensor = torch.tensor(focus_mask_indptr, dtype=torch.int32).pin_memory()
-                focus_block_unprocessed = torch.stack(focus_block_unprocessed).pin_memory()
+                focus_block_progress = torch.tensor(focus_block_progress, dtype=torch.int32).pin_memory()
                 focus_avg_tensor = torch.tensor(focus_avg_tokens, dtype=torch.float32).pin_memory()
                 focus_mask_global_indices = mask_global_tensor
                 focus_mask_seq_offsets = mask_indptr_tensor
@@ -934,7 +931,7 @@ class Engine(EngineBase):
             model_inputs.ragged_tile_to_seq = tile_to_seq
             model_inputs.ragged_seq_tile_offsets = seq_tile_offsets
             if focus_enabled:
-                model_inputs.focus_block_unprocessed = focus_block_unprocessed
+                model_inputs.focus_block_progress = focus_block_progress
                 model_inputs.focus_avg_tokens = focus_avg_tensor
                 model_inputs.focus_mask_global_indices = focus_mask_global_indices
                 model_inputs.focus_mask_seq_offsets = focus_mask_seq_offsets

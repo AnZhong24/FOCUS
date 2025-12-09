@@ -34,7 +34,7 @@ class HistoryDLLMMask(HistoryTokenIds):
 @dataclass
 class FocusInfo:
     mask_indices: torch.Tensor
-    unprocessed_positions: torch.Tensor
+    rightmost_processed: int
     avg_decoded_tokens: float
 
 
@@ -81,24 +81,22 @@ class DelayedCacheState:
 @dataclass
 class FocusState:
     block_length: int
-    unprocessed_positions: torch.Tensor
+    rightmost_processed: int
 
     @classmethod
     def new(cls, block_length: int):
-        template = torch.ones((block_length, ), dtype=torch.bool, pin_memory=True)
-        return cls(block_length=block_length, unprocessed_positions=template.clone())
+        return cls(block_length=block_length, rightmost_processed=-1)
 
     def reset(self):
-        self.unprocessed_positions.fill_(True)
+        self.rightmost_processed = -1
 
-    def mark_processed(self, block_mask: torch.Tensor):
-        tensor = torch.as_tensor(block_mask, dtype=torch.bool)
-        tensor = tensor.to(device=self.unprocessed_positions.device, dtype=torch.bool)
-        self.unprocessed_positions &= ~tensor
+    def mark_processed(self, processed: int):
+        assert processed >= 0 and processed < self.block_length, f'processed={processed}'
+        if processed > self.rightmost_processed:
+            self.rightmost_processed = processed
 
-    def clone_unprocessed(self) -> torch.Tensor:
-        cloned = self.unprocessed_positions.clone()
-        return cloned
+    def get_rightmost(self) -> int:
+        return self.rightmost_processed
 
 
 @dataclass
@@ -179,24 +177,16 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
         mask_np = self.dllm_mask
         mask_tensor = torch.from_numpy(mask_np == DLLM_MASKED)
         mask_tensor = mask_tensor.to(dtype=torch.bool)
-        unprocessed = self._focus_state.clone_unprocessed()
+        rightmost = self._focus_state.get_rightmost() if self._focus_state is not None else -1
         avg_tokens = 1.0
         if self._focus_steps > 0:
             avg_tokens = self._focus_token_sum / self._focus_steps
         return FocusInfo(mask_indices=mask_tensor,
-                         unprocessed_positions=unprocessed,
+                         rightmost_processed=rightmost,
                          avg_decoded_tokens=avg_tokens)
 
-    def mark_focus_processed(self, processed_positions: torch.Tensor | Sequence[int]):
-        block_len = self.dllm_block_length
-        mask = torch.zeros((block_len, ), dtype=torch.bool)
-        if isinstance(processed_positions, torch.Tensor):
-            indices = processed_positions.to(dtype=torch.long).flatten()
-        else:
-            indices = torch.as_tensor(processed_positions, dtype=torch.long)
-        valid = (indices >= 0) & (indices < block_len)
-        mask[indices[valid]] = True
-        self._focus_state.mark_processed(mask)
+    def mark_focus_processed(self, rightmost_processed: int):
+        self._focus_state.mark_processed(rightmost_processed)
 
     def update_focus_stats(self, decoded_tokens: int):
         if decoded_tokens <= 0:
@@ -407,9 +397,9 @@ class DLLMSequenceStrategy(SequenceStrategy):
                     # Refresh delayed-cache bookkeeping using the existing mask
                     # so newly unmasked tokens still get one more iteration.
                     msg._update_delayed_cache_state()
-                if msg._focus_enabled:
-                    processed_positions = model_meta['focus_processed_indices']
-                    msg.mark_focus_processed(processed_positions)
+                if msg._focus_enabled and model_meta is not None:
+                    processed_rightmost = model_meta.get('focus_processed_rightmost')
+                    msg.mark_focus_processed(processed_rightmost)
             # fill token
             msg.update_token_ids(token, dllm_mask=mask, model_meta=model_meta, mode=update_mode)
             if is_decoding and msg._focus_enabled:

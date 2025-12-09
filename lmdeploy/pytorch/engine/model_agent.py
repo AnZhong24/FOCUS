@@ -251,7 +251,7 @@ def model_forward(
                 context=context,
             )
             output = model(**input_dict)
-            focus_processed = context.get_focus_processed_indices()
+            focus_processed = context.get_focus_processed_positions()
             if not isinstance(output, Dict):
                 output = dict(hidden_states=output)
             # InternVL-3.5-Flash will change the seqlen, model_metas during forward
@@ -263,7 +263,7 @@ def model_forward(
                 new_metas: List[Dict[str, Any]] = []
                 for meta, processed in zip(model_metas, focus_processed):
                     entry = {} if meta is None else dict(meta)
-                    entry['focus_processed_indices'] = processed
+                    entry['focus_processed_rightmost'] = processed
                     new_metas.append(entry)
                 model_metas = new_metas
             if context.is_decoding and context.dllm_track:

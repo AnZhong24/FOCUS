@@ -196,19 +196,15 @@ def test_focus_rule_enforcement_matches_iterative_reference():
     valid_mask[1, :3] = True
     retain_mask[1, :3] = torch.tensor([False, True, False])
 
-    block_unprocessed = torch.zeros((len(seq_lengths), block_count), dtype=torch.bool)
-    block_unprocessed[0, 3] = True
-    block_unprocessed[0, 4] = True
-    block_unprocessed[1, 5] = True
-    block_unprocessed[1, 6] = True
+    block_progress = torch.tensor([2, 4], dtype=torch.long)
 
-    batched = attn._enforce_focus_rules_batch(block_positions.clone(), block_unprocessed.clone(),
+    batched = attn._enforce_focus_rules_batch(block_positions.clone(), block_progress.clone(),
                                               retain_mask.clone(), valid_mask.clone())
 
     per_sequence = []
     for i in range(len(seq_lengths)):
         per_sequence.append(
-            attn._enforce_focus_rules_batch(block_positions[i:i + 1].clone(), block_unprocessed[i:i + 1].clone(),
+            attn._enforce_focus_rules_batch(block_positions[i:i + 1].clone(), block_progress[i:i + 1].clone(),
                                             retain_mask[i:i + 1].clone(), valid_mask[i:i + 1].clone()))
     stacked = torch.cat(per_sequence, dim=0)
 
@@ -221,10 +217,8 @@ def test_focus_rule_enforcement_preserves_unprocessed_tokens():
     block_positions = torch.tensor([[1, 2, 3, -1], [4, 5, -1, -1]], dtype=torch.long)
     valid_mask = block_positions >= 0
     retain_mask = torch.zeros_like(block_positions, dtype=torch.bool)
-    block_unprocessed = torch.zeros((2, 10), dtype=torch.bool)
-    block_unprocessed[0, 2] = True
-    block_unprocessed[1, 5] = True
-    enforced = attn._enforce_focus_rules_batch(block_positions.clone(), block_unprocessed.clone(),
+    block_progress = torch.tensor([1, 4], dtype=torch.long)
+    enforced = attn._enforce_focus_rules_batch(block_positions.clone(), block_progress.clone(),
                                                retain_mask.clone(), valid_mask.clone())
     assert enforced[0, 1] and enforced[0, 2]
     assert enforced[1, 1]

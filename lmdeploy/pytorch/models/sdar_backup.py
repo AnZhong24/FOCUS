@@ -12,8 +12,6 @@ from lmdeploy.pytorch.nn import ApplyRotaryEmb, Attention, RMSNorm, SiluAndMul, 
 from lmdeploy.pytorch.nn.linear import (build_down_linear, build_gateup_linear, build_o_proj, build_qkv_proj,
                                         build_rowwise_linear)
 from lmdeploy.pytorch.weight_loader.model_weight_loader import load_weight
-from lmdeploy.pytorch.kernels.cuda.focus import (focus_compact_states, focus_compute_targets,
-                                                 focus_importance_ragged, focus_select_and_enforce_ragged)
 
 from .utils.cudagraph import CudaGraphMixin
 
@@ -88,8 +86,22 @@ class SDARAttention(nn.Module):
         # q, k norm
         self.q_norm = RMSNorm(head_dim, config.rms_norm_eps, dtype=dtype, device=device)
         self.k_norm = RMSNorm(head_dim, config.rms_norm_eps, dtype=dtype, device=device)
-        self._keep_tokens_host: Optional[torch.Tensor] = None
-        self._keep_tokens_event: Optional[torch.cuda.Event] = None
+        # Pre-allocate focus buffers when FOCUS is enabled so later calls
+        # can slice from a fixed (max_batch_size, dllm_block_length, ...) view.
+        if focus_enabled:
+            # q/k related buffers use the same dtype as attention inputs.
+            self._focus_delta_buffer = torch.zeros((focus_max_batch_size, dllm_block_length),
+                                                    dtype=dtype, 
+                                                    device=device)
+            self._focus_blockpos_buffer = torch.zeros((focus_max_batch_size, dllm_block_length), 
+                                                       dtype=torch.long, 
+                                                       device=device)
+            self._focus_qpad_buffer = torch.zeros((focus_max_batch_size, dllm_block_length, num_heads, head_dim),
+                                                    dtype=dtype, 
+                                                    device=device)
+            self._focus_kpad_buffer = torch.zeros((focus_max_batch_size, dllm_block_length, num_key_value_heads, head_dim),
+                                                    dtype=dtype, 
+                                                    device=device)
 
     def forward(
         self,
@@ -97,14 +109,15 @@ class SDARAttention(nn.Module):
         rotary_pos_emb: Tuple[torch.FloatTensor, torch.FloatTensor],
         past_key_value: Optional[Tuple[torch.Tensor]] = None,
         attn_metadata: Any = None,
-        residual: Optional[torch.Tensor] = None,
     ):
         """Rewrite of LlamaAttention.forward."""
-        updated_residual = residual
+        focus_mask = None
         context = self._get_context()
         focus_active = bool(context.focus_enabled() and context.is_decoding)
         if focus_active:
-            attn_metadata = context.attn_metadata
+            ctx_meta = getattr(context, 'attn_metadata', None)
+            if ctx_meta is not attn_metadata:
+                attn_metadata = ctx_meta
 
         # qkv proj
         qkv_states = self.qkv_proj(hidden_states)
@@ -132,31 +145,13 @@ class SDARAttention(nn.Module):
         v_scales = None if not has_scales else past_key_value[3]
         focus_fill_only = focus_active and self.layer_idx == 1
         if focus_active and self.layer_idx == 0:
-            torch.cuda.nvtx.range_push("self._compute_focus_importance")
             self._compute_focus_importance(context, query_states, key_states)
-            torch.cuda.nvtx.range_pop()
         elif focus_fill_only:
-            torch.cuda.nvtx.range_push("self._prepare_focus_pruning")
-            retain_processing_mask = self._prepare_focus_pruning(context, query_states, key_states)
-            torch.cuda.nvtx.range_pop()
             # Preserve the original ragged view for KV fill before pruning.
             self.attn_fwd.forward_only_fill_kv(key_states, value_states, k_cache, v_cache, attn_metadata,
                                                k_scales_zeros=k_scales, v_scales_zeros=v_scales)
-            torch.cuda.nvtx.range_push("self._apply_focus_pruning")
-            (query_states, key_states, value_states, hidden_states, updated_residual,
-                new_proc_indices, new_q_lens, new_q_lens_host) = self._apply_focus_pruning(
-                context,
-                hidden_states,
-                query_states,
-                key_states,
-                value_states,
-                updated_residual,
-                retain_processing_mask,
-            )
-            context.update_processing_view(new_proc_indices, new_q_lens, new_q_lens_host)
-            context.update_focus_progress()
-            context.refresh_attention_metadata()
-            torch.cuda.nvtx.range_pop()
+            query_states, key_states, value_states, hidden_states, focus_mask = \
+                self._apply_focus_pruning(context, hidden_states, query_states, key_states, value_states)
             attn_metadata = context.attn_metadata
 
         # attention
@@ -186,133 +181,299 @@ class SDARAttention(nn.Module):
 
         # o proj
         attn_output = self.o_proj(attn_output)
-        return attn_output, updated_residual
+        return attn_output, focus_mask
 
     def _get_context(self) -> StepContext:
         mgr = get_step_ctx_manager()
         return mgr.current_context()
 
-    def _get_keep_tokens_host(self) -> torch.Tensor:
-        if self._keep_tokens_host is None:
-            self._keep_tokens_host = torch.empty(1, dtype=torch.int32, device='cpu', pin_memory=True)
-        return self._keep_tokens_host
-
-    def _get_keep_tokens_event(self) -> torch.cuda.Event:
-        if self._keep_tokens_event is None:
-            self._keep_tokens_event = torch.cuda.Event()
-        return self._keep_tokens_event
-
     def _compute_focus_importance(self, context: StepContext, query_states: torch.Tensor, key_states: torch.Tensor):
         view = context.focus_view
-        mask_indices = view.processing_mask_global_indices
-        mask_indptr = view.processing_mask_indptr
-        max_mask_len = view.processing_mask_max_len
-        importance_flat = focus_importance_ragged(query_states,
-                                                  key_states,
-                                                  mask_indices,
-                                                  mask_indptr,
-                                                  max_mask_len,
-                                                  self.num_key_value_groups,
-                                                  self.scale)
-        num_tokens = context.processing_indices.numel()
-        importance = torch.zeros((num_tokens, ), dtype=query_states.dtype, device=query_states.device)
+        mask_indices = getattr(view, 'processing_mask_global_indices', None)
+        mask_indptr = getattr(view, 'processing_mask_indptr', None)
+        proc_view = context.processing_indices
+        device = query_states.device
+        mask_indices = mask_indices.to(device=device)
+        max_mask_len = getattr(view, 'processing_mask_max_len', None)
+        importance_flat = self._calc_focus_importance_ragged(query_states,
+                                                             key_states,
+                                                             mask_indices,
+                                                             mask_indptr,
+                                                             max_mask_len)
+        num_tokens = proc_view.numel()
+        importance = torch.zeros((num_tokens, ), dtype=query_states.dtype, device=device)
         importance.index_copy_(0, mask_indices, importance_flat)
         context.focus_first_layer_scores = importance
 
-    def _prepare_focus_pruning(
-        self,
-        context: StepContext,
-        query_states: torch.Tensor,
-        key_states: torch.Tensor,
-    ) -> torch.Tensor:
-        prev_scores = context.focus_first_layer_scores
-        view = context.focus_view
+    def _calc_focus_importance(self, query_states: torch.Tensor, key_states: torch.Tensor) -> torch.Tensor:
+        """Compute per-token importance used by FOCUS."""
+        q = query_states.transpose(0, 1)  # [num_heads, seq_len, head_dim]
+        k = key_states.transpose(0, 1)  # [num_kv_heads, seq_len, head_dim]
+        if self.num_key_value_groups > 1:
+            k = k.repeat_interleave(self.num_key_value_groups, dim=0)
+
+        attn_logits = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        pooled_logits = F.max_pool1d(attn_logits, kernel_size=3, stride=1, padding=1)
+        attn_weights = torch.softmax(pooled_logits, dim=-1)
+        attn_sum = attn_weights.sum(dim=-2)
+        importance = attn_sum.sum(dim=0)
+        return importance.to(dtype=query_states.dtype)
+
+    def _update_rotary_after_prune(self, context: StepContext, retain_mask: torch.Tensor):
+        """Trim cached rotary embeddings to match the retained tokens."""
+        rotary = getattr(context, 'rotary_pos_emb', None)
+        cos, sin = rotary
+        keep_idx = torch.arange(retain_mask.numel(), device=retain_mask.device)[retain_mask]
+        cos = cos.index_select(0, keep_idx)
+        sin = sin.index_select(0, keep_idx)
+        context.rotary_pos_emb = (cos, sin)
+
+    def _calc_focus_importance_ragged(self,
+                                      query_states: torch.Tensor,
+                                      key_states: torch.Tensor,
+                                      mask_indices: torch.Tensor,
+                                      mask_indptr: torch.Tensor,
+                                      max_mask_len: int) -> torch.Tensor:
+        """Vectorized importance computation over ragged sequences."""
         device = query_states.device
-        proc_indices = context.processing_indices
-        mask_globals = view.processing_mask_global_indices
-        mask_indptr = view.processing_mask_indptr
-        mask_lengths = view.processing_mask_lengths
-        avg_tokens = view.avg_decoded_tokens
-        targets = focus_compute_targets(mask_lengths, avg_tokens, context.focus_params.focus_alpha)
-        should_prune = (targets > 0) & (mask_lengths > targets)
+        # Gather masked tokens in ragged order.
+        gathered_query = query_states.index_select(0, mask_indices)
+        gathered_key = key_states.index_select(0, mask_indices)
+        mask_offsets = mask_indptr.to(device=device, dtype=torch.long)
+        lengths = mask_offsets[1:] - mask_offsets[:-1]
+        num_seq = lengths.size(0)
+        if max_mask_len <= 0:
+            return query_states.new_zeros((0, ), dtype=query_states.dtype)
+        seq_offsets = mask_offsets[:-1]
+        seq_ids = torch.repeat_interleave(torch.arange(num_seq, device=device), lengths)
+        rel_pos = torch.arange(mask_indices.numel(), device=device) - seq_offsets.repeat_interleave(lengths)
+        # Pad sequences to batched tensor for attention computation.
+        padded_q = self._get_focus_padding_buffer(
+            '_focus_qpad_buffer',
+            (num_seq, max_mask_len, gathered_query.size(1), gathered_query.size(2)),
+        )
+        padded_k = self._get_focus_padding_buffer(
+            '_focus_kpad_buffer',
+            (num_seq, max_mask_len, gathered_key.size(1), gathered_key.size(2)),
+        )
+        padded_q[seq_ids, rel_pos] = gathered_query
+        padded_k[seq_ids, rel_pos] = gathered_key
+        valid_mask = torch.arange(max_mask_len, device=device).unsqueeze(0) < lengths.unsqueeze(1)
+        q = padded_q.transpose(1, 2)  # (num_seq, num_heads, max_len, head_dim)
+        k = padded_k.transpose(1, 2)  # (num_seq, num_kv_heads, max_len, head_dim)
+        if self.num_key_value_groups > 1:
+            k = k.repeat_interleave(self.num_key_value_groups, dim=1)
+        attn_logits = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        attn_logits = attn_logits.masked_fill(~valid_mask[:, None, None, :], float('-inf'))
+        logits_flat = attn_logits.reshape(-1, max_mask_len)
+        query_mask = valid_mask[:, None, :].expand(num_seq, self.num_attention_heads, max_mask_len).reshape(-1)
+        key_mask_rows = valid_mask[:, None, None, :].expand(num_seq, self.num_attention_heads, max_mask_len, max_mask_len)
+        key_mask_rows = key_mask_rows.reshape(-1, max_mask_len)
+        row_probs = logits_flat.new_zeros((logits_flat.size(0), max_mask_len), dtype=query_states.dtype)
+        valid_logits = logits_flat[query_mask]
+        pooled = F.max_pool1d(valid_logits.unsqueeze(1), kernel_size=3, stride=1, padding=1).squeeze(1)
+        valid_keys = key_mask_rows[query_mask]
+        pooled = pooled.masked_fill(~valid_keys, float('-inf'))
+        attn_weights = torch.softmax(pooled, dim=-1)
+        row_probs[query_mask] = attn_weights.to(dtype=query_states.dtype)
+        row_probs = row_probs.view(num_seq, self.num_attention_heads, max_mask_len, max_mask_len)
+        importance = row_probs.sum(dim=2)
+        importance = importance * valid_mask[:, None, :]
+        importance = importance.sum(dim=1)
+        return importance[valid_mask]
 
-        retain_processing_mask = torch.ones_like(proc_indices, dtype=torch.bool, device=device)
-
-        total_masked = view.processing_mask_total
-        should_prune_any = view.processing_mask_prunable
-        if total_masked > 0 and should_prune_any:
-            max_mask_len = view.processing_mask_max_len
-            mask_importance_flat = focus_importance_ragged(query_states,
-                                                           key_states,
-                                                           mask_globals,
-                                                           mask_indptr,
-                                                           max_mask_len,
-                                                           self.num_key_value_groups,
-                                                           self.scale)
-            retain_mask_flat = focus_select_and_enforce_ragged(mask_importance_flat,
-                                                               prev_scores,
-                                                               mask_globals,
-                                                               proc_indices,
-                                                               mask_indptr,
-                                                               targets,
-                                                               should_prune,
-                                                               view.block_progress,
-                                                               max_mask_len)
-            retain_processing_mask[mask_globals] = retain_mask_flat
-
-        keep_tokens_host = self._get_keep_tokens_host()
-        keep_tokens_dev = retain_processing_mask.sum(dtype=torch.int32)
-        keep_tokens_host.copy_(keep_tokens_dev, non_blocking=True)
-        keep_tokens_event = self._get_keep_tokens_event()
-        keep_tokens_event.record()
-        return retain_processing_mask
+    def _get_focus_padding_buffer(self,
+                                  attr_name: str,
+                                  shape: Tuple[int, ...]) -> torch.Tensor:
+        """Return a zeroed slice of a reusable buffer for padded tensors."""
+        buf = getattr(self, attr_name, None)
+        view = buf
+        for dim, length in enumerate(shape):
+            view = view.narrow(dim, 0, length)
+        view.zero_()
+        return view
 
     def _apply_focus_pruning(
         self,
         context: StepContext,
-        attn_output: torch.Tensor,
+        hidden_states: torch.Tensor,
         query_states: torch.Tensor,
         key_states: torch.Tensor,
         value_states: torch.Tensor,
-        residual: Optional[torch.Tensor],
-        retain_processing_mask: torch.Tensor,
     ):
-        keep_tokens_host = self._get_keep_tokens_host()
-        keep_tokens_event = self._get_keep_tokens_event()
-        if not keep_tokens_event.query():
-            keep_tokens_event.synchronize()
-        keep_tokens = keep_tokens_host.item()
-        rotary_cos, rotary_sin = context.rotary_pos_emb
-        (query_states, key_states, value_states, attn_output, new_input_ids, new_position_ids, new_q_lens,
-         new_proc_indices, new_rotary, new_residual) = focus_compact_states(
-            keep_tokens,
-            retain_processing_mask,
-            query_states,
-            key_states,
-            value_states,
-            attn_output,
-            context.input_ids,
-            context.position_ids,
-            context.processing_indices,
-            context.q_seqlens,
-            rotary_cos=rotary_cos,
-            rotary_sin=rotary_sin,
-            residual_states=residual,
-        )
+        prev_scores = getattr(context, 'focus_first_layer_scores', None)
+        view = context.focus_view
+        device = query_states.device
+        proc_indices = context.processing_indices
+        mask_globals_cpu = getattr(view, 'processing_mask_global_indices', None)
+        orig_q_lens = context.q_seqlens.detach().clone()
+        block_progress_view = view.block_progress
+        mask_indptr = getattr(view, 'processing_mask_indptr', None)
+        mask_indptr_dev = mask_indptr.to(device=device, dtype=torch.long)
+        mask_lengths = (mask_indptr_dev[1:] - mask_indptr_dev[:-1])
+        avg_tokens = view.avg_decoded_tokens.to(device=device)
+        targets = self._compute_focus_targets(mask_lengths, avg_tokens, context.focus_params)
+        should_prune = (targets > 0) & (mask_lengths > targets)
 
-        new_q_lens_host = context.prepare_processing_view(new_q_lens)
-        context.input_ids = new_input_ids
-        context.position_ids = new_position_ids
+        retain_processing_mask = torch.ones_like(proc_indices, dtype=torch.bool, device=device)
+
+        total_masked = getattr(view, 'processing_mask_total', None)
+        should_prune_any = getattr(view, 'processing_mask_prunable', None)
+        if total_masked > 0 and should_prune_any:
+            mask_globals = mask_globals_cpu.to(device=device, dtype=torch.long)
+            max_mask_len = getattr(view, 'processing_mask_max_len', None)
+            mask_importance_flat = self._calc_focus_importance_ragged(query_states,
+                                                                      key_states,
+                                                                      mask_globals,
+                                                                      mask_indptr,
+                                                                      max_mask_len)
+            num_seq = mask_lengths.size(0)
+            seq_ids = torch.repeat_interleave(torch.arange(num_seq, device=device, dtype=torch.long), mask_lengths)
+            seq_offsets = mask_indptr_dev[:-1]
+            rel_pos = torch.arange(total_masked, device=device, dtype=torch.long)
+            rel_pos = rel_pos - seq_offsets.repeat_interleave(mask_lengths)
+            padded_shape = (num_seq, max_mask_len)
+            prev_indices = mask_globals_cpu.to(prev_scores.device)
+            prev_selected = prev_scores.index_select(0, prev_indices).to(device=device,
+                                                                          dtype=mask_importance_flat.dtype)
+            seq_delta_flat = mask_importance_flat - prev_selected
+            padded_delta = self._get_focus_padding_buffer('_focus_delta_buffer', padded_shape)
+            padded_delta[seq_ids, rel_pos] = seq_delta_flat
+            valid_mask = torch.arange(max_mask_len, device=device, dtype=torch.long).unsqueeze(0)
+            valid_mask = valid_mask < mask_lengths.unsqueeze(1)
+            token_indices = mask_globals
+            seq_block_positions_flat = proc_indices.index_select(0, token_indices)
+            padded_block_positions = self._get_focus_padding_buffer('_focus_blockpos_buffer', padded_shape)
+            padded_block_positions[seq_ids, rel_pos] = seq_block_positions_flat
+            effective_targets = torch.where(should_prune, targets, torch.zeros_like(targets))
+            selection_mask = self._select_focus_mask_batch(padded_delta, valid_mask, effective_targets)
+            retain_mask = torch.where(should_prune.unsqueeze(1), selection_mask, valid_mask)
+            block_progress = block_progress_view.to(device=device, dtype=torch.long)
+            retain_mask = self._enforce_focus_rules_batch(padded_block_positions, block_progress, retain_mask,
+                                                          valid_mask)
+            retain_mask_flat = retain_mask[seq_ids, rel_pos]
+            retain_processing_mask[token_indices] = retain_mask_flat
+
+        context.focus_first_layer_scores = None
+
+        retain_idx = torch.arange(retain_processing_mask.size(0), device=device)[retain_processing_mask]
+        any_pruned = retain_idx.numel() != retain_processing_mask.size(0)
+        if not any_pruned:
+            context.update_focus_processed_mask()
+            return query_states, key_states, value_states, hidden_states, None
+
+        query_states = query_states.index_select(0, retain_idx)
+        key_states = key_states.index_select(0, retain_idx)
+        value_states = value_states.index_select(0, retain_idx)
+        hidden_states = hidden_states[:, retain_processing_mask, :]
+
+        lengths_device = orig_q_lens.device
+        batch_size = orig_q_lens.size(0)
+        new_q_lens = torch.zeros_like(orig_q_lens, device=lengths_device, dtype=orig_q_lens.dtype)
+        mask_vals = retain_processing_mask.to(dtype=new_q_lens.dtype)
+        seq_lengths = orig_q_lens.to(device=mask_vals.device, dtype=torch.long)
+        token_seq_ids = torch.repeat_interleave(torch.arange(batch_size, device=mask_vals.device, dtype=torch.long),
+                                                seq_lengths)
+        seq_sums = torch.zeros(batch_size, dtype=new_q_lens.dtype, device=mask_vals.device)
+        seq_sums.scatter_add_(0, token_seq_ids, mask_vals)
+        new_q_lens.copy_(seq_sums.to(device=lengths_device, dtype=new_q_lens.dtype))
+        new_q_lens = new_q_lens.to(device=context.q_seqlens.device, dtype=context.q_seqlens.dtype)
+        new_proc_indices = proc_indices[retain_processing_mask]
+
+        context.update_processing_view(new_proc_indices, new_q_lens)
+        context.refresh_attention_metadata()
+        context.update_focus_processed_mask()
+        mask = retain_processing_mask.to(context.input_ids.device)
+        context.input_ids = context.input_ids[:, mask]
+        mask = retain_processing_mask.to(context.position_ids.device)
+        context.position_ids = context.position_ids[:, mask]
         if context.attention_mask is not None:
-            context.attention_mask = context.attention_mask[:, retain_processing_mask]
+            mask = retain_processing_mask.to(context.attention_mask.device)
+            context.attention_mask = context.attention_mask[:, mask]
         if context.input_embeddings is not None:
-            context.input_embeddings = context.input_embeddings[:, retain_processing_mask, :]
+            mask_gpu = retain_processing_mask.to(context.input_embeddings.device)
+            context.input_embeddings = context.input_embeddings[:, mask_gpu, :]
         if context.input_embedding_indexing is not None:
-            mask_cpu = retain_processing_mask.to(context.input_embedding_indexing.device, non_blocking=True)
+            mask_cpu = retain_processing_mask.to(context.input_embedding_indexing.device)
             context.input_embedding_indexing = context.input_embedding_indexing[mask_cpu]
 
-        context.rotary_pos_emb = new_rotary
-        return query_states, key_states, value_states, attn_output, new_residual, new_proc_indices, new_q_lens, new_q_lens_host
+        self._update_rotary_after_prune(context, retain_processing_mask)
+        return query_states, key_states, value_states, hidden_states, retain_processing_mask
+
+    def _compute_focus_targets(self, mask_lengths: torch.Tensor, avg_tokens: torch.Tensor,
+                               focus_params) -> torch.Tensor:
+        avg_tokens = torch.maximum(avg_tokens, torch.ones_like(avg_tokens))
+        retain = torch.ceil(avg_tokens * focus_params.focus_alpha).to(mask_lengths.dtype)
+        retain = torch.clamp(retain, min=1)
+        targets = torch.minimum(mask_lengths, retain)
+        targets = torch.where(mask_lengths <= 0, torch.zeros_like(targets), targets)
+        return targets
+
+    def _build_ranked_selection(self, scores: torch.Tensor, valid_mask: torch.Tensor, targets: torch.Tensor,
+                                descending: bool) -> torch.Tensor:
+        device = scores.device
+        fill_value = float('-inf') if descending else float('inf')
+        scores = scores.masked_fill(~valid_mask, fill_value)
+        order = torch.argsort(scores, dim=-1, descending=descending)
+        rank_range = torch.arange(scores.size(-1), device=device, dtype=targets.dtype).unsqueeze(0).expand_as(order)
+        rank_mask = rank_range < targets.unsqueeze(1)
+        selection = torch.zeros(valid_mask.shape, device=device, dtype=torch.int64)
+        selection.scatter_(1, order, rank_mask.to(dtype=selection.dtype))
+        selection = selection.to(dtype=torch.bool)
+        selection &= valid_mask
+        return selection
+
+    def _select_dynamic_mask(self, scores: torch.Tensor, valid_mask: torch.Tensor,
+                             targets: torch.Tensor) -> torch.Tensor:
+        base_selection = self._build_ranked_selection(scores, valid_mask, targets, descending=True)
+        masked_scores = scores.masked_fill(~valid_mask, 0.0)
+        counts = valid_mask.sum(dim=-1).clamp(min=1).to(masked_scores.dtype)
+        mean = masked_scores.sum(dim=-1) / counts
+        diff = (masked_scores - mean.unsqueeze(1)) * valid_mask
+        variance = diff.pow(2).sum(dim=-1) / counts
+        std = torch.sqrt(variance)
+        threshold = mean + std
+        candidate_mask = (scores >= threshold.unsqueeze(1)) & valid_mask
+        candidate_counts = candidate_mask.sum(dim=-1).to(targets.dtype)
+        positive_targets = targets > 0
+        use_threshold = positive_targets & (candidate_counts >= targets)
+        selection = torch.where(use_threshold.unsqueeze(1), candidate_mask, base_selection)
+        selection &= valid_mask
+        return selection
+
+    def _select_focus_mask_batch(self,
+                                 delta: torch.Tensor,
+                                 valid_mask: torch.Tensor,
+                                 targets: torch.Tensor) -> torch.Tensor:
+        max_counts = valid_mask.sum(dim=-1).to(targets.dtype)
+        targets = torch.clamp(targets, min=0)
+        targets = torch.minimum(targets, max_counts)
+        positive = targets > 0
+        clamped = torch.where(positive, torch.clamp(targets, min=1), targets)
+        return self._select_dynamic_mask(delta, valid_mask, clamped)
+
+    def _enforce_focus_rules_batch(self, block_positions: torch.Tensor, block_progress: torch.Tensor,
+                                   retain_mask: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+        device = retain_mask.device
+        block_progress = block_progress.to(device=device, dtype=torch.long)
+        adjacency = (block_positions[:, 1:] - block_positions[:, :-1]) == 1
+        adjacency = adjacency & valid_mask[:, 1:] & valid_mask[:, :-1]
+        adjust = adjacency & retain_mask[:, 1:] & (~retain_mask[:, :-1])
+        retain_mask[:, :-1] |= adjust
+        retain_valid = retain_mask & valid_mask
+        no_keep = (~retain_valid).all(dim=-1)
+        if torch.any(no_keep):
+            retain_mask[no_keep] = valid_mask[no_keep]
+            retain_valid = retain_mask & valid_mask
+        safe_positions = block_positions.masked_fill(~retain_valid, -1)
+        rightmost = safe_positions.max(dim=-1).values
+        evicted_before = (block_positions < rightmost.unsqueeze(1)) & (~retain_mask) & valid_mask
+        progress = block_progress.unsqueeze(1).to(dtype=block_positions.dtype)
+        is_unprocessed = block_positions > progress
+        need_keep = is_unprocessed & evicted_before
+        retain_mask |= need_keep
+        return retain_mask
+
 
 class SDARMLP(nn.Module):
     """mlp."""
@@ -405,13 +566,14 @@ class SDARDecoderLayer(nn.Module):
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
         # Self Attention
-        hidden_states, residual = self.self_attn(
+        hidden_states, focus_mask = self.self_attn(
             hidden_states=hidden_states,
             rotary_pos_emb=rotary_pos_emb,
             past_key_value=past_key_value,
             attn_metadata=attn_metadata,
-            residual=residual,
         )
+        if focus_mask is not None:
+            residual = residual[:, focus_mask, :]
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)

@@ -2,8 +2,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from lmdeploy.pytorch.kernels.cuda.focus import (focus_compact_states, focus_compute_targets, focus_enforce_rules,
-                                                 focus_importance_ragged, focus_select_and_enforce_ragged)
+from lmdeploy.pytorch.kernels.cuda.focus import (_focus_compute_keep_offsets, focus_compact_states,
+                                                 focus_compute_targets, focus_enforce_rules, focus_importance_ragged,
+                                                 focus_select_and_enforce_ragged)
 
 
 def _reference_ragged_importance(padded_q: torch.Tensor, padded_k: torch.Tensor, lengths: torch.Tensor,
@@ -80,10 +81,9 @@ def _reference_focus_select_mask(delta: torch.Tensor, valid_mask: torch.Tensor, 
     return selection
 
 
-def _reference_focus_enforce_rules(block_positions: torch.Tensor, block_unprocessed: torch.Tensor,
+def _reference_focus_enforce_rules(block_positions: torch.Tensor, block_progress: torch.Tensor,
                                    retain_mask: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
     retain = retain_mask.clone()
-    block_flags = block_unprocessed.to(dtype=torch.bool)
     adjacency = (block_positions[:, 1:] - block_positions[:, :-1]) == 1
     adjacency = adjacency & valid_mask[:, 1:] & valid_mask[:, :-1]
     adjust = adjacency & retain[:, 1:] & (~retain[:, :-1])
@@ -96,20 +96,20 @@ def _reference_focus_enforce_rules(block_positions: torch.Tensor, block_unproces
     safe_positions = block_positions.masked_fill(~retain_valid, -1)
     rightmost = safe_positions.max(dim=-1).values
     evicted_before = (block_positions < rightmost.unsqueeze(1)) & (~retain) & valid_mask
-    gather_indices = block_positions.clamp(min=0)
-    gathered = torch.gather(block_flags, 1, gather_indices)
-    need_keep = gathered & evicted_before
+    progress = block_progress.to(dtype=block_positions.dtype).unsqueeze(1)
+    is_unprocessed = block_positions > progress
+    need_keep = is_unprocessed & evicted_before
     retain |= need_keep
     return retain
 
 
 def _reference_focus_select_and_enforce(delta: torch.Tensor, valid_mask: torch.Tensor, targets: torch.Tensor,
                                         should_prune: torch.Tensor, block_positions: torch.Tensor,
-                                        block_unprocessed: torch.Tensor) -> torch.Tensor:
+                                        block_progress: torch.Tensor) -> torch.Tensor:
     effective_targets = torch.where(should_prune, targets, torch.zeros_like(targets))
     selection = _reference_focus_select_mask(delta, valid_mask, effective_targets)
     retain = torch.where(should_prune.unsqueeze(1), selection, valid_mask)
-    return _reference_focus_enforce_rules(block_positions, block_unprocessed, retain, valid_mask)
+    return _reference_focus_enforce_rules(block_positions, block_progress, retain, valid_mask)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='FOCUS Triton kernels require CUDA')
@@ -169,10 +169,10 @@ def test_focus_enforce_rules_matches_reference():
     valid_mask = torch.rand(batch, width, device=device) > 0.3
     block_positions = block_positions.masked_fill(~valid_mask, -1)
     retain_mask = torch.rand(batch, width, device=device) > 0.5
-    block_unprocessed = torch.rand(batch, block_count, device=device) > 0.7
-    fused = focus_enforce_rules(block_positions.clone(), block_unprocessed.clone(), retain_mask.clone(),
+    block_progress = torch.randint(-1, block_count, (batch, ), device=device, dtype=torch.long)
+    fused = focus_enforce_rules(block_positions.clone(), block_progress.clone(), retain_mask.clone(),
                                 valid_mask.clone())
-    reference = _reference_focus_enforce_rules(block_positions.cpu(), block_unprocessed.cpu(), retain_mask.cpu(),
+    reference = _reference_focus_enforce_rules(block_positions.cpu(), block_progress.cpu(), retain_mask.cpu(),
                                                valid_mask.cpu())
     assert torch.equal(fused.cpu(), reference)
 
@@ -183,14 +183,30 @@ def test_focus_enforce_rules_preserves_unprocessed_tokens():
     block_positions = torch.tensor([[1, 2, 3, -1], [4, 5, -1, -1]], device=device, dtype=torch.long)
     valid_mask = block_positions >= 0
     retain_mask = torch.zeros_like(block_positions, dtype=torch.bool)
-    block_unprocessed = torch.zeros((2, 10), device=device, dtype=torch.bool)
-    block_unprocessed[0, 2] = True
-    block_unprocessed[1, 5] = True
-    fused = focus_enforce_rules(block_positions.clone(), block_unprocessed.clone(), retain_mask.clone(),
+    block_progress = torch.tensor([1, 4], device=device, dtype=torch.long)
+    fused = focus_enforce_rules(block_positions.clone(), block_progress.clone(), retain_mask.clone(),
                                 valid_mask.clone())
-    reference = _reference_focus_enforce_rules(block_positions.cpu(), block_unprocessed.cpu(), retain_mask.cpu(),
+    reference = _reference_focus_enforce_rules(block_positions.cpu(), block_progress.cpu(), retain_mask.cpu(),
                                                valid_mask.cpu())
     assert torch.equal(fused.cpu(), reference)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='FOCUS Triton kernels require CUDA')
+def test_focus_keep_offsets_kernel_matches_reference():
+    device = torch.device('cuda')
+    torch.manual_seed(3)
+    lengths = [0, 1, 7, 64, 257]
+    for total_tokens in lengths:
+        retain_mask = torch.rand(total_tokens, device=device) > 0.45
+        fused = _focus_compute_keep_offsets(retain_mask)
+        if total_tokens == 0:
+            assert fused.numel() == 0
+            continue
+        mask_i32 = retain_mask.to(dtype=torch.int32)
+        reference = torch.cumsum(mask_i32, dim=0, dtype=torch.int32)
+        reference -= mask_i32
+        reference.masked_fill_(~retain_mask, -1)
+        torch.testing.assert_close(fused, reference)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='FOCUS Triton kernels require CUDA')
@@ -207,6 +223,7 @@ def test_focus_compact_states_matches_reference_gathers():
     key_states = torch.randn(total_tokens, num_kv_heads, head_dim, device=device, dtype=torch.float16)
     value_states = torch.randn(total_tokens, num_kv_heads, head_dim, device=device, dtype=torch.float16)
     hidden_states = torch.randn(hidden_batch, total_tokens, hidden_dim, device=device, dtype=torch.float16)
+    residual_states = torch.randn_like(hidden_states)
     proc_indices = (torch.arange(total_tokens, device=device, dtype=torch.long) * 3 + 7)
     input_ids = torch.randint(0, 32000, (batch, total_tokens), device=device, dtype=torch.int64)
     position_ids = torch.arange(total_tokens, device=device, dtype=torch.int64).expand(batch, -1).clone()
@@ -222,15 +239,33 @@ def test_focus_compact_states_matches_reference_gathers():
     if bool(retain_mask.all().item()):
         retain_mask[0] = False
     retain_idx = torch.nonzero(retain_mask, as_tuple=True)[0]
+    keep_tokens = int(retain_idx.numel())
+    rope_dim = 16
+    rotary_cos = torch.randn(total_tokens, rope_dim, device=device, dtype=torch.float16)
+    rotary_sin = torch.randn_like(rotary_cos)
 
-    fused = focus_compact_states(retain_idx, query_states, key_states, value_states, hidden_states, input_ids,
-                                 position_ids, proc_indices, q_lens)
-    fused_q, fused_k, fused_v, fused_hidden, fused_input_ids, fused_position_ids, fused_q_lens, fused_proc = fused
+    fused = focus_compact_states(keep_tokens,
+                                 retain_mask,
+                                 query_states,
+                                 key_states,
+                                 value_states,
+                                 hidden_states,
+                                 input_ids,
+                                 position_ids,
+                                 proc_indices,
+                                 q_lens,
+                                 rotary_cos=rotary_cos,
+                                 rotary_sin=rotary_sin,
+                                 residual_states=residual_states)
+    (fused_q, fused_k, fused_v, fused_hidden, fused_input_ids, fused_position_ids, fused_q_lens, fused_proc,
+     fused_rotary, fused_residual) = fused
+    fused_cos, fused_sin = fused_rotary
 
     ref_q = query_states.index_select(0, retain_idx)
     ref_k = key_states.index_select(0, retain_idx)
     ref_v = value_states.index_select(0, retain_idx)
     ref_hidden = hidden_states[:, retain_mask, :]
+    ref_residual = residual_states[:, retain_mask, :]
     ref_input_ids = input_ids[:, retain_mask]
     ref_position_ids = position_ids[:, retain_mask]
     mask_vals = retain_mask.to(dtype=q_lens.dtype)
@@ -238,15 +273,20 @@ def test_focus_compact_states_matches_reference_gathers():
     ref_q_lens = torch.zeros_like(q_lens)
     ref_q_lens.scatter_add_(0, token_seq_ids, mask_vals)
     ref_proc = proc_indices[retain_mask]
+    ref_cos = rotary_cos.index_select(0, retain_idx)
+    ref_sin = rotary_sin.index_select(0, retain_idx)
 
     torch.testing.assert_close(fused_q, ref_q)
     torch.testing.assert_close(fused_k, ref_k)
     torch.testing.assert_close(fused_v, ref_v)
     torch.testing.assert_close(fused_hidden, ref_hidden)
+    torch.testing.assert_close(fused_residual, ref_residual)
     torch.testing.assert_close(fused_input_ids, ref_input_ids)
     torch.testing.assert_close(fused_position_ids, ref_position_ids)
     torch.testing.assert_close(fused_q_lens, ref_q_lens)
     torch.testing.assert_close(fused_proc, ref_proc)
+    torch.testing.assert_close(fused_cos, ref_cos)
+    torch.testing.assert_close(fused_sin, ref_sin)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='FOCUS Triton kernels require CUDA')
@@ -260,7 +300,7 @@ def test_focus_select_and_enforce_ragged_matches_reference():
     total = int(mask_indptr[-1].item())
     delta = torch.randn(total, device=device)
     block_positions = torch.randint(0, block_count, (total, ), device=device, dtype=torch.long)
-    block_unprocessed = torch.rand(num_seq, block_count, device=device) > 0.6
+    block_progress = torch.randint(-1, block_count, (num_seq, ), device=device, dtype=torch.long)
     targets = torch.randint(0, max_len + 1, (num_seq, ), device=device, dtype=torch.int32)
     should_prune = torch.rand(num_seq, device=device) > 0.4
     base_offset = 3
@@ -291,11 +331,11 @@ def test_focus_select_and_enforce_ragged_matches_reference():
                                             mask_indptr.clone(),
                                             targets.clone(),
                                             should_prune.clone(),
-                                            block_unprocessed.clone(),
+                                            block_progress.clone(),
                                             runtime_max_len)
     reference = _reference_focus_select_and_enforce(padded_delta.cpu(), valid_mask.cpu(), targets.cpu(),
                                                     should_prune.cpu(), padded_positions.cpu(),
-                                                    block_unprocessed.cpu())
+                                                    block_progress.cpu())
     expected = []
     for idx, length in enumerate(lengths.tolist()):
         if length <= 0:
