@@ -2,7 +2,6 @@
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple
 import torch
-import torch.nn.functional as F
 from torch.profiler import record_function
 
 # from torch import distributed as dist
@@ -456,8 +455,8 @@ class StepContext:
         dllm_cfg = getattr(build_ctx, 'dllm_config', None) if build_ctx is not None else None
         focus_params = FocusParams()
         if dllm_cfg is not None:
-            focus_enabled = getattr(dllm_cfg, 'enable_focus', False)
-            focus_params = FocusParams(enabled=focus_enabled, focus_alpha=getattr(dllm_cfg, 'focus_alpha', None))
+            focus_enabled = dllm_cfg.enable_focus
+            focus_params = FocusParams(enabled=focus_enabled, focus_alpha=dllm_cfg.focus_alpha)
 
         use_delayed_cache = bool(inputs.is_decoding and processing_indices is not None and processing_q_lens is not None)
         if focus_params.enabled and not use_delayed_cache:
@@ -507,16 +506,9 @@ class StepContext:
 
         # seq_len + history_length
         if use_delayed_cache:
-            batch_size = q_seqlens.size(0)
-            rightmost_vals = proc_tensor.new_full((batch_size, ), -1)
-            valid_mask = q_seqlens > 0
             end_offsets = q_start_loc + q_seqlens - 1
-            if proc_tensor.numel() > 0:
-                safe_end_offsets = torch.where(valid_mask, end_offsets, end_offsets.new_zeros(end_offsets.size()))
-                gathered = proc_tensor.index_select(0, safe_end_offsets)
-                rightmost_vals = torch.where(valid_mask, gathered, rightmost_vals)
-            zeros = rightmost_vals.new_zeros((batch_size, ))
-            rightmost_plus_one = torch.where(rightmost_vals < 0, zeros, rightmost_vals + 1)
+            rightmost_vals = proc_tensor.index_select(0, end_offsets)
+            rightmost_plus_one = rightmost_vals + 1
             kv_seqlens = history_seqlens + rightmost_plus_one
         else:
             kv_seqlens = q_seqlens + history_seqlens
@@ -535,10 +527,9 @@ class StepContext:
             mask_lengths = mask_lengths_cpu.to(device=device, non_blocking=True)
             processing_mask_total = mask_seq_offsets_cpu[-1].item()
             processing_mask_max_len = mask_lengths_cpu.max().item()
-            focus_alpha = focus_params.focus_alpha
-            retain_cpu = torch.ceil(avg_tokens_cpu * focus_alpha).to(dtype=mask_lengths_cpu.dtype)
+            retain_cpu = torch.ceil(avg_tokens_cpu * focus_params.focus_alpha).to(dtype=mask_lengths_cpu.dtype)
             targets_cpu = torch.minimum(mask_lengths_cpu, retain_cpu)
-            should_prune = bool(((targets_cpu > 0) & (mask_lengths_cpu > targets_cpu)).any().item())
+            should_prune = ((targets_cpu > 0) & (mask_lengths_cpu > targets_cpu)).any().item()
             block_progress_host = inputs.focus_block_progress
             block_progress = block_progress_host.to(device=device, non_blocking=True)
             focus_view = FocusRuntimeView(
@@ -602,11 +593,6 @@ class StepContext:
     def focus_enabled(self) -> bool:
         return (self.focus_params is not None and self.focus_params.enabled and self.focus_view is not None)
 
-    def commit_processing_view(self):
-        """Sync current processing indices/q_lens back to originating ModelInputs."""
-        self.source_inputs.processing_indices = self.processing_indices
-        self.source_inputs.processing_q_lens = self.q_seqlens
-
     def _stage_focus_progress_host(self):
         """Kick off an async copy of the focus progress tensor to the host buffer."""
         view = self.focus_view
@@ -631,54 +617,41 @@ class StepContext:
         return new_q_lens_host_buffer
 
     def update_processing_view(self, new_proc_indices: torch.Tensor, new_q_lens: torch.Tensor, new_q_lens_host: torch.Tensor):
-        """Replace ragged processing view and refresh derived metadata."""
-        q_start_loc = new_q_lens.cumsum(0) - new_q_lens
+        """Replace ragged processing view, refresh metadata, and sync focus progress."""
+        block_progress = self.focus_view.block_progress
+        from lmdeploy.pytorch.kernels.cuda.focus import focus_update_processing_metadata
+        q_start_loc, cu_q, kv_seqlens, cu_k = focus_update_processing_metadata(new_q_lens, new_proc_indices,
+                                                                               self.history_lengths,
+                                                                               self.num_ignored_history,
+                                                                               block_progress)
+        self._stage_focus_progress_host()
         self.processing_indices = new_proc_indices
         self.q_seqlens = new_q_lens
-        block_size = self.kv_caches[0][0].size(1)
+        self.q_start_loc = q_start_loc
+        self.kv_seqlens = kv_seqlens
+        self.attn_metadata.q_seqlens = new_q_lens
+        self.attn_metadata.q_start_loc = q_start_loc
+        self.attn_metadata.cu_seqlens_q = cu_q
+        self.attn_metadata.processing_indices = new_proc_indices
+        self.attn_metadata.kv_seqlens = kv_seqlens
+        self.attn_metadata.cu_seqlens_k = cu_k
+        # Update fill_seqlens if it was set (needed for FOCUS to work correctly)
+        self.attn_metadata.fill_seqlens = new_q_lens
+        self.source_inputs.processing_indices = self.processing_indices
+        self.source_inputs.processing_q_lens = self.q_seqlens
+
         from lmdeploy.pytorch.engine.engine import build_delayed_cache_ragged_metadata
         if not self.focus_view.new_q_lens_event.query():
             self.focus_view.new_q_lens_event.synchronize()
         ragged_tile_to_seq, ragged_seq_tile_offsets, max_q_len_host = build_delayed_cache_ragged_metadata(
             new_q_lens_host,
             self.model_config,
-            block_size,
+            self.kv_caches[0][0].size(1),
         )
-        self.ragged_tile_to_seq = ragged_tile_to_seq.to(self.q_seqlens.device, non_blocking=True)
-        self.ragged_seq_tile_offsets = ragged_seq_tile_offsets.to(self.q_seqlens.device, non_blocking=True)
-        self.max_q_seqlen = max_q_len_host
-        self.q_start_loc = q_start_loc
-        batch_size = new_q_lens.size(0)
-        end_offsets = q_start_loc + new_q_lens - 1
-        rightmost_vals = new_proc_indices.index_select(0, end_offsets)
-        zeros = rightmost_vals.new_zeros((batch_size, ))
-        rightmost_plus_one = torch.where(rightmost_vals < 0, zeros, rightmost_vals + 1)
-        kv_seqlens = self.history_lengths + rightmost_plus_one
-        kv_seqlens -= self.num_ignored_history
-        self.kv_seqlens = kv_seqlens
-        self.attn_metadata.q_seqlens = new_q_lens
-        self.attn_metadata.q_start_loc = q_start_loc
+        self.attn_metadata.ragged_tile_to_seq = ragged_tile_to_seq.to(self.q_seqlens.device, non_blocking=True)
+        self.attn_metadata.ragged_seq_tile_offsets = ragged_seq_tile_offsets.to(self.q_seqlens.device, non_blocking=True)
         self.attn_metadata.max_q_seqlen = max_q_len_host
-        cu_q = F.pad(torch.cumsum(new_q_lens, dim=0, dtype=torch.int32), (1, 0))
-        self.attn_metadata.cu_seqlens_q = cu_q
-        self.attn_metadata.processing_indices = new_proc_indices
-        self.attn_metadata.kv_seqlens = kv_seqlens
-        cu_k = F.pad(torch.cumsum(kv_seqlens, dim=0, dtype=torch.int32), (1, 0))
-        self.attn_metadata.cu_seqlens_k = cu_k
-        # Update fill_seqlens if it was set (needed for FOCUS to work correctly)
-        self.attn_metadata.fill_seqlens = new_q_lens
-        self.commit_processing_view()
-
-    def update_focus_progress(self):
-        """Track the rightmost processed block position per sequence."""
-        if not self.focus_enabled():
-            return
-        block_progress = self.focus_view.block_progress
-        end_offsets = self.q_start_loc + self.q_seqlens - 1
-        new_positions = self.processing_indices.index_select(0, end_offsets)
-        new_progress = new_positions.to(block_progress.dtype)
-        self.focus_view.block_progress = torch.maximum(block_progress, new_progress)
-        self._stage_focus_progress_host()
+        self.max_q_seqlen = max_q_len_host
 
     def get_focus_processed_positions(self) -> Optional[List[int]]:
         """Return per-sequence rightmost processed positions."""
@@ -689,12 +662,6 @@ class StepContext:
         if not event.query():
             event.synchronize()
         return [int(val) for val in host_buffer.tolist()]
-
-    def refresh_attention_metadata(self):
-        """Rebuild backend attention metadata after pruning updates."""
-        backend = get_backend()
-        backend.update_step_context(self)
-        return self.attn_metadata
 
     @classmethod
     def get_mask_and_position_ids(cls, inputs: ModelInputs):

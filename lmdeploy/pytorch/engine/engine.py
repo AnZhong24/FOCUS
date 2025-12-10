@@ -862,23 +862,15 @@ class Engine(EngineBase):
                 proc_lengths.append(indices.numel())
                 if focus_enabled:
                     focus_info = msg.get_focus_info()
-                    if focus_info is None:
-                        focus_enabled = False
-                        focus_block_progress = []
-                        focus_avg_tokens = []
-                        focus_mask_globals = []
-                        focus_mask_indptr = [0]
-                    else:
-                        mask_tensor = focus_info.mask_indices.to('cpu', non_blocking=False)
-                        focus_block_progress.append(int(focus_info.rightmost_processed))
-                        ragged_mask = mask_tensor.index_select(0, indices)
-                        focus_avg_tokens.append(float(focus_info.avg_decoded_tokens))
-                        local_indices = torch.nonzero(ragged_mask, as_tuple=False).squeeze(-1).to(torch.long)
-                        focus_mask_globals.append(local_indices + running_proc_offset)
-                        focus_mask_indptr.append(focus_mask_indptr[-1] + local_indices.numel())
+                    mask_tensor = focus_info.mask_indices.to('cpu', non_blocking=False)
+                    focus_block_progress.append(focus_info.rightmost_processed)
+                    ragged_mask = mask_tensor.index_select(0, indices)
+                    focus_avg_tokens.append(focus_info.avg_decoded_tokens)
+                    local_indices = torch.nonzero(ragged_mask, as_tuple=False).squeeze(-1)
+                    focus_mask_globals.append(local_indices + running_proc_offset)
+                    focus_mask_indptr.append(focus_mask_indptr[-1] + local_indices.numel())
                 running_proc_offset += indices.numel()
-            processing_indices = (torch.cat(proc_tensors)
-                                  if len(proc_tensors) > 0 else torch.empty((0, ), dtype=torch.long))
+            processing_indices = torch.cat(proc_tensors)
             processing_q_lens = torch.tensor(proc_lengths, dtype=torch.long)
             if focus_enabled:
                 total_masked = focus_mask_indptr[-1]

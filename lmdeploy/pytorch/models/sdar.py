@@ -136,6 +136,8 @@ class SDARAttention(nn.Module):
             self._compute_focus_importance(context, query_states, key_states)
             torch.cuda.nvtx.range_pop()
         elif focus_fill_only:
+            # For better overlap.
+            new_q_lens = torch.zeros_like(context.q_seqlens)
             torch.cuda.nvtx.range_push("self._prepare_focus_pruning")
             retain_processing_mask = self._prepare_focus_pruning(context, query_states, key_states)
             torch.cuda.nvtx.range_pop()
@@ -152,10 +154,9 @@ class SDARAttention(nn.Module):
                 value_states,
                 updated_residual,
                 retain_processing_mask,
+                new_q_lens,
             )
             context.update_processing_view(new_proc_indices, new_q_lens, new_q_lens_host)
-            context.update_focus_progress()
-            context.refresh_attention_metadata()
             torch.cuda.nvtx.range_pop()
             attn_metadata = context.attn_metadata
 
@@ -276,6 +277,7 @@ class SDARAttention(nn.Module):
         value_states: torch.Tensor,
         residual: Optional[torch.Tensor],
         retain_processing_mask: torch.Tensor,
+        new_q_lens: torch.Tensor,
     ):
         keep_tokens_host = self._get_keep_tokens_host()
         keep_tokens_event = self._get_keep_tokens_event()
@@ -295,6 +297,7 @@ class SDARAttention(nn.Module):
             context.position_ids,
             context.processing_indices,
             context.q_seqlens,
+            new_q_lens,
             rotary_cos=rotary_cos,
             rotary_sin=rotary_sin,
             residual_states=residual,

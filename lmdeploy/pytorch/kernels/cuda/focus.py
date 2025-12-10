@@ -327,6 +327,57 @@ def _focus_keep_offsets_kernel(RETAIN_MASK, KEEP_OFFSETS, n_tokens, num_blocks, 
         carry += block_total
 
 
+@triton.jit
+def _focus_processing_view_kernel(
+    NEW_Q_LENS,
+    PROC_INDICES,
+    HISTORY_LENS,
+    NUM_IGNORED,
+    BLOCK_PROGRESS,
+    Q_START_LOC,
+    CU_Q,
+    KV_SEQLENS,
+    CU_K,
+    batch_size,
+    stride_q_lens,
+    stride_proc,
+    stride_history,
+    stride_ignored,
+    stride_progress,
+    stride_q_start,
+    stride_cuq,
+    stride_kv,
+    stride_cuk,
+):
+    zero32 = tl.zeros((), dtype=tl.int32)
+    tl.store(CU_Q, zero32)
+    tl.store(CU_K, zero32)
+    q_prefix = tl.zeros((), dtype=tl.int64)
+    kv_prefix = tl.zeros((), dtype=tl.int64)
+    for seq in tl.range(0, batch_size):
+        q_len = tl.load(NEW_Q_LENS + seq * stride_q_lens).to(tl.int64)
+        tl.store(Q_START_LOC + seq * stride_q_start, q_prefix)
+        q_prefix += q_len
+        tl.store(CU_Q + (seq + 1) * stride_cuq, q_prefix.to(tl.int32))
+
+        end_offset = q_prefix - 1
+        proc_val = tl.load(PROC_INDICES + end_offset * stride_proc).to(tl.int64)
+        rightmost = proc_val
+
+        progress_val = tl.load(BLOCK_PROGRESS + seq * stride_progress)
+        updated_progress = tl.maximum(progress_val, rightmost.to(progress_val.dtype))
+        tl.store(BLOCK_PROGRESS + seq * stride_progress, updated_progress)
+
+        plus_one = tl.where(rightmost < 0, tl.zeros((), dtype=tl.int64), rightmost + 1)
+        history = tl.load(HISTORY_LENS + seq * stride_history).to(tl.int64)
+        ignored = tl.load(NUM_IGNORED + seq * stride_ignored).to(tl.int64)
+        kv_len = history + plus_one - ignored
+        tl.store(KV_SEQLENS + seq * stride_kv, kv_len)
+
+        kv_prefix += kv_len
+        tl.store(CU_K + (seq + 1) * stride_cuk, kv_prefix.to(tl.int32))
+
+
 def _focus_compute_keep_offsets(retain_mask: torch.Tensor, block_size: int = 256) -> torch.Tensor:
     total_tokens = retain_mask.numel()
     keep_offsets = retain_mask.new_empty((total_tokens, ), dtype=torch.int32)
@@ -416,7 +467,6 @@ def _focus_compact_states_kernel(
     stride_sin_ot,
     stride_sin_od,
     stride_seq,
-    n_tokens,
     hidden_batch,
     input_batch,
     pos_batch,
@@ -719,6 +769,7 @@ def focus_compact_states(keep_tokens: int,
                          position_ids: torch.Tensor,
                          proc_indices: torch.Tensor,
                          orig_q_lens: torch.Tensor,
+                         new_q_lens: torch.Tensor,
                          rotary_cos: torch.Tensor,
                          rotary_sin: torch.Tensor,
                          residual_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor,
@@ -739,8 +790,7 @@ def focus_compact_states(keep_tokens: int,
     ids_shape = input_ids.shape
     pos_shape = position_ids.shape
 
-    orig_q_lens_i32 = orig_q_lens.to(dtype=torch.int32).contiguous()
-    new_q_lens = torch.zeros_like(orig_q_lens)
+    # Caller zeros new_q_lens ahead of time to hide the initialization cost.
     q_out = query_states.new_empty((keep_tokens, q_shape[1], q_shape[2]))
     k_out = key_states.new_empty((keep_tokens, k_shape[1], k_shape[2]))
     v_out = value_states.new_empty((keep_tokens, v_shape[1], v_shape[2]))
@@ -786,7 +836,7 @@ def focus_compact_states(keep_tokens: int,
     _focus_compact_states_kernel[grid](retain_mask,
                                         keep_offsets,
                                         proc_indices,
-                                        orig_q_lens_i32,
+                                        orig_q_lens,
                                         query_states,
                                         key_states,
                                         value_states,
@@ -853,8 +903,7 @@ def focus_compact_states(keep_tokens: int,
                                         stride_cos_od,
                                         stride_sin_ot,
                                         stride_sin_od,
-                                        orig_q_lens_i32.stride(0),
-                                        total_tokens,
+                                        orig_q_lens.stride(0),
                                         hidden_shape[0],
                                         ids_shape[0],
                                         pos_shape[0],
@@ -868,7 +917,7 @@ def focus_compact_states(keep_tokens: int,
                                         residual_batch,
                                         residual_dim,
                                         rotary_dim,
-                                        orig_q_lens_i32.size(0),
+                                        orig_q_lens.size(0),
                                         BLOCK_Q_HEAD=4,
                                         BLOCK_Q_DIM=64,
                                         BLOCK_K_HEAD=4,
@@ -883,8 +932,43 @@ def focus_compact_states(keep_tokens: int,
 
     new_rotary = (cos_out, sin_out)
 
-    return (q_out, k_out, v_out, hidden_out, input_ids_out, position_ids_out, new_q_lens.to(orig_q_lens.dtype),
+    return (q_out, k_out, v_out, hidden_out, input_ids_out, position_ids_out, new_q_lens,
             new_proc_indices, new_rotary, residual_out)
+
+
+def focus_update_processing_metadata(
+        new_q_lens: torch.Tensor, new_proc_indices: torch.Tensor, history_lengths: torch.Tensor,
+        num_ignored_history: torch.Tensor,
+        block_progress: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse prefix sums/metadata refresh for delayed cache updates."""
+    batch_size = new_q_lens.size(0)
+    q_start_loc = torch.empty_like(new_q_lens)
+    kv_seqlens = history_lengths.new_empty((batch_size, ))
+    cu_q = torch.empty((batch_size + 1, ), device=new_q_lens.device, dtype=torch.int32)
+    cu_k = torch.empty_like(cu_q)
+    grid = (1, )
+    _focus_processing_view_kernel[grid](new_q_lens,
+                                        new_proc_indices,
+                                        history_lengths,
+                                        num_ignored_history,
+                                        block_progress,
+                                        q_start_loc,
+                                        cu_q,
+                                        kv_seqlens,
+                                        cu_k,
+                                        batch_size,
+                                        new_q_lens.stride(0),
+                                        new_proc_indices.stride(0),
+                                        history_lengths.stride(0),
+                                        num_ignored_history.stride(0),
+                                        block_progress.stride(0),
+                                        q_start_loc.stride(0),
+                                        cu_q.stride(0),
+                                        kv_seqlens.stride(0),
+                                        cu_k.stride(0),
+                                        num_warps=1,
+                                        num_stages=1)
+    return q_start_loc, cu_q, kv_seqlens, cu_k
 
 
 def _pick_focus_enforce_meta(width: int) -> tuple[int, int]:

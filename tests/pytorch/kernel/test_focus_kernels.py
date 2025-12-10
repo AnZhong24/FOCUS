@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 from lmdeploy.pytorch.kernels.cuda.focus import (_focus_compute_keep_offsets, focus_compact_states,
                                                  focus_compute_targets, focus_enforce_rules, focus_importance_ragged,
-                                                 focus_select_and_enforce_ragged)
+                                                 focus_select_and_enforce_ragged, focus_update_processing_metadata)
 
 
 def _reference_ragged_importance(padded_q: torch.Tensor, padded_k: torch.Tensor, lengths: torch.Tensor,
@@ -112,6 +112,32 @@ def _reference_focus_select_and_enforce(delta: torch.Tensor, valid_mask: torch.T
     return _reference_focus_enforce_rules(block_positions, block_progress, retain, valid_mask)
 
 
+def _reference_focus_processing_update(new_q_lens: torch.Tensor, new_proc_indices: torch.Tensor,
+                                       history_lengths: torch.Tensor, num_ignored_history: torch.Tensor,
+                                       block_progress: torch.Tensor):
+    q_cumsum = torch.cumsum(new_q_lens, dim=0)
+    q_start_loc = q_cumsum - new_q_lens
+    valid = new_q_lens > 0
+    rightmost = new_proc_indices.new_full((new_q_lens.size(0), ), -1)
+    if bool(valid.any().item()):
+        end_offsets = q_start_loc + new_q_lens - 1
+        safe_offsets = torch.where(valid, end_offsets, end_offsets.new_zeros(end_offsets.size()))
+        gathered = new_proc_indices.index_select(0, safe_offsets)
+        rightmost = torch.where(valid, gathered, rightmost)
+    zeros = torch.zeros_like(rightmost)
+    rightmost_plus_one = torch.where(rightmost < 0, zeros, rightmost + 1)
+    kv_seqlens = history_lengths + rightmost_plus_one.to(history_lengths.dtype)
+    kv_seqlens = kv_seqlens - num_ignored_history.to(history_lengths.dtype)
+    cu_q = torch.zeros((new_q_lens.size(0) + 1, ), dtype=torch.int32, device=new_q_lens.device)
+    if q_cumsum.numel() > 0:
+        cu_q[1:] = q_cumsum.to(torch.int32)
+    cu_k = torch.zeros_like(cu_q)
+    if kv_seqlens.numel() > 0:
+        cu_k[1:] = torch.cumsum(kv_seqlens, dim=0, dtype=torch.int32)
+    new_progress = torch.maximum(block_progress, rightmost.to(block_progress.dtype))
+    return q_start_loc, cu_q, kv_seqlens, cu_k, new_progress
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='FOCUS Triton kernels require CUDA')
 def test_focus_ragged_kernel_matches_reference():
     device = torch.device('cuda')
@@ -210,6 +236,57 @@ def test_focus_keep_offsets_kernel_matches_reference():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='FOCUS Triton kernels require CUDA')
+def test_focus_update_processing_metadata_matches_reference():
+    device = torch.device('cuda')
+    torch.manual_seed(29)
+    batch = 7
+    new_q_lens = torch.randint(0, 6, (batch, ), device=device, dtype=torch.long)
+    if not bool((new_q_lens > 0).any().item()):
+        new_q_lens[0] = 1
+    total_tokens = int(new_q_lens.sum().item())
+    new_proc_indices = torch.randint(0, 32, (total_tokens, ), device=device, dtype=torch.long)
+    history_lengths = torch.randint(0, 12, (batch, ), device=device, dtype=torch.long)
+    num_ignored_history = torch.randint(0, 3, (batch, ), device=device, dtype=torch.long)
+    block_progress = torch.randint(-1, 32, (batch, ), device=device, dtype=torch.int32)
+    fused_block_progress = block_progress.clone()
+    q_start_loc, cu_q, kv_seqlens, cu_k = focus_update_processing_metadata(new_q_lens.clone(),
+                                                                           new_proc_indices.clone(),
+                                                                           history_lengths.clone(),
+                                                                           num_ignored_history.clone(),
+                                                                           fused_block_progress)
+    (ref_q_start, ref_cu_q, ref_kv, ref_cu_k,
+     ref_progress) = _reference_focus_processing_update(new_q_lens.cpu(), new_proc_indices.cpu(),
+                                                        history_lengths.cpu(), num_ignored_history.cpu(),
+                                                        block_progress.cpu())
+    torch.testing.assert_close(q_start_loc.cpu(), ref_q_start)
+    torch.testing.assert_close(cu_q.cpu(), ref_cu_q)
+    torch.testing.assert_close(kv_seqlens.cpu(), ref_kv)
+    torch.testing.assert_close(cu_k.cpu(), ref_cu_k)
+    torch.testing.assert_close(fused_block_progress.cpu(), ref_progress.cpu())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='FOCUS Triton kernels require CUDA')
+def test_focus_update_processing_metadata_empty_batch():
+    device = torch.device('cuda')
+    new_q_lens = torch.empty(0, device=device, dtype=torch.long)
+    new_proc_indices = torch.empty(0, device=device, dtype=torch.long)
+    history_lengths = torch.empty(0, device=device, dtype=torch.long)
+    num_ignored_history = torch.empty(0, device=device, dtype=torch.long)
+    block_progress = torch.empty(0, device=device, dtype=torch.int32)
+    fused_block_progress = block_progress.clone()
+    q_start_loc, cu_q, kv_seqlens, cu_k = focus_update_processing_metadata(new_q_lens,
+                                                                           new_proc_indices,
+                                                                           history_lengths,
+                                                                           num_ignored_history,
+                                                                           fused_block_progress)
+    assert q_start_loc.numel() == 0
+    assert kv_seqlens.numel() == 0
+    torch.testing.assert_close(cu_q, torch.zeros(1, device=device, dtype=torch.int32))
+    torch.testing.assert_close(cu_k, torch.zeros(1, device=device, dtype=torch.int32))
+    assert fused_block_progress.numel() == 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='FOCUS Triton kernels require CUDA')
 def test_focus_compact_states_matches_reference_gathers():
     device = torch.device('cuda')
     torch.manual_seed(19)
@@ -244,6 +321,7 @@ def test_focus_compact_states_matches_reference_gathers():
     rotary_cos = torch.randn(total_tokens, rope_dim, device=device, dtype=torch.float16)
     rotary_sin = torch.randn_like(rotary_cos)
 
+    fused_q_lens_buffer = torch.zeros_like(q_lens)
     fused = focus_compact_states(keep_tokens,
                                  retain_mask,
                                  query_states,
@@ -254,6 +332,7 @@ def test_focus_compact_states_matches_reference_gathers():
                                  position_ids,
                                  proc_indices,
                                  q_lens,
+                                 fused_q_lens_buffer,
                                  rotary_cos=rotary_cos,
                                  rotary_sin=rotary_sin,
                                  residual_states=residual_states)
