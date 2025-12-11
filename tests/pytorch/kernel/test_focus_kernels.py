@@ -3,7 +3,7 @@ import torch
 import torch.nn.functional as F
 
 from lmdeploy.pytorch.kernels.cuda.focus import (_focus_compute_keep_offsets, focus_compact_states,
-                                                 focus_compute_targets, focus_enforce_rules, focus_importance_ragged,
+                                                 focus_compute_targets, focus_importance_ragged,
                                                  focus_select_and_enforce_ragged, focus_update_processing_metadata)
 
 
@@ -184,37 +184,6 @@ def test_focus_target_kernel_matches_reference():
     fused = focus_compute_targets(mask_lengths, avg_tokens, alpha)
     reference = _reference_targets(mask_lengths, avg_tokens, alpha)
     torch.testing.assert_close(fused, reference)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='FOCUS Triton kernels require CUDA')
-def test_focus_enforce_rules_matches_reference():
-    device = torch.device('cuda')
-    torch.manual_seed(7)
-    batch, width, block_count = 6, 17, 32
-    block_positions = torch.randint(-4, block_count, (batch, width), device=device, dtype=torch.long)
-    valid_mask = torch.rand(batch, width, device=device) > 0.3
-    block_positions = block_positions.masked_fill(~valid_mask, -1)
-    retain_mask = torch.rand(batch, width, device=device) > 0.5
-    block_progress = torch.randint(-1, block_count, (batch, ), device=device, dtype=torch.long)
-    fused = focus_enforce_rules(block_positions.clone(), block_progress.clone(), retain_mask.clone(),
-                                valid_mask.clone())
-    reference = _reference_focus_enforce_rules(block_positions.cpu(), block_progress.cpu(), retain_mask.cpu(),
-                                               valid_mask.cpu())
-    assert torch.equal(fused.cpu(), reference)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason='FOCUS Triton kernels require CUDA')
-def test_focus_enforce_rules_preserves_unprocessed_tokens():
-    device = torch.device('cuda')
-    block_positions = torch.tensor([[1, 2, 3, -1], [4, 5, -1, -1]], device=device, dtype=torch.long)
-    valid_mask = block_positions >= 0
-    retain_mask = torch.zeros_like(block_positions, dtype=torch.bool)
-    block_progress = torch.tensor([1, 4], device=device, dtype=torch.long)
-    fused = focus_enforce_rules(block_positions.clone(), block_progress.clone(), retain_mask.clone(),
-                                valid_mask.clone())
-    reference = _reference_focus_enforce_rules(block_positions.cpu(), block_progress.cpu(), retain_mask.cpu(),
-                                               valid_mask.cpu())
-    assert torch.equal(fused.cpu(), reference)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='FOCUS Triton kernels require CUDA')

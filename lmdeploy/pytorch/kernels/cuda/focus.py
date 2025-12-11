@@ -139,65 +139,6 @@ def _focus_importance_ragged_kernel(
 
 
 @triton.jit
-def _focus_enforce_rules_kernel(
-    BLOCK_POS,
-    BLOCK_PROGRESS,
-    RETAIN,
-    VALID,
-    stride_bp,
-    stride_bc,
-    stride_prog,
-    stride_rb,
-    stride_rc,
-    stride_vb,
-    stride_vc,
-    width,
-    BLOCK: tl.constexpr,
-):
-    row = tl.program_id(0)
-    offs = tl.arange(0, BLOCK)
-    in_bounds = offs < width
-
-    pos_ptrs = BLOCK_POS + row * stride_bp + offs * stride_bc
-    positions = tl.load(pos_ptrs, mask=in_bounds, other=-1).to(tl.int32)
-
-    retain_ptrs = RETAIN + row * stride_rb + offs * stride_rc
-    retain = tl.load(retain_ptrs, mask=in_bounds, other=0).to(tl.int1)
-
-    valid_ptrs = VALID + row * stride_vb + offs * stride_vc
-    valid = tl.load(valid_ptrs, mask=in_bounds, other=0).to(tl.int1)
-
-    has_next = (offs + 1) < width
-    next_pos = tl.load(pos_ptrs + stride_bc, mask=has_next, other=-2).to(tl.int32)
-    next_valid = tl.load(valid_ptrs + stride_vc, mask=has_next, other=0).to(tl.int1)
-    next_retain = tl.load(retain_ptrs + stride_rc, mask=has_next, other=0).to(tl.int1)
-
-    adjacency = ((next_pos - positions) == 1)
-    adjacency = adjacency & has_next & valid & next_valid
-    adjust = adjacency & next_retain & (retain == 0)
-    retain = retain | adjust
-
-    retain_valid = retain & valid
-    keep_count = tl.sum(retain_valid.to(tl.int32), axis=0)
-    no_keep = keep_count == 0
-    retain = tl.where(no_keep, valid, retain)
-    retain_valid = retain & valid
-
-    safe_positions = tl.where(retain_valid, positions, -1)
-    rightmost = tl.max(safe_positions, axis=0)
-    less_than_rightmost = positions < rightmost
-    not_retain = retain == 0
-    evicted_before = less_than_rightmost & not_retain & valid
-
-    progress = tl.load(BLOCK_PROGRESS + row * stride_prog).to(tl.int32)
-    is_unprocessed = positions > progress
-    need_keep = is_unprocessed & evicted_before
-    retain = retain | need_keep
-
-    tl.store(retain_ptrs, retain, mask=in_bounds)
-
-
-@triton.jit
 def _focus_select_enforce_ragged_kernel(
     IMPORTANCE,
     PREV_SCORES,
@@ -651,7 +592,7 @@ def focus_importance_ragged(query_states: torch.Tensor,
     stride_kt, stride_kh, stride_kd = key_states.stride()
     stride_ws = workspace.stride(0)
     block_d = triton.next_power_of_2(head_dim)
-    block_row = min(128, triton.next_power_of_2(max_mask_len))
+    block_row = triton.next_power_of_2(max(16, min(max_mask_len, 128)))
     num_warps, num_stages = _pick_focus_kernel_meta(block_d, block_row)
     grid = (total_rows, )
     _focus_importance_ragged_kernel[grid](query_states,
@@ -683,9 +624,9 @@ def focus_compute_targets(mask_lengths: torch.Tensor, avg_tokens: torch.Tensor, 
     """Compute focus targets via the Triton kernel."""
     targets = torch.empty_like(mask_lengths)
     n_elements = mask_lengths.numel()
-    BLOCK = 128
+    BLOCK = max(32, min(128, triton.next_power_of_2(max(1, n_elements))))
     grid = (triton.cdiv(n_elements, BLOCK), )
-    tgt_num_warps, tgt_num_stages = _pick_focus_target_meta(n_elements)
+    tgt_num_warps, tgt_num_stages = _pick_focus_target_meta(n_elements, BLOCK)
     _focus_targets_kernel[grid](mask_lengths,
                                 avg_tokens,
                                 targets,
@@ -700,31 +641,6 @@ def focus_compute_targets(mask_lengths: torch.Tensor, avg_tokens: torch.Tensor, 
     return targets
 
 
-def focus_enforce_rules(block_positions: torch.Tensor, block_progress: torch.Tensor,
-                        retain_mask: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
-    """Fuse rule enforcement into a Triton kernel."""
-    batch, width = block_positions.shape
-    grid = (batch, )
-    BLOCK = triton.next_power_of_2(max(1, width))
-    num_warps, num_stages = _pick_focus_enforce_meta(width)
-    _focus_enforce_rules_kernel[grid](block_positions,
-                                      block_progress,
-                                      retain_mask,
-                                      valid_mask,
-                                      block_positions.stride(0),
-                                      block_positions.stride(1),
-                                      block_progress.stride(0),
-                                      retain_mask.stride(0),
-                                      retain_mask.stride(1),
-                                      valid_mask.stride(0),
-                                      valid_mask.stride(1),
-                                      width,
-                                      BLOCK=BLOCK,
-                                      num_warps=num_warps,
-                                      num_stages=num_stages)
-    return retain_mask
-
-
 def focus_select_and_enforce_ragged(importance: torch.Tensor,
                                     prev_scores: torch.Tensor,
                                     mask_indices: torch.Tensor,
@@ -736,9 +652,6 @@ def focus_select_and_enforce_ragged(importance: torch.Tensor,
                                     max_len: int) -> torch.Tensor:
     """Ragged variant that also computes delta/block positions inside the Triton kernel."""
     num_seq = mask_indptr.numel() - 1
-    device = importance.device
-    targets_i32 = targets.to(device=device, dtype=torch.int32, non_blocking=True).contiguous()
-    should_prune_i32 = should_prune.to(device=device, dtype=torch.int32, non_blocking=True).contiguous()
     output = torch.zeros_like(importance, dtype=torch.bool)
     block = triton.next_power_of_2(max_len)
     num_warps, num_stages = _pick_focus_select_enforce_meta(max_len)
@@ -748,8 +661,8 @@ def focus_select_and_enforce_ragged(importance: torch.Tensor,
                                               mask_indices,
                                               proc_indices,
                                               mask_indptr,
-                                              targets_i32,
-                                              should_prune_i32,
+                                              targets,
+                                              should_prune,
                                               block_progress,
                                               output,
                                               block_progress.stride(0),
@@ -971,23 +884,6 @@ def focus_update_processing_metadata(
     return q_start_loc, cu_q, kv_seqlens, cu_k
 
 
-def _pick_focus_enforce_meta(width: int) -> tuple[int, int]:
-    major, _ = torch.cuda.get_device_capability()
-    if major >= 9:
-        if width >= 256:
-            return 4, 3
-        if width >= 128:
-            return 4, 2
-        if width >= 64:
-            return 2, 2
-        return 1, 2
-    if major >= 8:
-        if width >= 128:
-            return 2, 2
-        return 1, 2
-    return 1, 1
-
-
 def _pick_focus_select_enforce_meta(width: int) -> tuple[int, int]:
     """Scheduling heuristic for the fused selection+enforcement kernel."""
     major, _ = torch.cuda.get_device_capability()
@@ -1008,23 +904,23 @@ def _pick_focus_select_enforce_meta(width: int) -> tuple[int, int]:
     return 1, 1
 
 
-def _pick_focus_target_meta(n_elements: int) -> tuple[int, int]:
+def _pick_focus_target_meta(n_elements: int, block: int) -> tuple[int, int]:
     """Heuristic num_warps/num_stages for the focus target kernel."""
     major, _ = torch.cuda.get_device_capability()
     if major >= 9:
-        if n_elements >= 1 << 15:
+        if block >= 128 and n_elements >= 256:
             return 4, 3
-        if n_elements >= 1 << 13:
-            return 4, 2
-        if n_elements >= 1 << 11:
+        if block >= 128:
+            return 2, 2
+        if block >= 64:
             return 2, 2
         return 1, 2
     if major >= 8:
-        if n_elements >= 1 << 14:
-            return 4, 2
-        if n_elements >= 1 << 12:
+        if block >= 128:
             return 2, 2
-        return 1, 2
+        if block >= 64:
+            return 1, 2
+        return 1, 1
     return 1, 1
 
 
@@ -1032,6 +928,12 @@ def _pick_focus_kernel_meta(block_d: int, block_row: int) -> tuple[int, int]:
     """Choose num_warps/num_stages based on tile shape and GPU architecture."""
     major, _ = torch.cuda.get_device_capability()
     area = block_d * block_row
+    if block_row <= 32 and block_d <= 128:
+        if major >= 9:
+            return 2, 2
+        if major >= 8:
+            return 2, 2
+        return 1, 1
     if major >= 9:
         if area >= 16384:
             return 8, 4
