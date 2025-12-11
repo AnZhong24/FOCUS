@@ -1,5 +1,6 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import functools
+import math
 from typing import Any, Dict, List, Tuple
 
 import torch
@@ -70,6 +71,8 @@ class CUDASingleGraphRunner:
         model_config: ModelConfig,
         device: torch.device,
         decode_query_len: int = 1,
+        block_size: int = 1,
+        use_delayed_cache: bool = False,
     ):
         self.model = model
         self.ctx_mgr = model.ctx_mgr
@@ -87,6 +90,8 @@ class CUDASingleGraphRunner:
             decode_query_len=decode_query_len,
             use_flash_mla=model_config.use_flash_mla,
             use_fa3_decoding=model_config.model_paradigm == 'ar_spec',
+            block_size=block_size,
+            use_delayed_cache=use_delayed_cache,
         )
         self.device = device
         self.max_batches = max_batches
@@ -177,34 +182,60 @@ class CUDAGraphRunner(GraphRunner):
 
         self.has_try_compile_model = True
 
-    def _get_capture_tokens(self, batch_size: int):
-        """Get capture tokens."""
+    def _round_capture_batch_size(self, batch_size: int):
         cap_sizes = self.get_capture_batch_sizes()
         for size in cap_sizes:
             if size >= batch_size:
                 return size
         assert False, f'Unsupported batch_size={batch_size}'
 
+    def _get_capture_tokens(self, batch_size: int, origin_batch_size: int = None):
+        """Get capture tokens."""
+        capture_func = self._round_capture_batch_size
+        strategy = getattr(self, 'cudagraph_strategy', None)
+        if strategy is None:
+            return capture_func(batch_size)
+        if origin_batch_size is None:
+            origin_batch_size = batch_size
+        return strategy.get_capture_batch_size(target_batch_size=batch_size,
+                                               origin_batch_size=origin_batch_size,
+                                               capture_func=capture_func)
+
     def get_graph_key(self, input_ids: torch.Tensor, position_ids: torch.Tensor, past_key_values: List,
                       attn_metadata: TritonAttentionMetadata, inputs_embeds: torch.Tensor, **kwargs):
         """Get graph key."""
         context = self.ctx_mgr.current_context()
         is_decoding = context.is_decoding
-        batch_size = attn_metadata.q_seqlens.size(0)
+        origin_batch_size = attn_metadata.q_seqlens.size(0)
         meta = self.get_meta()
         enable_microbatch = get_step_ctx_manager().current_context().enable_microbatch
         # for draft model to distinguish inputs from target model and itself
-        query_len = input_ids.size(1) // batch_size
-        if meta.padding_batch_size is None:
-            batch_size = self._get_capture_tokens(batch_size)
+        num_tokens = input_ids.size(1)
+        use_delayed_cache = context.use_delayed_cache
+        if use_delayed_cache:
+            token_bucket = self.cudagraph_strategy.get_capture_token_bucket(num_tokens)
+            query_key = token_bucket
         else:
-            batch_size = self._get_capture_tokens(meta.padding_batch_size)
-        return (batch_size, is_decoding, enable_microbatch, query_len)
+            token_bucket = num_tokens
+            query_key = num_tokens // origin_batch_size
+        decode_query_len = context.max_q_seqlen
+        if decode_query_len is None:
+            decode_query_len = math.ceil(num_tokens / max(origin_batch_size, 1))
+        if meta.padding_batch_size is None:
+            batch_size = self._get_capture_tokens(origin_batch_size, origin_batch_size=origin_batch_size)
+        else:
+            batch_size = self._get_capture_tokens(meta.padding_batch_size, origin_batch_size=origin_batch_size)
+        return (batch_size, is_decoding, enable_microbatch, query_key, decode_query_len, use_delayed_cache)
 
     def _get_max_tokens(self, graph_key: tuple, input_ids: torch.Tensor, q_seqlens: torch.Tensor):
         max_batches = graph_key[0]
         is_decoding = graph_key[1]
         assert is_decoding
+        use_delayed_cache = graph_key[5] if len(graph_key) > 5 else False
+        if use_delayed_cache:
+            num_tokens = input_ids.size(1)
+            max_tokens = self.cudagraph_strategy.get_capture_token_bucket(num_tokens)
+            return max_tokens
         origin_batch_size = q_seqlens.size(0)
         num_tokens = input_ids.size(1)
         return self.cudagraph_strategy.get_max_tokens(max_batches, origin_batch_size, num_tokens)
@@ -224,8 +255,10 @@ class CUDAGraphRunner(GraphRunner):
         graph_key = self.get_graph_key(**kwargs)
         max_batches = graph_key[0]
         is_decoding = graph_key[1]
-        decode_query_len = graph_key[3]
-        if graph_key not in self._runner_map:
+        decode_query_len = graph_key[4]
+        use_delayed_cache = graph_key[5] if len(graph_key) > 5 else False
+        runner = self._runner_map.get(graph_key, None)
+        if runner is None:
             max_tokens = self._get_max_tokens(graph_key, kwargs['input_ids'], kwargs['attn_metadata'].q_seqlens)
             runner = CUDASingleGraphRunner(
                 self.model,
@@ -237,6 +270,8 @@ class CUDAGraphRunner(GraphRunner):
                 model_config=self.model_config,
                 device=self.device,
                 decode_query_len=decode_query_len,
+                block_size=self.cache_config.block_size,
+                use_delayed_cache=use_delayed_cache,
             )
             output = runner.capture(**kwargs)
             self._runner_map[graph_key] = runner
@@ -280,8 +315,13 @@ class CUDAGraphRunner(GraphRunner):
         if is_decoding and dp_meta is not None:
             meta = self.get_meta()
             padding_batch_size = meta.padding_batch_size
-            tp_size = self._get_capture_tokens(padding_batch_size)
-            dp_meta.sync_tp_size(tp_size)
+            if padding_batch_size is not None:
+                tp_size = self.cudagraph_strategy.get_capture_batch_size(
+                    target_batch_size=padding_batch_size,
+                    origin_batch_size=padding_batch_size,
+                    capture_func=self._get_capture_tokens,
+                )
+                dp_meta.sync_tp_size(tp_size)
         return inputs
 
     def get_capture_batch_sizes(self) -> List[int]:

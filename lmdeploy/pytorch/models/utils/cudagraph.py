@@ -1,4 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
@@ -37,6 +38,9 @@ class CudaGraphMeta:
     decode_query_len: int = 1
     use_flash_mla: bool = False
     use_fa3_decoding: bool = False
+    block_size: int = 1
+    use_delayed_cache: bool = False
+    max_tiles_per_seq: int = 0
 
 
 class CudaGraphMixin:
@@ -102,6 +106,14 @@ class CudaGraphMixin:
         input_buffers['cu_seqlens'] = torch.zeros(2, max_batches + 1, dtype=torch.int32, device=device)
         input_buffers['cu_seqlens_q'] = input_buffers['cu_seqlens'][0]
         input_buffers['cu_seqlens_k'] = input_buffers['cu_seqlens'][1]
+
+        if graph_meta.use_delayed_cache:
+            input_buffers['processing_indices'] = torch.zeros(max_tokens, dtype=torch.long, device=device)
+            max_tiles_per_seq = self._get_max_tiles_per_seq(graph_meta)
+            graph_meta.max_tiles_per_seq = max_tiles_per_seq
+            total_tiles = max_tiles_per_seq * max_batches
+            input_buffers['seq_tile_offsets'] = torch.zeros(max_batches, dtype=torch.int32, device=device)
+            input_buffers['tile_to_seq'] = torch.zeros(total_tiles, dtype=torch.int32, device=device)
 
         return input_buffers
 
@@ -177,6 +189,23 @@ class CudaGraphMixin:
             input_buffers['scheduler_metadata'][:batch_size + 1].copy_(scheduler_metadata[:batch_size + 1])
             attn_metadata.scheduler_metadata = input_buffers['scheduler_metadata']
 
+        if graph_meta.use_delayed_cache:
+            proc_indices = attn_metadata.processing_indices
+            proc_buf = input_buffers['processing_indices']
+            proc_len = proc_indices.numel()
+            proc_buf[:proc_len].copy_(proc_indices)
+            attn_metadata.processing_indices = proc_buf
+            tile_to_seq = attn_metadata.tile_to_seq
+            seq_tile_offsets = attn_metadata.seq_tile_offsets
+            tile_buf = input_buffers['tile_to_seq']
+            tile_buf.zero_()
+            tile_buf[:tile_to_seq.numel()] = tile_to_seq
+            offset_buf = input_buffers['seq_tile_offsets']
+            offset_buf.zero_()
+            offset_buf[:seq_tile_offsets.numel()] = seq_tile_offsets
+            attn_metadata.tile_to_seq = tile_buf
+            attn_metadata.seq_tile_offsets = offset_buf
+
         new_inputs = dict(
             past_key_values=past_key_values,
             attn_metadata=attn_metadata,
@@ -218,3 +247,12 @@ class CudaGraphMixin:
         if output_buffers.get('all_routed_experts', None) is not None:
             outputs['all_routed_experts'] = output_buffers['all_routed_experts'][:num_tokens, ...].clone()
         return outputs
+
+    def _get_max_tiles_per_seq(self, graph_meta: CudaGraphMeta) -> int:
+        """Estimate max ragged tiles per sequence used by delayed cache kernels."""
+        kv_group_num = max(1, self.config.num_attention_heads // self.config.num_key_value_heads)
+        max_query_len = max(1, graph_meta.decode_query_len)
+        heads_per_req = max(1, kv_group_num * max_query_len)
+        block_size = max(1, graph_meta.block_size)
+        block_h = max(16, min(block_size, next_power_of_2(heads_per_req)))
+        return max(1, math.ceil(heads_per_req / block_h))
