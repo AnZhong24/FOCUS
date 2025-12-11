@@ -513,8 +513,6 @@ class StepContext:
         else:
             kv_seqlens = q_seqlens + history_seqlens
         kv_seqlens -= num_ignored_history
-        if inputs.is_dummy:
-            kv_seqlens = torch.zeros_like(kv_seqlens)
 
         focus_view = None
         if focus_params.enabled:

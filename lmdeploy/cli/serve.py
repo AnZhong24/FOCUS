@@ -244,6 +244,7 @@ class SubCliServe:
                 dllm_enable_focus=args.dllm_enable_focus,
                 dllm_focus_alpha=args.dllm_focus_alpha,
                 dllm_track=args.dllm_track,
+                distributed_executor_backend=args.distributed_executor_backend,
             )
         else:
             from lmdeploy.messages import TurbomindEngineConfig
