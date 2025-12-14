@@ -63,7 +63,13 @@ class DLLMStrategyFactory(StrategyFactoryBase):
     def build_model_inputs_strategy(self) -> 'ModelInputsStrategy':
         """Build model inputs strategy."""
         from .model_inputs import DLLMModelInputsStrategy
-        return DLLMModelInputsStrategy(block_size=self.dllm_block_length)
+        return DLLMModelInputsStrategy(
+            block_size=self.dllm_block_length,
+            enable_delayed_cache=self.dllm_config.enable_delayed_cache,
+            enable_focus=self.dllm_config.enable_focus,
+            num_attention_heads=self.model_config.num_attention_heads,
+            num_key_value_heads=self.model_config.num_key_value_heads,
+        )
 
     def build_model_agent_strategy(self) -> 'ModelAgentStrategy':
         """Build model agent strategy."""

@@ -41,6 +41,9 @@ class CudaGraphMeta:
     block_size: int = 1
     use_delayed_cache: bool = False
     max_tiles_per_seq: int = 0
+    # Maximum batch size for buffer allocation (may differ from max_batchs
+    # in the graph key to allow reusing warmup graphs for delayed cache).
+    max_buffer_batch_size: int = None
 
 
 class CudaGraphMixin:
@@ -70,6 +73,9 @@ class CudaGraphMixin:
     def make_buffers_cudagraph(self, graph_meta: CudaGraphMeta, *args, **kwargs) -> BuffType:
         """Make cudagraph buffers from forward inputs."""
         max_batches = graph_meta.max_batchs
+        # For delayed cache, use the larger buffer batch size to allow graph reuse.
+        if graph_meta.use_delayed_cache:
+            max_batches = graph_meta.max_buffer_batch_size
         max_tokens = graph_meta.max_tokens
         num_blocks = graph_meta.num_blocks
         device = graph_meta.device
@@ -143,6 +149,8 @@ class CudaGraphMixin:
         input_buffers['qkv_lens'][:, :batch_size] = qkv
         input_buffers['cu_seqlens_q'][1:batch_size + 1] = input_buffers['q_seqlens'][:batch_size].cumsum(0)
         input_buffers['cu_seqlens_k'][1:batch_size + 1] = input_buffers['kv_seqlens'][:batch_size].cumsum(0)
+        # fill_seqlens is used to control KV fill; keep it on the static
+        input_buffers['fill_seqlens'][:batch_size] = q_seqlens
         if inputs_embeds is not None:
             emb_size = inputs_embeds.size(-1)
             if 'inputs_embeds' not in input_buffers:
@@ -158,7 +166,11 @@ class CudaGraphMixin:
         attn_metadata.kv_seqlens = input_buffers['kv_seqlens']
         attn_metadata.cu_seqlens_q = input_buffers['cu_seqlens_q']
         attn_metadata.cu_seqlens_k = input_buffers['cu_seqlens_k']
-        attn_metadata.max_q_seqlen = graph_meta.max_tokens // graph_meta.max_batchs
+        attn_metadata.fill_seqlens = input_buffers['fill_seqlens']
+        # NOTE: delayed-cache decoding uses ragged kernels which require
+        # `max_q_seqlen` to match the host-side ragged tile metadata builder.
+        if not graph_meta.use_delayed_cache:
+            attn_metadata.max_q_seqlen = graph_meta.max_tokens // graph_meta.max_batchs
 
         if graph_meta.use_flash_mla is True:
             import flash_mla
@@ -195,6 +207,7 @@ class CudaGraphMixin:
             proc_len = proc_indices.numel()
             proc_buf[:proc_len].copy_(proc_indices)
             attn_metadata.processing_indices = proc_buf
+
             tile_to_seq = attn_metadata.tile_to_seq
             seq_tile_offsets = attn_metadata.seq_tile_offsets
             tile_buf = input_buffers['tile_to_seq']

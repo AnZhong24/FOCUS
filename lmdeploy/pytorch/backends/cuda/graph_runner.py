@@ -1,7 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import functools
 import math
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch.profiler import record_function
@@ -73,6 +73,7 @@ class CUDASingleGraphRunner:
         decode_query_len: int = 1,
         block_size: int = 1,
         use_delayed_cache: bool = False,
+        max_buffer_batch_size: int = None,
     ):
         self.model = model
         self.ctx_mgr = model.ctx_mgr
@@ -92,6 +93,7 @@ class CUDASingleGraphRunner:
             use_fa3_decoding=model_config.model_paradigm == 'ar_spec',
             block_size=block_size,
             use_delayed_cache=use_delayed_cache,
+            max_buffer_batch_size=max_buffer_batch_size,
         )
         self.device = device
         self.max_batches = max_batches
@@ -163,6 +165,7 @@ class CUDAGraphRunner(GraphRunner):
         build_ctx = model.ctx_mgr.build_ctx
         strategy_factory: StrategyFactoryBase = build_ctx.strategy_factory
         self.cudagraph_strategy = strategy_factory.build_cudagraph_strategy()
+        self._cached_capture_batch_sizes: Optional[List[int]] = None
 
     def check_enable_graph(self):
         """Check enable graph."""
@@ -212,26 +215,35 @@ class CUDAGraphRunner(GraphRunner):
         # for draft model to distinguish inputs from target model and itself
         num_tokens = input_ids.size(1)
         use_delayed_cache = context.use_delayed_cache
-        if use_delayed_cache:
-            token_bucket = self.cudagraph_strategy.get_capture_token_bucket(num_tokens)
-            query_key = token_bucket
-        else:
-            token_bucket = num_tokens
-            query_key = num_tokens // origin_batch_size
-        decode_query_len = context.max_q_seqlen
-        if decode_query_len is None:
-            decode_query_len = math.ceil(num_tokens / max(origin_batch_size, 1))
+        is_dllm_paradigm = self.model_config.model_paradigm == 'dllm'
+
+        # DLLM + delayed-cache: key only by rounded total tokens (bucket).
+        # (Batch-size rounding via batch*block is for vanilla DLLM only.)
+        if is_dllm_paradigm and use_delayed_cache:
+            # Use block_size as query_key (same as vanilla DLLM) to enable
+            # reusing warmup graphs.
+            block_size = self.cudagraph_strategy.block_size
+            query_key = block_size
+
+            # Use ceil(num_tokens / block_size) as the batch_size key to allow
+            # warmup graphs to be reused across different actual batch sizes.
+            # Round to the nearest captured graph size.
+            raw_batch_size = math.ceil(num_tokens / block_size)
+            batch_size = self._round_capture_batch_size(raw_batch_size)
+            enable_microbatch = False
+            return (batch_size, is_decoding, enable_microbatch, query_key)
+
+        query_key = num_tokens // origin_batch_size
         if meta.padding_batch_size is None:
             batch_size = self._get_capture_tokens(origin_batch_size, origin_batch_size=origin_batch_size)
         else:
             batch_size = self._get_capture_tokens(meta.padding_batch_size, origin_batch_size=origin_batch_size)
-        return (batch_size, is_decoding, enable_microbatch, query_key, decode_query_len, use_delayed_cache)
+        return (batch_size, is_decoding, enable_microbatch, query_key)
 
-    def _get_max_tokens(self, graph_key: tuple, input_ids: torch.Tensor, q_seqlens: torch.Tensor):
+    def _get_max_tokens(self, graph_key: tuple, input_ids: torch.Tensor, q_seqlens: torch.Tensor, use_delayed_cache: bool):
         max_batches = graph_key[0]
         is_decoding = graph_key[1]
         assert is_decoding
-        use_delayed_cache = graph_key[5] if len(graph_key) > 5 else False
         if use_delayed_cache:
             num_tokens = input_ids.size(1)
             max_tokens = self.cudagraph_strategy.get_capture_token_bucket(num_tokens)
@@ -252,14 +264,101 @@ class CUDAGraphRunner(GraphRunner):
                 output = self.model(**kwargs)
                 return self.model.make_output_buffers(output)
 
+        # FOCUS changes tensor shapes inside layer 1. When enabled, run the
+        # prefix (layers 0-1) eagerly to perform token eviction, then capture
+        # and replay a CUDA graph for the remaining suffix.
+        context = self.ctx_mgr.current_context()
+        if context.is_decoding and context.focus_enabled():
+            prefix_fn = self.model.forward_focus_prefix
+            suffix_fn = self.model.get_focus_suffix_model
+
+            # stage 1: eager prefix (includes FOCUS pruning)
+            hidden_states, residual, query_states = prefix_fn(**kwargs)
+
+            # updated/pruned inputs live on the context
+            pruned_input_ids = context.input_ids
+            pruned_position_ids = context.position_ids
+            pruned_attn_metadata = context.attn_metadata
+
+            # graph key based on post-pruning (stable) shapes
+            suffix_graph_key = self.get_graph_key(
+                input_ids=pruned_input_ids,
+                position_ids=pruned_position_ids,
+                past_key_values=kwargs['past_key_values'],
+                attn_metadata=pruned_attn_metadata,
+                inputs_embeds=None,
+            )
+            max_batches = suffix_graph_key[0]
+            is_decoding = suffix_graph_key[1]
+            use_delayed_cache = getattr(pruned_attn_metadata, 'use_delayed_cache', False)
+            decode_query_len = suffix_graph_key[3]
+
+            runner = self._runner_map.get(suffix_graph_key, None)
+            if runner is None:
+                max_tokens = self._get_max_tokens(suffix_graph_key,
+                                                  pruned_input_ids,
+                                                  pruned_attn_metadata.q_seqlens,
+                                                  use_delayed_cache=use_delayed_cache)
+                q_max = int(pruned_attn_metadata.q_seqlens.max().item())
+                print('[focus-cudagraph] capture suffix graph',
+                      'orig_tokens=', int(kwargs['input_ids'].size(1)),
+                      'pruned_tokens=', int(pruned_input_ids.size(1)),
+                      'batch=', int(pruned_attn_metadata.q_seqlens.size(0)),
+                      'q_max=', q_max,
+                      'meta_max_q=', getattr(pruned_attn_metadata, 'max_q_seqlen', None),
+                      'max_tokens=', int(max_tokens),
+                      'key=', suffix_graph_key)
+                suffix_model = suffix_fn()
+                runner = CUDASingleGraphRunner(
+                    suffix_model,
+                    max_batches=max_batches,
+                    max_tokens=max_tokens,
+                    num_blocks=self.num_blocks,
+                    is_decoding=is_decoding,
+                    pool=self.graph_pool_handle,
+                    model_config=self.model_config,
+                    device=self.device,
+                    decode_query_len=decode_query_len,
+                    block_size=self.cache_config.block_size,
+                    use_delayed_cache=use_delayed_cache,
+                    max_buffer_batch_size=self.max_batches if use_delayed_cache else None,
+                )
+                output = runner.capture(
+                    input_ids=pruned_input_ids,
+                    position_ids=pruned_position_ids,
+                    past_key_values=kwargs['past_key_values'],
+                    attn_metadata=pruned_attn_metadata,
+                    inputs_embeds=None,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    query_states=query_states,
+                )
+                self._runner_map[suffix_graph_key] = runner
+                return output
+            else:
+                output = runner.forward(
+                    input_ids=pruned_input_ids,
+                    position_ids=pruned_position_ids,
+                    past_key_values=kwargs['past_key_values'],
+                    attn_metadata=pruned_attn_metadata,
+                    inputs_embeds=None,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    query_states=query_states,
+                )
+                return output
+
         graph_key = self.get_graph_key(**kwargs)
         max_batches = graph_key[0]
         is_decoding = graph_key[1]
-        decode_query_len = graph_key[4]
-        use_delayed_cache = graph_key[5] if len(graph_key) > 5 else False
+        use_delayed_cache = kwargs['attn_metadata'].use_delayed_cache
+        decode_query_len = graph_key[3]
         runner = self._runner_map.get(graph_key, None)
         if runner is None:
-            max_tokens = self._get_max_tokens(graph_key, kwargs['input_ids'], kwargs['attn_metadata'].q_seqlens)
+            max_tokens = self._get_max_tokens(graph_key,
+                                              kwargs['input_ids'],
+                                              kwargs['attn_metadata'].q_seqlens,
+                                              use_delayed_cache=use_delayed_cache)
             runner = CUDASingleGraphRunner(
                 self.model,
                 max_batches=max_batches,
@@ -272,6 +371,7 @@ class CUDAGraphRunner(GraphRunner):
                 decode_query_len=decode_query_len,
                 block_size=self.cache_config.block_size,
                 use_delayed_cache=use_delayed_cache,
+                max_buffer_batch_size=self.max_batches if use_delayed_cache else None,
             )
             output = runner.capture(**kwargs)
             self._runner_map[graph_key] = runner
@@ -326,4 +426,32 @@ class CUDAGraphRunner(GraphRunner):
 
     def get_capture_batch_sizes(self) -> List[int]:
         """Capture batch sizes."""
-        return _get_capture_batch_size_impl(self.cache_config.max_batches)
+        if self._cached_capture_batch_sizes is not None:
+            return self._cached_capture_batch_sizes
+
+        max_batches = self.cache_config.max_batches
+        strategy = self.cudagraph_strategy
+
+        # DLLM uses a total-token bucketing rule (see DLLMCudagraphStrategy) that
+        # can map many origin batch sizes to intermediate capture batch sizes
+        # (e.g. multiples of 8 when block_size=32). Warmup should pre-capture
+        # those buckets to avoid late graph captures during benchmarking.
+        if self.model_config.model_paradigm == 'dllm':
+            capture_func = lambda x: x
+            sizes = set()
+            for origin_batch_size in range(1, max_batches + 1):
+                cap = int(
+                    strategy.get_capture_batch_size(
+                        target_batch_size=origin_batch_size,
+                        origin_batch_size=origin_batch_size,
+                        capture_func=capture_func,
+                    ))
+                if 1 <= cap <= max_batches:
+                    sizes.add(cap)
+            sizes.add(1)
+            sizes.add(max_batches)
+            self._cached_capture_batch_sizes = sorted(sizes)
+            return self._cached_capture_batch_sizes
+
+        self._cached_capture_batch_sizes = _get_capture_batch_size_impl(max_batches)
+        return self._cached_capture_batch_sizes

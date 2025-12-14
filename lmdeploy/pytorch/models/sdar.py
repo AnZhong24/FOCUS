@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 
 from typing import Any, Iterable, List, Optional, Tuple
+import weakref
 
 import torch
 import torch.nn.functional as F
@@ -15,7 +16,7 @@ from lmdeploy.pytorch.weight_loader.model_weight_loader import load_weight
 from lmdeploy.pytorch.kernels.cuda.focus import (focus_compact_states, focus_compute_targets,
                                                  focus_importance_ragged, focus_select_and_enforce_ragged)
 
-from .utils.cudagraph import CudaGraphMixin
+from .utils.cudagraph import CudaGraphMeta, CudaGraphMixin
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -157,8 +158,8 @@ class SDARAttention(nn.Module):
                 new_q_lens,
             )
             context.update_processing_view(new_proc_indices, new_q_lens, new_q_lens_host)
-            torch.cuda.nvtx.range_pop()
             attn_metadata = context.attn_metadata
+            torch.cuda.nvtx.range_pop()
 
         # attention
         if focus_fill_only:
@@ -317,6 +318,104 @@ class SDARAttention(nn.Module):
         context.rotary_pos_emb = new_rotary
         return query_states, key_states, value_states, attn_output, new_residual, new_proc_indices, new_q_lens, new_q_lens_host
 
+    def forward_focus_qkv_and_prune(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_pos_emb: Tuple[torch.FloatTensor, torch.FloatTensor],
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        attn_metadata: Any = None,
+        residual: Optional[torch.Tensor] = None,
+    ):
+        """Forward through QKV, norms, rotary, and FOCUS pruning for layer 1.
+
+        This is the prefix part that runs eagerly before CUDA graph capture.
+        Returns compacted query_states, hidden_states, and residual for the suffix.
+        """
+        context = self._get_context()
+        updated_residual = residual
+
+        # qkv proj
+        qkv_states = self.qkv_proj(hidden_states)
+        qkv_states = qkv_states.flatten(0, -2)
+        query_states, key_states, value_states = self.qkv_proj.split_qkv(qkv_states)
+
+        # apply q, k norm
+        query_states = self.q_norm(query_states)
+        key_states = self.k_norm(key_states)
+
+        # apply rotary embedding
+        cos, sin = rotary_pos_emb
+        query_states, key_states = self.apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+        k_cache = past_key_value[0]
+        v_cache = past_key_value[1]
+        has_scales = len(past_key_value) > 2
+        k_scales = None if not has_scales else past_key_value[2]
+        v_scales = None if not has_scales else past_key_value[3]
+
+        # Prepare pruning
+        new_q_lens = torch.zeros_like(context.q_seqlens)
+        torch.cuda.nvtx.range_push("self._prepare_focus_pruning")
+        retain_processing_mask = self._prepare_focus_pruning(context, query_states, key_states)
+        torch.cuda.nvtx.range_pop()
+
+        # Fill KV cache before pruning
+        self.attn_fwd.forward_only_fill_kv(key_states, value_states, k_cache, v_cache, attn_metadata,
+                                           k_scales_zeros=k_scales, v_scales_zeros=v_scales)
+
+        # Apply pruning
+        torch.cuda.nvtx.range_push("self._apply_focus_pruning")
+        (query_states, key_states, value_states, hidden_states, updated_residual,
+            new_proc_indices, new_q_lens, new_q_lens_host) = self._apply_focus_pruning(
+            context,
+            hidden_states,
+            query_states,
+            key_states,
+            value_states,
+            updated_residual,
+            retain_processing_mask,
+            new_q_lens,
+        )
+        context.update_processing_view(new_proc_indices, new_q_lens, new_q_lens_host)
+        torch.cuda.nvtx.range_pop()
+
+        return query_states, hidden_states, updated_residual
+
+    def forward_focus_attention(
+        self,
+        query_states: torch.Tensor,
+        hidden_states: torch.Tensor,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        attn_metadata: Any = None,
+        residual: Optional[torch.Tensor] = None,
+    ):
+        """Forward through attention and o_proj for layer 1 after FOCUS pruning.
+
+        This is the suffix part that can be captured in CUDA graph.
+        """
+        k_cache = past_key_value[0]
+        v_cache = past_key_value[1]
+        has_scales = len(past_key_value) > 2
+        k_scales = None if not has_scales else past_key_value[2]
+        v_scales = None if not has_scales else past_key_value[3]
+
+        # attention
+        attn_output = self.attn_fwd.forward_only_attention(
+            query_states,
+            k_cache,
+            v_cache,
+            attn_metadata,
+            k_scales_zeros=k_scales,
+            v_scales_zeros=v_scales,
+            inplace=True,
+        )
+        attn_output = attn_output.reshape(*hidden_states.shape[:-1], -1)
+
+        # o proj
+        attn_output = self.o_proj(attn_output)
+        return attn_output, residual
+
+
 class SDARMLP(nn.Module):
     """mlp."""
 
@@ -423,6 +522,58 @@ class SDARDecoderLayer(nn.Module):
         outputs = (hidden_states, residual)
         return outputs
 
+    def forward_focus_prefix(
+        self,
+        hidden_states: torch.Tensor,
+        rotary_pos_emb: Tuple[torch.FloatTensor, torch.FloatTensor],
+        past_key_value: Optional[List[torch.FloatTensor]],
+        residual: torch.Tensor,
+        attn_metadata: Any = None,
+    ):
+        """Forward the prefix part of layer 1 with FOCUS.
+
+        Does layernorm, QKV projection, and pruning. Returns compacted states for the suffix.
+        This runs eagerly before CUDA graph capture.
+        """
+        hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        query_states, hidden_states, residual = self.self_attn.forward_focus_qkv_and_prune(
+            hidden_states=hidden_states,
+            rotary_pos_emb=rotary_pos_emb,
+            past_key_value=past_key_value,
+            attn_metadata=attn_metadata,
+            residual=residual,
+        )
+
+        return query_states, hidden_states, residual
+
+    def forward_focus_suffix(
+        self,
+        query_states: torch.Tensor,
+        hidden_states: torch.Tensor,
+        past_key_value: Optional[List[torch.FloatTensor]],
+        residual: torch.Tensor,
+        attn_metadata: Any = None,
+    ):
+        """Forward the suffix part of layer 1 with FOCUS.
+
+        Does attention, o_proj, post-attention layernorm, and MLP.
+        This can be captured in CUDA graph.
+        """
+        hidden_states, residual = self.self_attn.forward_focus_attention(
+            query_states=query_states,
+            hidden_states=hidden_states,
+            past_key_value=past_key_value,
+            attn_metadata=attn_metadata,
+            residual=residual,
+        )
+
+        # Fully Connected
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+
+        return hidden_states, residual
+
 
 class SDARModel(nn.Module):
     """model."""
@@ -505,6 +656,60 @@ class SDARModel(nn.Module):
 
         return hidden_states
 
+    def forward_focus_prefix(
+        self,
+        input_ids: torch.LongTensor,
+        position_ids: torch.LongTensor,
+        past_key_values: List[List[torch.Tensor]],
+        attn_metadata: Any = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+    ):
+        """Run the prefix part of the first two decoder layers eagerly.
+
+        This helper is used by the CUDA graph runner when FOCUS is enabled.
+        FOCUS prunes tokens inside layer 1, so we execute layer 0 fully and
+        layer 1's QKV/pruning eagerly, then capture the remaining suffix
+        (layer 1's attention + layers 2+) with fixed shapes.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: (hidden_states, residual, query_states)
+            where query_states is the compacted query for layer 1's attention.
+        """
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        hidden_states = inputs_embeds
+
+        # initial rotary embedding (pre-pruning)
+        cos, sin = self.rotary_emb(hidden_states, position_ids)
+        cos, sin = cos[0], sin[0]
+        rotary_pos_emb = (cos, sin)
+        context = get_step_ctx_manager().current_context()
+        if context is not None:
+            context.rotary_pos_emb = rotary_pos_emb
+
+        residual = None
+        # Layer 0: full forward
+        hidden_states, residual = self.layers[0](
+            hidden_states,
+            rotary_pos_emb=rotary_pos_emb,
+            past_key_value=past_key_values[0],
+            residual=residual,
+            attn_metadata=attn_metadata,
+        )
+
+        # Layer 1: only prefix (QKV projection, norms, rotary, pruning)
+        # The attention and o_proj will be done in the suffix (CUDA graph)
+        query_states, hidden_states, residual = self.layers[1].forward_focus_prefix(
+            hidden_states,
+            rotary_pos_emb=rotary_pos_emb,
+            past_key_value=past_key_values[1],
+            residual=residual,
+            attn_metadata=attn_metadata,
+        )
+
+        return hidden_states, residual, query_states
+
     def get_input_embeddings(self):
         """Get input embeddings."""
         return self.embed_tokens
@@ -550,6 +755,7 @@ class SDARForCausalLM(nn.Module, CudaGraphMixin):
                                             bias=False,
                                             dtype=dtype,
                                             device=device)
+        self._focus_suffix_model: Optional[nn.Module] = None
 
     def forward(
         self,
@@ -560,6 +766,9 @@ class SDARForCausalLM(nn.Module, CudaGraphMixin):
         inputs_embeds: torch.Tensor = None,
         **kwargs,
     ):
+        # context = get_step_ctx_manager().current_context()
+        # if context.is_decoding:
+        #     print("batch_size:", attn_metadata.q_seqlens.size(0), "num_tokens:", input_ids.size(1))
         """Model forward, return logits."""
         hidden_states = self.model(
             input_ids=input_ids,
@@ -612,6 +821,22 @@ class SDARForCausalLM(nn.Module, CudaGraphMixin):
             inputs_embeds=inputs_embeds,
         )
 
+    def forward_focus_prefix(self, **kwargs):
+        """Expose SDARModel.forward_focus_prefix."""
+        return self.model.forward_focus_prefix(**kwargs)
+
+    def get_focus_suffix_model(self):
+        """Build or return a cudagraph-compatible suffix module.
+
+        The suffix runs layer 1's attention/o_proj (using query_states from prefix),
+        followed by decoder layers from layer 2 to the end. It inherits
+        :class:`CudaGraphMixin` so the CUDA graph runner can allocate and fill
+        static buffers.
+        """
+        if self._focus_suffix_model is None:
+            self._focus_suffix_model = SDARPostFocusSuffix(self)
+        return self._focus_suffix_model
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights."""
         # modify from vllm
@@ -643,3 +868,185 @@ class SDARForCausalLM(nn.Module, CudaGraphMixin):
             else:
                 param = params_dict[name]
                 load_weight(param, loaded_weight)
+
+
+class SDARPostFocusSuffix(nn.Module, CudaGraphMixin):
+    """Suffix of SDAR used for CUDA graph after FOCUS eviction.
+
+    This module takes pruned hidden_states/residual/query_states (after layer 1's
+    QKV projection and pruning) and runs layer 1's attention + o_proj, followed by
+    the remaining decoder layers and final norm. Input tensors are padded to
+    ``graph_meta.max_tokens`` so CUDA graph shapes stay fixed.
+    """
+
+    def __init__(self, parent: SDARForCausalLM):
+        super().__init__()
+        # Keep a weak reference to avoid registering the parent as a submodule
+        # (which would create a module cycle).
+        self._parent_ref = weakref.ref(parent)
+        self.ctx_mgr = parent.ctx_mgr
+        self.config = parent.config
+
+    def make_buffers_cudagraph(self, graph_meta: CudaGraphMeta, **kwargs):
+        # FOCUS does not need input_ids in the graph; allocate only what the
+        # suffix actually consumes to keep buffers light.
+        max_batches = graph_meta.max_buffer_batch_size
+        max_tokens = graph_meta.max_tokens
+        num_blocks = graph_meta.num_blocks
+        device = graph_meta.device
+
+        input_buffers = dict()
+        input_buffers['position_ids'] = torch.zeros((1, max_tokens), dtype=torch.int64, device=device)
+        input_buffers['block_offsets'] = torch.zeros((max_batches, num_blocks), dtype=torch.int32, device=device)
+        input_buffers['qkv_lens'] = torch.zeros(3, max_batches, dtype=torch.int32, device=device)
+
+        input_buffers['q_start_loc'] = input_buffers['qkv_lens'][0]
+        input_buffers['q_seqlens'] = input_buffers['qkv_lens'][1]
+        input_buffers['kv_seqlens'] = input_buffers['qkv_lens'][2]
+        input_buffers['local_adapter_ids'] = torch.zeros(max_batches, dtype=torch.int64, device=device)
+        input_buffers['fill_seqlens'] = torch.zeros(max_batches, dtype=torch.int64, device=device)
+
+        input_buffers['cu_seqlens'] = torch.zeros(2, max_batches + 1, dtype=torch.int32, device=device)
+        input_buffers['cu_seqlens_q'] = input_buffers['cu_seqlens'][0]
+        input_buffers['cu_seqlens_k'] = input_buffers['cu_seqlens'][1]
+
+        input_buffers['processing_indices'] = torch.zeros(max_tokens, dtype=torch.long, device=device)
+        max_tiles_per_seq = self._get_max_tiles_per_seq(graph_meta)
+        graph_meta.max_tiles_per_seq = max_tiles_per_seq
+        total_tiles = max_tiles_per_seq * max_batches
+        input_buffers['seq_tile_offsets'] = torch.zeros(max_batches, dtype=torch.int32, device=device)
+        input_buffers['tile_to_seq'] = torch.zeros(total_tiles, dtype=torch.int32, device=device)
+
+        # Allocate buffers for prefix outputs.
+        hs = kwargs.get('hidden_states', None)
+        res = kwargs.get('residual', None)
+        dtype = (hs.dtype if hs is not None else res.dtype if res is not None else getattr(self.config, 'torch_dtype',
+                                                                                          torch.float16))
+        hidden_size = self.config.hidden_size
+        input_buffers['hidden_states'] = torch.zeros((1, max_tokens, hidden_size), dtype=dtype, device=device)
+        input_buffers['residual'] = torch.zeros((1, max_tokens, hidden_size), dtype=dtype, device=device)
+
+        # Allocate buffer for query_states (for layer 1's attention in CUDA graph).
+        input_buffers['query_states'] = torch.zeros((max_tokens, self.config.num_attention_heads, self.config.head_dim),
+                                                     dtype=dtype, device=device)
+
+        return input_buffers
+
+    def fill_buffers_cudagraph(self, graph_meta: CudaGraphMeta, hidden_states: torch.Tensor,
+                               residual: torch.Tensor, query_states: torch.Tensor = None,
+                               input_ids: torch.Tensor = None,
+                               position_ids: torch.Tensor = None, past_key_values=None, attn_metadata=None,
+                               inputs_embeds: torch.Tensor = None, **kwargs):
+        """Fill static buffers for the FOCUS suffix capture."""
+        block_offsets: torch.Tensor = attn_metadata.block_offsets
+        q_start_loc: torch.Tensor = attn_metadata.q_start_loc
+        q_seqlens: torch.Tensor = attn_metadata.q_seqlens
+        kv_seqlens: torch.Tensor = attn_metadata.kv_seqlens
+        input_buffers = graph_meta.input_buffers
+
+        batch_size, num_blocks = block_offsets.size()
+        num_tokens = hidden_states.size(1)
+        # Fill metadata buffers (no input_ids copy needed for FOCUS).
+        input_buffers['position_ids'][:, :num_tokens] = position_ids
+        input_buffers['block_offsets'][:batch_size, :num_blocks] = block_offsets
+
+        qkv = torch.stack((q_start_loc, q_seqlens, kv_seqlens))
+        input_buffers['qkv_lens'].zero_()
+        input_buffers['q_seqlens'].fill_(graph_meta.max_tokens // graph_meta.max_batchs)
+        input_buffers['qkv_lens'][:, :batch_size] = qkv
+        input_buffers['cu_seqlens_q'][1:batch_size + 1] = input_buffers['q_seqlens'][:batch_size].cumsum(0)
+        input_buffers['cu_seqlens_k'][1:batch_size + 1] = input_buffers['kv_seqlens'][:batch_size].cumsum(0)
+        input_buffers['fill_seqlens'][:batch_size] = q_seqlens
+
+        new_inputs = dict(
+            past_key_values=past_key_values,
+            attn_metadata=attn_metadata,
+        )
+
+        # create inputs
+        attn_metadata.block_offsets = input_buffers['block_offsets']
+        attn_metadata.q_start_loc = input_buffers['q_start_loc']
+        attn_metadata.q_seqlens = input_buffers['q_seqlens']
+        attn_metadata.kv_seqlens = input_buffers['kv_seqlens']
+        attn_metadata.cu_seqlens_q = input_buffers['cu_seqlens_q']
+        attn_metadata.cu_seqlens_k = input_buffers['cu_seqlens_k']
+        attn_metadata.fill_seqlens = input_buffers['fill_seqlens']
+
+        proc_indices = attn_metadata.processing_indices
+        proc_buf = input_buffers['processing_indices']
+        proc_buf[:proc_indices.numel()] = proc_indices
+        attn_metadata.processing_indices = proc_buf
+
+        tile_to_seq = attn_metadata.tile_to_seq
+        seq_tile_offsets = attn_metadata.seq_tile_offsets
+        tile_buf = input_buffers['tile_to_seq']
+        tile_buf.zero_()
+        tile_buf[:tile_to_seq.numel()] = tile_to_seq
+        offset_buf = input_buffers['seq_tile_offsets']
+        offset_buf.zero_()
+        offset_buf[:seq_tile_offsets.numel()] = seq_tile_offsets
+        attn_metadata.tile_to_seq = tile_buf
+        attn_metadata.seq_tile_offsets = offset_buf
+
+        # Fill prefix outputs.
+        hs_buf = input_buffers['hidden_states']
+        hs_buf[:, :num_tokens] = hidden_states
+        res_buf = input_buffers['residual']
+        res_buf[:, :num_tokens] = residual
+        # Fill query_states for layer 1's attention.
+        qs_buf = input_buffers['query_states']
+        qs_buf[:num_tokens] = query_states
+
+        new_inputs['position_ids'] = input_buffers['position_ids']
+        new_inputs['hidden_states'] = hs_buf
+        new_inputs['residual'] = res_buf
+        new_inputs['query_states'] = qs_buf
+        new_inputs.update(kwargs)
+        return new_inputs
+
+    def forward(
+        self,
+        position_ids: torch.Tensor,
+        past_key_values: List[List[torch.Tensor]],
+        attn_metadata: Any = None,
+        hidden_states: torch.Tensor = None,
+        residual: torch.Tensor = None,
+        query_states: torch.Tensor = None,
+        **kwargs,
+    ):
+        """Run decoder layers from layer 1 onward.
+
+        Runs layer 1's attention suffix (attention + o_proj) plus
+        post-attention layernorm and MLP, then proceeds with layers 2+.
+        """
+        parent = self._parent_ref()
+        # Recompute rotary embeddings for the (padded) pruned inputs.
+        cos, sin = parent.model.rotary_emb(hidden_states, position_ids)
+        cos, sin = cos[0], sin[0]
+        rotary_pos_emb = (cos, sin)
+
+        # Layer 1: run the suffix part (attention + o_proj + post_attn_norm + MLP)
+        past_key_value = past_key_values[1]
+        hidden_states, residual = parent.model.layers[1].forward_focus_suffix(
+            query_states=query_states,
+            hidden_states=hidden_states,
+            past_key_value=past_key_value,
+            residual=residual,
+            attn_metadata=attn_metadata,
+        )
+        # Layers 2+
+        for idx in range(2, len(parent.model.layers)):
+            past_key_value = past_key_values[idx]
+            hidden_states, residual = parent.model.layers[idx](
+                hidden_states,
+                rotary_pos_emb=rotary_pos_emb,
+                past_key_value=past_key_value,
+                residual=residual,
+                attn_metadata=attn_metadata,
+            )
+
+        hidden_states, _ = parent.model.norm(hidden_states, residual)
+        return hidden_states
+
+    # The suffix module reuses parameters from the parent SDARForCausalLM;
+    # it does not own weights and should not be passed to the weight loader.

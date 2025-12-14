@@ -462,7 +462,12 @@ class BaseModelAgent:
 
             # warmup decoding(with cuda graph)
             capture_batch_sizes = self.patched_model.get_capture_batch_sizes()
-            capture_batch_sizes = sorted(capture_batch_sizes, reverse=True)
+            if self.inputs_strategy.enable_focus:
+                focus_cap = (max_batches + 1) // 2
+                capture_batch_sizes = sorted({min(bs, focus_cap) for bs in capture_batch_sizes})
+            else:
+                capture_batch_sizes = sorted(capture_batch_sizes, reverse=True)
+
             for num_tokens in capture_batch_sizes:
                 inputs = self.inputs_strategy.make_dummy(num_tokens,
                                                          is_decoding=True,
