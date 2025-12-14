@@ -299,15 +299,6 @@ class CUDAGraphRunner(GraphRunner):
                                                   pruned_input_ids,
                                                   pruned_attn_metadata.q_seqlens,
                                                   use_delayed_cache=use_delayed_cache)
-                q_max = int(pruned_attn_metadata.q_seqlens.max().item())
-                print('[focus-cudagraph] capture suffix graph',
-                      'orig_tokens=', int(kwargs['input_ids'].size(1)),
-                      'pruned_tokens=', int(pruned_input_ids.size(1)),
-                      'batch=', int(pruned_attn_metadata.q_seqlens.size(0)),
-                      'q_max=', q_max,
-                      'meta_max_q=', getattr(pruned_attn_metadata, 'max_q_seqlen', None),
-                      'max_tokens=', int(max_tokens),
-                      'key=', suffix_graph_key)
                 suffix_model = suffix_fn()
                 runner = CUDASingleGraphRunner(
                     suffix_model,
