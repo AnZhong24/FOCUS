@@ -34,7 +34,7 @@ class HistoryDLLMMask(HistoryTokenIds):
 
 @dataclass
 class FocusInfo:
-    mask_indices: torch.Tensor
+    mask_local_indices: torch.Tensor
     rightmost_processed: int
     avg_decoded_tokens: float
 
@@ -44,18 +44,24 @@ class DelayedCacheState:
     block_length: int
     uncached_positions: torch.Tensor
     needs_warmup: bool = True
+    _full_indices: torch.Tensor = None
 
     @classmethod
     def new(cls, block_length: int):
-        uncached = torch.ones((block_length, ), dtype=torch.bool, pin_memory=True)
-        return cls(block_length=block_length, uncached_positions=uncached)
+        # Keep this on regular host memory:
+        # - Engine copies indices into its own pinned pool buffers anyway.
+        # - Pinning per-sequence buffers adds overhead and can fragment pinned memory.
+        uncached = torch.ones((block_length, ), dtype=torch.bool)
+        full_indices = torch.arange(block_length, dtype=torch.long)
+        return cls(block_length=block_length,
+                   uncached_positions=uncached,
+                   _full_indices=full_indices)
 
     def reset(self):
         self.uncached_positions.fill_(True)
         self.needs_warmup = True
 
     def mark_cached(self, ready_mask: torch.Tensor):
-        ready_mask = ready_mask.to(device=self.uncached_positions.device, dtype=torch.bool)
         self.uncached_positions &= ~ready_mask
 
     def update_from_mask(self, dllm_mask: np.ndarray):
@@ -66,16 +72,14 @@ class DelayedCacheState:
         self.mark_cached(ready)
 
     def get_processing_indices(self) -> torch.Tensor:
-        device = self.uncached_positions.device
+        # Always return a CPU tensor (engine will pack into its pinned pool).
         if self.needs_warmup:
-            indices = torch.arange(self.block_length, dtype=torch.long, device=device)
-        else:
-            indices = self.uncached_positions.nonzero(as_tuple=False).squeeze(-1)
-            if indices.numel() == 0:
-                indices = torch.arange(self.block_length, dtype=torch.long, device=device)
-        if not indices.is_pinned():
-            indices = indices.pin_memory()
-        self.needs_warmup = False
+            self.needs_warmup = False
+            return self._full_indices
+
+        indices = self.uncached_positions.nonzero(as_tuple=False).squeeze(-1)
+        if indices.numel() == 0:
+            return self._full_indices
         return indices
 
 
@@ -176,13 +180,20 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
 
     def get_focus_info(self) -> FocusInfo:
         mask_np = self.dllm_mask
-        mask_tensor = torch.from_numpy(mask_np == DLLM_MASKED)
-        mask_tensor = mask_tensor.to(dtype=torch.bool)
+        masked_positions = np.flatnonzero(mask_np == DLLM_MASKED)
+        if masked_positions.size == 0:
+            mask_local_indices = torch.empty((0, ), dtype=torch.long)
+        else:
+            delayed_state = self._delayed_cache_state
+            uncached_np = delayed_state.uncached_positions.numpy()
+            rank = np.cumsum(uncached_np, dtype=np.int64) - 1
+            local = rank[masked_positions]
+            mask_local_indices = torch.from_numpy(local)
         rightmost = self._focus_state.get_rightmost() if self._focus_state is not None else -1
         avg_tokens = 1.0
         if self._focus_steps > 0:
             avg_tokens = self._focus_token_sum / self._focus_steps
-        return FocusInfo(mask_indices=mask_tensor,
+        return FocusInfo(mask_local_indices=mask_local_indices,
                          rightmost_processed=rightmost,
                          avg_decoded_tokens=avg_tokens)
 

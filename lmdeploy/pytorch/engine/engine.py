@@ -62,6 +62,24 @@ class InferOutput:
     routed_experts: torch.Tensor = None
 
 
+@dataclass
+class _DelayedCachePinnedBuffers:
+    """Pinned host buffers for delayed-cache/FOCUS metadata.
+
+    NOTE: The engine can prefetch the next forward while the current forward is
+    still consuming host tensors, so we keep a small pool of these buffers.
+    """
+
+    max_batches: int
+    max_tokens: int
+    processing_q_lens: torch.Tensor
+    processing_indices: torch.Tensor
+    focus_block_progress: Optional[torch.Tensor] = None
+    focus_avg_tokens: Optional[torch.Tensor] = None
+    focus_mask_seq_offsets: Optional[torch.Tensor] = None
+    focus_mask_indices: Optional[torch.Tensor] = None
+
+
 def _tensorlize_block_offsets(block_offsets, dtype=torch.int32):
     """Tensorlize block_offsets."""
     # copy on numpy is faster than torch.nn.utils.rnn.pad_sequence
@@ -88,10 +106,8 @@ def build_delayed_cache_ragged_metadata(
     block_size: int,
 ):
     """Build ragged delayed-cache metadata on host."""
-    num_heads = model_config.num_attention_heads
-    num_kv_heads = model_config.num_key_value_heads
-    kv_group_num = max(1, num_heads // num_kv_heads)
-    max_q = int(host_q_seqlens.max().item())
+    kv_group_num = model_config.num_attention_heads // model_config.num_key_value_heads
+    max_q = host_q_seqlens.max().item()
     heads_per_req_max = kv_group_num * max_q
     block_h = max(16, min(block_size, _next_power_of_two(heads_per_req_max)))
     heads_per_req = host_q_seqlens * kv_group_num
@@ -99,7 +115,7 @@ def build_delayed_cache_ragged_metadata(
     seq_tile_offsets = torch.cumsum(tiles_per_seq, dim=0, dtype=torch.int32)
     seq_tile_offsets = torch.cat([seq_tile_offsets.new_zeros((1, )), seq_tile_offsets[:-1]])
     seq_tile_offsets = seq_tile_offsets.contiguous()
-    total_tiles = int(tiles_per_seq.sum().item())
+    total_tiles = tiles_per_seq.sum().item()
     seq_ids = torch.arange(host_q_seqlens.numel(), dtype=torch.int32)
     tile_to_seq = torch.repeat_interleave(seq_ids, tiles_per_seq, output_size=total_tiles)
     return tile_to_seq, seq_tile_offsets, max_q
@@ -500,6 +516,15 @@ class Engine(EngineBase):
 
         self.engine_conn = EngineP2PConnection(self)
 
+        # Reusable pinned buffers for delayed-cache / FOCUS metadata.
+        # Double-buffering is required because the engine may prefetch the next
+        # forward while the current forward is still consuming host tensors.
+        self._delayed_cache_pinned_pool_size = 2
+        self._delayed_cache_pinned_buffers: List[Optional[_DelayedCachePinnedBuffers]] = [
+            None
+        ] * self._delayed_cache_pinned_pool_size
+        self._delayed_cache_pinned_buffer_idx = 0
+
     @classmethod
     def from_pretrained(cls,
                         pretrained_model_name_or_path: str,
@@ -753,6 +778,45 @@ class Engine(EngineBase):
             return torch.int32
         return torch.int64
 
+    def _get_delayed_cache_pinned_buffers(self, max_tokens: int, focus_enabled: bool) -> _DelayedCachePinnedBuffers:
+        """Get a pooled pinned-buffer set for delayed-cache/FOCUS metadata."""
+        max_batches = self.scheduler_config.max_batches
+
+        idx = self._delayed_cache_pinned_buffer_idx
+        self._delayed_cache_pinned_buffer_idx = (idx + 1) % self._delayed_cache_pinned_pool_size
+
+        buf = self._delayed_cache_pinned_buffers[idx]
+        need_capacity = (buf is None or buf.max_batches < max_batches or buf.max_tokens < max_tokens)
+        need_focus = focus_enabled and (buf is None or buf.focus_mask_indices is None
+                                        or buf.focus_block_progress is None or buf.focus_avg_tokens is None)
+        if need_capacity or need_focus:
+            processing_q_lens = torch.empty((max_batches, ), dtype=torch.long, device='cpu', pin_memory=True)
+            processing_indices = torch.empty((max_tokens, ), dtype=torch.long, device='cpu', pin_memory=True)
+
+            focus_block_progress = None
+            focus_avg_tokens = None
+            focus_mask_seq_offsets = None
+            focus_mask_indices = None
+            if focus_enabled:
+                focus_block_progress = torch.empty((max_batches, ), dtype=torch.int32, device='cpu', pin_memory=True)
+                focus_avg_tokens = torch.empty((max_batches, ), dtype=torch.float32, device='cpu', pin_memory=True)
+                focus_mask_seq_offsets = torch.empty((max_batches + 1, ), dtype=torch.int32, device='cpu', pin_memory=True)
+                focus_mask_indices = torch.empty((max_tokens, ), dtype=torch.long, device='cpu', pin_memory=True)
+
+            buf = _DelayedCachePinnedBuffers(
+                max_batches=max_batches,
+                max_tokens=max_tokens,
+                processing_q_lens=processing_q_lens,
+                processing_indices=processing_indices,
+                focus_block_progress=focus_block_progress,
+                focus_avg_tokens=focus_avg_tokens,
+                focus_mask_seq_offsets=focus_mask_seq_offsets,
+                focus_mask_indices=focus_mask_indices,
+            )
+            self._delayed_cache_pinned_buffers[idx] = buf
+
+        return buf
+
     def _create_vision_model_inputs(self, messages: SeqList, model_inputs: ModelInputs):
         """Create vision model inputs."""
         batch_size = len(messages)
@@ -846,47 +910,52 @@ class Engine(EngineBase):
 
         processing_indices = None
         processing_q_lens = None
+        pinned: Optional[_DelayedCachePinnedBuffers] = None
         dllm_cfg = getattr(self.misc_config, 'dllm_config', None)
         enable_delayed = dllm_cfg and dllm_cfg.enable_delayed_cache and is_decoding
         focus_enabled = enable_delayed and dllm_cfg and dllm_cfg.enable_focus
         focus_avg_tensor = None
         if enable_delayed:
-            proc_tensors = []
-            proc_lengths = []
-            focus_block_progress = []
-            focus_avg_tokens = []
-            focus_mask_globals = []
-            focus_mask_indptr = [0]
+            # Build delayed-cache processing view without "cat then pin" patterns.
+            # Reuse pinned output tensors and fill them in-place.
+            dllm_block_len = dllm_cfg.block_length
+            max_total_proc = self.scheduler_config.max_batches * dllm_block_len
+            pinned = self._get_delayed_cache_pinned_buffers(max_total_proc, focus_enabled=focus_enabled)
+            processing_q_lens = pinned.processing_q_lens[:batch_size]
+            processing_indices_buffer = pinned.processing_indices
+            proc_write = 0
+
             focus_mask_global_indices = None
             focus_mask_seq_offsets = None
-            running_proc_offset = 0
-            for msg in messages:
+            if focus_enabled:
+                focus_block_progress = pinned.focus_block_progress[:batch_size]
+                focus_avg_tensor = pinned.focus_avg_tokens[:batch_size]
+                focus_mask_seq_offsets = pinned.focus_mask_seq_offsets[:batch_size + 1]
+                focus_mask_seq_offsets[0] = 0
+                focus_mask_buffer = pinned.focus_mask_indices
+                mask_write = 0
+
+            for msg_idx, msg in enumerate(messages):
                 indices = msg.get_processing_indices()
-                proc_tensors.append(indices)
-                proc_lengths.append(indices.numel())
+                proc_len = indices.numel()
+                processing_q_lens[msg_idx] = proc_len
+                processing_indices_buffer[proc_write:proc_write + proc_len].copy_(indices, non_blocking=False)
+
                 if focus_enabled:
                     focus_info = msg.get_focus_info()
-                    mask_tensor = focus_info.mask_indices.to('cpu', non_blocking=False)
-                    focus_block_progress.append(focus_info.rightmost_processed)
-                    ragged_mask = mask_tensor.index_select(0, indices)
-                    focus_avg_tokens.append(focus_info.avg_decoded_tokens)
-                    local_indices = torch.nonzero(ragged_mask, as_tuple=False).squeeze(-1)
-                    focus_mask_globals.append(local_indices + running_proc_offset)
-                    focus_mask_indptr.append(focus_mask_indptr[-1] + local_indices.numel())
-                running_proc_offset += indices.numel()
-            processing_indices = torch.cat(proc_tensors)
-            processing_q_lens = torch.tensor(proc_lengths, dtype=torch.long)
+                    focus_block_progress[msg_idx] = focus_info.rightmost_processed
+                    focus_avg_tensor[msg_idx] = float(focus_info.avg_decoded_tokens)
+                    local_indices = focus_info.mask_local_indices
+                    local_count = local_indices.numel()
+                    dst = focus_mask_buffer[mask_write:mask_write + local_count]
+                    torch.add(local_indices, proc_write, out=dst)
+                    mask_write += local_count
+                    focus_mask_seq_offsets[msg_idx + 1] = mask_write
+                proc_write += proc_len
+
+            processing_indices = processing_indices_buffer[:proc_write]
             if focus_enabled:
-                total_masked = focus_mask_indptr[-1]
-                if total_masked > 0:
-                    mask_global_tensor = torch.cat(focus_mask_globals).pin_memory()
-                else:
-                    mask_global_tensor = torch.empty((0, ), dtype=torch.long).pin_memory()
-                mask_indptr_tensor = torch.tensor(focus_mask_indptr, dtype=torch.int32).pin_memory()
-                focus_block_progress = torch.tensor(focus_block_progress, dtype=torch.int32).pin_memory()
-                focus_avg_tensor = torch.tensor(focus_avg_tokens, dtype=torch.float32).pin_memory()
-                focus_mask_global_indices = mask_global_tensor
-                focus_mask_seq_offsets = mask_indptr_tensor
+                focus_mask_global_indices = focus_mask_buffer[:mask_write]
 
         kv_seqlens = seq_length + history_lengths
         max_kv_seqlen = kv_seqlens.max().item()

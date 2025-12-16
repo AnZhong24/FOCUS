@@ -144,6 +144,7 @@ class FocusRuntimeView:
     processing_mask_prunable: bool = False
     block_progress_host: torch.LongTensor = None
     block_progress_event: Optional[torch.cuda.Event] = None
+    new_q_lens_host_buffer: Optional[torch.Tensor] = None
     new_q_lens_event: Optional[torch.cuda.Event] = None
 
 
@@ -370,16 +371,19 @@ class ModelInputs:
         return ret
 
 
-def _gather_flat_tensor(tensor: torch.Tensor, full_lengths: torch.Tensor, gathered_lengths: torch.Tensor,
-                        gathered_indices: torch.Tensor) -> torch.Tensor:
-    """Gather ragged per-sequence slices from ``tensor`` using length metadata."""
+def _build_flat_absolute_indices(full_lengths: torch.Tensor, gathered_lengths: torch.Tensor,
+                                 gathered_indices: torch.Tensor) -> torch.Tensor:
+    """Build absolute indices for ragged per-sequence slices.
+
+    The flattened ``gathered_indices`` are assumed to be concatenated in the same
+    order as ``gathered_lengths`` (i.e. seq0 then seq1...). We expand per-sequence
+    base offsets via ``repeat_interleave`` to avoid the more expensive
+    ``bucketize``-based mapping.
+    """
     offsets = torch.cumsum(full_lengths, dim=0) - full_lengths
-    seq_boundaries = torch.cumsum(gathered_lengths, dim=0)
-    positions = torch.arange(gathered_indices.size(0), device=tensor.device, dtype=torch.long)
-    seq_ids = torch.bucketize(positions, seq_boundaries, right=True)
-    expanded_offsets = offsets.index_select(0, seq_ids)
-    absolute_indices = gathered_indices + expanded_offsets
-    return tensor.index_select(-1, absolute_indices)
+    output_size = gathered_indices.numel()
+    expanded_offsets = torch.repeat_interleave(offsets, gathered_lengths, output_size=output_size)
+    return gathered_indices + expanded_offsets
 
 
 @dataclass
@@ -485,12 +489,11 @@ class StepContext:
         if use_delayed_cache:
             q_seqlens = processing_q_lens
             proc_tensor = processing_indices
-            input_ids_tensor = _gather_flat_tensor(inputs.input_ids, seq_length_full, q_seqlens, proc_tensor)
-            position_ids_flat = _gather_flat_tensor(position_ids_flat.unsqueeze(0), seq_length_full, q_seqlens,
-                                                    proc_tensor).squeeze(0)
+            absolute_indices = _build_flat_absolute_indices(seq_length_full, q_seqlens, proc_tensor)
+            input_ids_tensor = inputs.input_ids.index_select(-1, absolute_indices)
+            position_ids_flat = position_ids_flat.index_select(0, absolute_indices)
             if attention_mask_full is not None:
-                attention_mask = _gather_flat_tensor(attention_mask_full.reshape(1, -1), seq_length_full, q_seqlens,
-                                                     proc_tensor)
+                attention_mask = attention_mask_full.reshape(1, -1).index_select(-1, absolute_indices)
             max_q_len_host = inputs.processing_max_q_len
         q_start_loc = q_seqlens.cumsum(0) - q_seqlens
         position_ids = position_ids_flat.reshape(1, -1)
@@ -516,6 +519,16 @@ class StepContext:
 
         focus_view = None
         if focus_params.enabled:
+            q_lens_host_buffer = None
+            capacity = build_ctx.max_batch_size
+            q_lens_host_buffer = build_ctx.focus_new_q_lens_host_buffer
+            if q_lens_host_buffer is None:
+                q_lens_host_buffer = torch.empty((capacity, ),
+                                                  dtype=seq_length_full.dtype,
+                                                  device='cpu',
+                                                  pin_memory=True)
+                build_ctx.focus_new_q_lens_host_buffer = q_lens_host_buffer
+
             avg_tokens_cpu = inputs.focus_avg_tokens
             avg_tokens = avg_tokens_cpu.to(device=device, non_blocking=True)
             mask_global_indices = inputs.focus_mask_global_indices
@@ -540,6 +553,7 @@ class StepContext:
                 processing_mask_max_len=processing_mask_max_len,
                 processing_mask_prunable=should_prune,
                 block_progress_host=block_progress_host,
+                new_q_lens_host_buffer=q_lens_host_buffer,
             )
 
         dllm_track = False
@@ -605,7 +619,7 @@ class StepContext:
 
     def prepare_processing_view(self, new_q_lens: torch.Tensor) -> torch.Tensor:
         view = self.focus_view
-        new_q_lens_host_buffer = torch.empty_like(new_q_lens, device='cpu', pin_memory=True)
+        new_q_lens_host_buffer = view.new_q_lens_host_buffer[:new_q_lens.numel()]
         new_q_lens_host_buffer.copy_(new_q_lens, non_blocking=True)
         event = view.new_q_lens_event
         if event is None:
@@ -613,6 +627,16 @@ class StepContext:
             view.new_q_lens_event = event
         event.record()
         return new_q_lens_host_buffer
+
+    def update_focus_progress_only(self):
+        """Update focus progress without rebuilding the ragged processing view."""
+        view = self.focus_view
+        q_seqlens = self.q_seqlens
+
+        end_offsets = self.q_start_loc + q_seqlens - 1
+        rightmost = self.processing_indices.index_select(0, end_offsets)
+        torch.maximum(view.block_progress, rightmost.to(view.block_progress.dtype), out=view.block_progress)
+        self._stage_focus_progress_host()
 
     def update_processing_view(self, new_proc_indices: torch.Tensor, new_q_lens: torch.Tensor, new_q_lens_host: torch.Tensor):
         """Replace ragged processing view, refresh metadata, and sync focus progress."""
@@ -646,8 +670,8 @@ class StepContext:
             self.model_config,
             self.kv_caches[0][0].size(1),
         )
-        self.attn_metadata.ragged_tile_to_seq = ragged_tile_to_seq.to(self.q_seqlens.device, non_blocking=True)
-        self.attn_metadata.ragged_seq_tile_offsets = ragged_seq_tile_offsets.to(self.q_seqlens.device, non_blocking=True)
+        self.attn_metadata.tile_to_seq = ragged_tile_to_seq.to(self.q_seqlens.device, non_blocking=True)
+        self.attn_metadata.seq_tile_offsets = ragged_seq_tile_offsets.to(self.q_seqlens.device, non_blocking=True)
         self.attn_metadata.max_q_seqlen = max_q_len_host
         self.max_q_seqlen = max_q_len_host
 
@@ -714,6 +738,8 @@ class BuildModelContext:
     enable_return_routed_experts: bool = False
     # Maximum batch size configured for the engine (used for buffer preallocation).
     max_batch_size: int = 1
+    # Persistent pinned host buffer for FOCUS metadata (avoid per-forward allocations).
+    focus_new_q_lens_host_buffer: Optional[torch.Tensor] = None
 
 
 class StepContextManager(CtxMgrBase[StepContext]):

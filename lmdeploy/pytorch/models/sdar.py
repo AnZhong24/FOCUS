@@ -132,34 +132,39 @@ class SDARAttention(nn.Module):
         k_scales = None if not has_scales else past_key_value[2]
         v_scales = None if not has_scales else past_key_value[3]
         focus_fill_only = focus_active and self.layer_idx == 1
-        if focus_active and self.layer_idx == 0:
+        if focus_active and self.layer_idx == 0 and context.focus_view.processing_mask_prunable:
             torch.cuda.nvtx.range_push("self._compute_focus_importance")
             self._compute_focus_importance(context, query_states, key_states)
             torch.cuda.nvtx.range_pop()
         elif focus_fill_only:
-            # For better overlap.
-            new_q_lens = torch.zeros_like(context.q_seqlens)
-            torch.cuda.nvtx.range_push("self._prepare_focus_pruning")
-            retain_processing_mask = self._prepare_focus_pruning(context, query_states, key_states)
-            torch.cuda.nvtx.range_pop()
-            # Preserve the original ragged view for KV fill before pruning.
-            self.attn_fwd.forward_only_fill_kv(key_states, value_states, k_cache, v_cache, attn_metadata,
-                                               k_scales_zeros=k_scales, v_scales_zeros=v_scales)
-            torch.cuda.nvtx.range_push("self._apply_focus_pruning")
-            (query_states, key_states, value_states, hidden_states, updated_residual,
-                new_proc_indices, new_q_lens, new_q_lens_host) = self._apply_focus_pruning(
-                context,
-                hidden_states,
-                query_states,
-                key_states,
-                value_states,
-                updated_residual,
-                retain_processing_mask,
-                new_q_lens,
-            )
-            context.update_processing_view(new_proc_indices, new_q_lens, new_q_lens_host)
-            attn_metadata = context.attn_metadata
-            torch.cuda.nvtx.range_pop()
+            if context.focus_view.processing_mask_prunable:
+                # For better overlap.
+                new_q_lens = torch.zeros_like(context.q_seqlens)
+                torch.cuda.nvtx.range_push("self._prepare_focus_pruning")
+                retain_processing_mask = self._prepare_focus_pruning(context, query_states, key_states)
+                torch.cuda.nvtx.range_pop()
+                # Preserve the original ragged view for KV fill before pruning.
+                self.attn_fwd.forward_only_fill_kv(key_states, value_states, k_cache, v_cache, attn_metadata,
+                                                   k_scales_zeros=k_scales, v_scales_zeros=v_scales)
+                torch.cuda.nvtx.range_push("self._apply_focus_pruning")
+                (query_states, key_states, value_states, hidden_states, updated_residual,
+                    new_proc_indices, new_q_lens, new_q_lens_host) = self._apply_focus_pruning(
+                    context,
+                    hidden_states,
+                    query_states,
+                    key_states,
+                    value_states,
+                    updated_residual,
+                    retain_processing_mask,
+                    new_q_lens,
+                )
+                context.update_processing_view(new_proc_indices, new_q_lens, new_q_lens_host)
+                attn_metadata = context.attn_metadata
+                torch.cuda.nvtx.range_pop()
+            else:
+                context.update_focus_progress_only()
+                self.attn_fwd.forward_only_fill_kv(key_states, value_states, k_cache, v_cache, attn_metadata,
+                                                   k_scales_zeros=k_scales, v_scales_zeros=v_scales)
 
         # attention
         if focus_fill_only:
@@ -352,6 +357,12 @@ class SDARAttention(nn.Module):
         has_scales = len(past_key_value) > 2
         k_scales = None if not has_scales else past_key_value[2]
         v_scales = None if not has_scales else past_key_value[3]
+
+        if not context.focus_view.processing_mask_prunable:
+            context.update_focus_progress_only()
+            self.attn_fwd.forward_only_fill_kv(key_states, value_states, k_cache, v_cache, attn_metadata,
+                                               k_scales_zeros=k_scales, v_scales_zeros=v_scales)
+            return query_states, hidden_states, updated_residual
 
         # Prepare pruning
         new_q_lens = torch.zeros_like(context.q_seqlens)
