@@ -228,8 +228,12 @@ class Engine:
         self.tokenizer = Tokenizer(model_path)
         
         # Automatically detect and use the model's corresponding chat template
-        from lmdeploy.model import ChatTemplateConfig, best_match_model
-        chat_template_name = best_match_model(model_path)
+        from lmdeploy.model import ChatTemplateConfig, MODELS
+        chat_template_name = 'base'
+        for name, model in MODELS.module_dict.items():
+            if model.match(model_path):
+                chat_template_name = name
+                break
         self.chat_template_config = ChatTemplateConfig(model_name=chat_template_name, model_path=model_path)
         self.chat_template = self.chat_template_config.chat_template
         
@@ -367,18 +371,14 @@ class Engine:
             tasks.append(task)
 
         async def _gather_tasks(tasks):
-            return await asyncio.gather(*tasks)
+            profiler.start()
+            ret = await asyncio.gather(*tasks)
+            profiler.finish()
+            return ret
 
         self.pbar = tqdm(total=len(requests))
 
-        event_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(event_loop)
-
-        profiler.start()
-
         asyncio.run(_gather_tasks(tasks))
-
-        profiler.finish()
 
         self.pbar.close()
 

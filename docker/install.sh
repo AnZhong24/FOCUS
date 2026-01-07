@@ -58,9 +58,9 @@ fi
 pip install -U pip wheel setuptools
 
 if [[ "${CUDA_VERSION_SHORT}" = "cu130" ]]; then
-    pip install nvidia-nvshmem-cu13
+    pip install nvidia-nvshmem-cu13==3.4.5
 elif [[ "${CUDA_VERSION_SHORT}" != "cu118" ]]; then
-    pip install nvidia-nvshmem-cu12
+    pip install nvidia-nvshmem-cu12==3.4.5
 fi
 
 pip install torch${TORCH_VERSION} --extra-index-url https://download.pytorch.org/whl/${CUDA_VERSION_SHORT}
@@ -98,6 +98,9 @@ BASE_URL="https://github.com/Dao-AILab/flash-attention/releases/download/v${FA_V
 FULL_URL="${BASE_URL}/${WHEEL}"
 
 pip install "$FULL_URL"
+
+# install requirements/serve.txt dependencies such as timm
+pip install -r /tmp/requirements/serve.txt
 
 # copy nccl
 if [[ "${CUDA_VERSION_SHORT}" = "cu118" ]]; then

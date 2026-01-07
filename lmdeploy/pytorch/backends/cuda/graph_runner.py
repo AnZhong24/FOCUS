@@ -88,8 +88,10 @@ class CUDASingleGraphRunner:
             input_buffers=dict(),
             output_buffers=dict(),
             vocab_size=self.model_config.vocab_size,
+            use_mla_fp8_cache=getattr(self.model_config, 'use_mla_fp8_cache', False),
+            use_flash_mla=getattr(self.model_config, 'use_flash_mla', False),
+            mla_index_topk=getattr(self.model_config, 'mla_index_topk', None),
             decode_query_len=decode_query_len,
-            use_flash_mla=model_config.use_flash_mla,
             use_fa3_decoding=model_config.model_paradigm == 'ar_spec',
             block_size=block_size,
             use_delayed_cache=use_delayed_cache,
@@ -240,6 +242,14 @@ class CUDAGraphRunner(GraphRunner):
             batch_size = self._get_capture_tokens(meta.padding_batch_size, origin_batch_size=origin_batch_size)
         return (batch_size, is_decoding, enable_microbatch, query_key)
 
+    def _prepare_inputs(self, **kwargs):
+        """Prepare inputs."""
+        assert 'attn_metadata' in kwargs, 'attn_metadata is required for cudagraph.'
+        attn_metadata: TritonAttentionMetadata = kwargs['attn_metadata']
+        if not attn_metadata.block_offsets.dtype == torch.int32:
+            attn_metadata.block_offsets = attn_metadata.block_offsets.to(torch.int32)
+        return kwargs
+
     def _get_max_tokens(self, graph_key: tuple, input_ids: torch.Tensor, q_seqlens: torch.Tensor, use_delayed_cache: bool):
         max_batches = graph_key[0]
         is_decoding = graph_key[1]
@@ -257,6 +267,7 @@ class CUDAGraphRunner(GraphRunner):
         if not self.backend_config.eager_mode and get_backend().get_name() == 'cuda':
             self._try_compile_model_once()
 
+        kwargs = self._prepare_inputs(**kwargs)
         enable_graph = self.enable_graph(**kwargs)
 
         if not enable_graph:

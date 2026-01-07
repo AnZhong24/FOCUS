@@ -1,9 +1,9 @@
 import os
 import subprocess
-from subprocess import PIPE, Popen
+from subprocess import PIPE
 
 import allure
-import psutil
+from utils.common_utils import execute_command_with_logging
 from utils.config_utils import _is_bf16_supported_by_device, get_workerid
 from utils.run_restful_chat import health_check
 
@@ -55,12 +55,12 @@ def throughput_test(config, run_id, run_config, cuda_prefix: str = None, worker_
             get_max_cache_entry(model, backend), '--csv ', csv_path
         ])
 
-        returncode, stderr = run_testcase(cmd, benchmark_log)
+        result, stderr = execute_command_with_logging(cmd, benchmark_log)
         allure.attach.file(benchmark_log, attachment_type=allure.attachment_type.TEXT)
 
-        if returncode == 0 and not os.path.isfile(csv_path):
+        if result and not os.path.isfile(csv_path):
             return False, 'result is empty'
-        if returncode != 0:
+        if not result:
             return False, stderr
 
     return True, 'success'
@@ -102,11 +102,11 @@ def longtext_throughput_test(config,
             command += ' --model-format awq'
         command = command + f' --quant-policy {quant_policy}'
 
-    for input_len, out_len, num_prompts, case_name, concurrency in [(1, 32768, 60, '32k', 20),
-                                                                    (1, 65536, 30, '64k', 10),
-                                                                    (65536, 1024, 45, '64k-1k', 15),
+    for input_len, out_len, num_prompts, case_name, concurrency in [(1, 32768, 20, '32k', 20),
+                                                                    (1, 65536, 10, '64k', 10),
+                                                                    (65536, 1024, 15, '64k-1k', 15),
                                                                     (198000, 1024, 3, '198k-1k', 1)]:
-        session_len = input_len + out_len
+        session_len = input_len + out_len + 1
         csv_path = f'{benchmark_path}/longtext_{case_name}_1th.csv'
         benchmark_log = os.path.join(
             log_path, f'benchmark_longtext_throughput_{case_name}' + model.split('/')[1] + worker_id + '.log')
@@ -118,14 +118,14 @@ def longtext_throughput_test(config,
         if concurrency:
             cmd += f' --concurrency {concurrency}'
 
-        returncode, stderr = run_testcase(cmd, benchmark_log)
+        result, stderr = execute_command_with_logging(cmd, benchmark_log)
         allure.attach.file(benchmark_log, attachment_type=allure.attachment_type.TEXT)
 
-        if returncode == 0 and not os.path.isfile(csv_path):
+        if result and not os.path.isfile(csv_path):
             return False, 'result is empty'
-        if returncode != 0:
-            return returncode == 0, stderr
-    return True, ''
+        if not result:
+            return False, stderr
+    return True, 'success'
 
 
 def restful_test(config, run_id, run_config, worker_id: str = '', is_smoke: bool = False):
@@ -287,7 +287,7 @@ def prefixcache_throughput_test(config,
             command = ' '.join([
                 base_command, '--dataset-name random', f'--random-input-len {input_len}',
                 f'--random-output-len {out_len}', '--random-range-ratio 1.0', f'--num-prompts {num_prompts}',
-                '--stream-output', f'--csv {csv_path}'
+                '--stream-output', '--session-len 32768', f'--csv {csv_path}'
             ])
 
             if enable_prefix_caching:
@@ -296,43 +296,14 @@ def prefixcache_throughput_test(config,
             if concurrency:
                 command += f' --concurrency {concurrency}'
 
-            returncode, stderr = run_testcase(command, benchmark_log)
+            result, stderr = execute_command_with_logging(command, benchmark_log)
             allure.attach.file(benchmark_log, attachment_type=allure.attachment_type.TEXT)
 
-            if returncode == 0 and not os.path.isfile(csv_path):
+            if result and not os.path.isfile(csv_path):
                 return False, 'result is empty'
-            if returncode != 0:
-                return returncode == 0, stderr
-
-    return True, ''
-
-
-def run_testcase(cmd, benchmark_log):
-    if os.path.isfile(benchmark_log):
-        write_type = 'a'
-    else:
-        write_type = 'w'
-    with open(benchmark_log, write_type) as f:
-        f.writelines('reproduce command: ' + cmd + '\n')
-        print('reproduce command: ' + cmd)
-        with Popen([cmd], stdin=PIPE, stdout=f, stderr=PIPE, shell=True, text=True, encoding='utf-8') as process:
-            try:
-                stdout, stderr = process.communicate(None)
-            except Exception:
-                kill_process(process.pid)
-                raise
-            except:  # noqa: E722
-                kill_process(process.pid)
-                raise
-            retcode = process.poll()
-    return retcode, stderr
-
-
-def kill_process(pid):
-    parent = psutil.Process(pid)
-    for child in parent.children(recursive=True):
-        child.kill()
-    parent.kill()
+            if not result:
+                return False, stderr
+    return True, 'success'
 
 
 def get_command_with_extra(cmd, cuda_prefix: str = None):

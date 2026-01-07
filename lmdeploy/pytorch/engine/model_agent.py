@@ -1,7 +1,5 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import asyncio
-import base64
-import functools
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, fields
@@ -10,12 +8,14 @@ from os import getenv
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+import pybase64
 import torch
 import torch.distributed as dist
 from torch.profiler import ProfilerActivity, profile, record_function
 
 from lmdeploy.pytorch.consts import DLLM_META_PROCESSED_TOKENS
 from lmdeploy.pytorch.disagg.config import EngineRole
+from lmdeploy.pytorch.utils import wait_for_async_tasks
 from lmdeploy.serve.openai.protocol import UpdateParamsRequest
 from lmdeploy.tokenizer import Tokenizer
 from lmdeploy.utils import FlattenedTensorBucket, FlattenedTensorMetadata, get_logger
@@ -125,10 +125,7 @@ class AgentProfiler:
         self.dp = dist_ctx.dist_config.dp
         self.stream = stream
         self.profiler = None
-        if self.dp == 1:
-            self.name = f'rank[{self.rank}]'
-        else:
-            self.name = f'dp_rank[{self.dp_rank}]'
+        self.name = f'rank[{self.rank}]'
 
         self.delay = envs.torch_profile_delay
         self.duration = envs.torch_profile_duration
@@ -167,7 +164,7 @@ class AgentProfiler:
 
         try:
             self.profiler.stop()
-            rank = self.rank if self.dp == 1 else self.dp_rank
+            rank = self.rank
             dump_path = f'{self.prefix}{rank}.json'
             self.profiler.export_chrome_trace(dump_path)
             logger.warning(f'Profiler {self.name} dump to {dump_path}.')
@@ -236,6 +233,7 @@ def model_forward(
         context = ctx_mgr.build_context(
             inputs=inputs,
             model_config=cache_engine.model_config,
+            cache_config=cache_engine.cache_config,
             kv_caches=cache_engine.gpu_cache,
             state_caches=state_cache_engine.state_caches,
             kv_quant_policy=cache_engine.cache_config.quant_policy,
@@ -350,12 +348,15 @@ class BaseModelAgent:
         monkey_patch_hf_modules_cache()
         self.tokenizer = Tokenizer(model_path).model.model
 
+        # asyncio
         self._pre_in_que = None
         self._in_que = None
         self._out_que = None
         self._background_task = None
         self._preprocess_task = None
+        self.tasks = set()
 
+        # cuda stream
         self.stream = torch.cuda.Stream()
         self.out_stream = torch.cuda.Stream()
         self.cache_stream = torch.cuda.Stream()
@@ -468,6 +469,9 @@ class BaseModelAgent:
             else:
                 capture_batch_sizes = sorted(capture_batch_sizes, reverse=True)
 
+            if self.cache_config.role == EngineRole.Prefill:
+                # do not warmup decoding for prefill engine
+                capture_batch_sizes = []
             for num_tokens in capture_batch_sizes:
                 inputs = self.inputs_strategy.make_dummy(num_tokens,
                                                          is_decoding=True,
@@ -921,22 +925,6 @@ class BaseModelAgent:
             if forward_event is not None:
                 forward_event.clear()
 
-    @staticmethod
-    def _on_finish_callback(task: asyncio.Task, ptasks: asyncio.Task) -> None:
-        """Raise exception on finish."""
-        task_name = task.get_name()
-        try:
-            task.result()
-        except asyncio.CancelledError:
-            logger.debug(f'Task <{task_name}> cancelled.')
-            return
-        except BaseException:
-            logger.exception(f'Task <{task_name}> failed')
-        finally:
-            for ptask in ptasks:
-                if not ptask.done():
-                    ptask.cancel()
-
     def start(self, forward_event: asyncio.Event = None):
         """Start event loop."""
         event_loop = asyncio.get_event_loop()
@@ -944,30 +932,40 @@ class BaseModelAgent:
         self._in_que = asyncio.Queue()
         self._out_que = asyncio.Queue()
 
-        tasks_to_cancel = [asyncio.current_task()]
-
         # forward task
         logger.debug('Create task ModelAgentLoop.')
         self._background_task = event_loop.create_task(self._async_loop_background(forward_event),
                                                        name='ModelAgentLoop')
-        tasks_to_cancel.append(self._background_task)
+        self.tasks.add(self._background_task)
+        self._background_task.add_done_callback(self.tasks.discard)
 
         # preprocess inputs task
         logger.debug('Create task ModelAgentPreprocess.')
         self._preprocess_task = event_loop.create_task(self._async_loop_inputs_preprocess(forward_event),
                                                        name='ModelAgentPreprocess')
-        tasks_to_cancel.append(self._preprocess_task)
+        self.tasks.add(self._preprocess_task)
+        self._preprocess_task.add_done_callback(self.tasks.discard)
 
         # profiler
         self.profiler = AgentProfiler(self.dist_ctx, self.stream)
         self.profiler.create_task()
 
-        # binding done task
-        logger.debug('binding done callback.')
-        backgroup_done_callback = functools.partial(self._on_finish_callback, ptasks=tasks_to_cancel)
-        self._background_task.add_done_callback(backgroup_done_callback)
-        preprocess_done_callback = functools.partial(self._on_finish_callback, ptasks=tasks_to_cancel)
-        self._preprocess_task.add_done_callback(preprocess_done_callback)
+    async def wait_tasks(self):
+        """Wait tasks."""
+        if len(self.tasks) == 0:
+            return
+        try:
+            await wait_for_async_tasks(self.tasks)
+        except asyncio.CancelledError:
+            logger.debug(f'ModelAgent rank[{self.rank}] wait_tasks cancelled.')
+            raise
+        except BaseException as e:
+            # we want to keep logs in both ray logs and engine logs
+            msg = f'ModelAgent rank[{self.rank}] wait_tasks failed'
+            logger.exception(msg)
+            raise e from None
+        finally:
+            logger.debug(f'ModelAgent rank[{self.rank}] wait_tasks cleanup.')
 
     def stop(self):
         """Stop task."""
@@ -977,13 +975,9 @@ class BaseModelAgent:
         if self.profiler is not None:
             self.profiler.dump()
 
-        if self._background_task is not None:
-            if not self._background_task.done():
-                self._background_task.cancel()
-
-        if self._preprocess_task is not None:
-            if not self._preprocess_task.done():
-                self._preprocess_task.cancel()
+        for task in self.tasks:
+            if not task.done():
+                task.cancel()
 
         if self.guided_decoding_manager:
             self.guided_decoding_manager.clear()
@@ -1000,21 +994,13 @@ class BaseModelAgent:
                 await asyncio.sleep(1)
             self.profiler.dump()
 
-        if self._background_task is not None:
-            if not self._background_task.done():
-                self._background_task.cancel()
+        for task in self.tasks:
+            if not task.done():
+                task.cancel()
                 try:
-                    await self._background_task
+                    await task
                 except asyncio.CancelledError:
-                    logger.debug('ModelAgent background task cancelled.')
-
-        if self._preprocess_task is not None:
-            if not self._preprocess_task.done():
-                self._preprocess_task.cancel()
-                try:
-                    await self._preprocess_task
-                except asyncio.CancelledError:
-                    logger.debug('ModelAgent preprocess task cancelled.')
+                    logger.debug(f'ModelAgent {task.get_name()} task cancelled.')
 
         if self.guided_decoding_manager:
             self.guided_decoding_manager.clear()
@@ -1164,7 +1150,7 @@ class BaseModelAgent:
             if isinstance(serialized_data, list):
                 serialized_data = serialized_data[self.dist_ctx.tp_group.rank]
             model = self.patched_model.get_model()
-            weights = ForkingPickler.loads(base64.b64decode(serialized_data))
+            weights = ForkingPickler.loads(pybase64.b64decode(serialized_data))
             if request.load_format == 'flattened_bucket':
                 metadata: List[FlattenedTensorMetadata] = weights['metadata']
                 if metadata:
@@ -1261,6 +1247,13 @@ class DPForwardInputsMaker:
         self._ready_event = torch.cuda.Event()
         self._attn_tp_cpu_group = self.dist_ctx.attn_tp_group.cpu_group
 
+        # timeout to wait for inputs
+        # if any rank has no inputs, all ranks would wait for this timeout
+        # so it is very important to balance the inputs between ranks
+        from lmdeploy.pytorch import envs
+        self.base_timeout = envs.dp_input_timeout
+        self.timeout = self.base_timeout
+
     def _make_dummy_forward_inputs(self):
         """Make dummy forward inputs."""
         is_decoding = self._is_decoding
@@ -1287,7 +1280,16 @@ class DPForwardInputsMaker:
         if self.cache_config.role != EngineRole.Prefill:
             self._is_decoding = not self._is_decoding
 
-    async def _broadcast_has_inputs(self, has_inputs: bool = False):
+        if self.cache_config.role == EngineRole.Decode:
+            # set timeout for next inputs
+            # next inputs is ~self._is_decoding
+            # and prefill is rarely happened in decoding engine
+            if self._is_decoding:
+                self.timeout = max(0.02, self.base_timeout / 2)
+            else:
+                self.timeout = self.base_timeout
+
+    async def _gather_has_inputs(self, has_inputs: bool = False):
         """Broadcast has inputs."""
         attn_tp_group = self.dist_ctx.attn_tp_group
         attn_tp = self.dist_ctx.dist_config.attn_tp
@@ -1295,52 +1297,40 @@ class DPForwardInputsMaker:
             return has_inputs
 
         group = attn_tp_group.cpu_group
-        rank = dist.get_global_rank(group, 0)
-        has_inputs = torch.tensor((has_inputs, ))
-        handle = dist.broadcast(has_inputs, src=rank, group=group, async_op=True)
+        has_inputs = torch.tensor((int(has_inputs), ))
+        handle = dist.all_reduce(has_inputs, op=dist.ReduceOp.SUM, group=group, async_op=True)
         future = handle.get_future()
         while not future.done():
             await asyncio.sleep(0)
-        return has_inputs.item()
+        future.wait()
+        return (has_inputs > 0).item()
 
-    async def _get_inputs_rank0(self):
-        """Try get inputs rank0."""
-        try:
-            forward_inputs = await asyncio.wait_for(self._in_que.get(), timeout=0.02)
-        except asyncio.TimeoutError:
-            forward_inputs = None
-
-        has_inputs = forward_inputs is not None
-        await self._broadcast_has_inputs(has_inputs)
-        return forward_inputs
-
-    async def _get_inputs_rankn(self):
-        """Try get inputs rankn."""
-        # broadcast
-        has_inputs = await self._broadcast_has_inputs()
-
-        # try get inputs
-        if has_inputs:
+    async def _get_inputs(self):
+        if self.model_agent._pre_in_que.qsize() > 0:
             forward_inputs = await self._in_que.get()
         else:
-            forward_inputs = None
+            try:
+                forward_inputs = await asyncio.wait_for(self._in_que.get(), timeout=self.timeout)
+            except asyncio.TimeoutError:
+                forward_inputs = None
+
+        has_inputs = await self._gather_has_inputs(forward_inputs is not None)
+
+        # try get inputs
+        if has_inputs and forward_inputs is None:
+            forward_inputs = await self._in_que.get()
+
         return forward_inputs
 
     async def _try_get_inputs(self):
         """Try get inputs."""
-
-        attn_tp_group = self.dist_ctx.attn_tp_group
-        tp_rank = attn_tp_group.rank
 
         # initialize output
         forward_inputs = None
         need_dummy = True
 
         # get inputs from in_que. Rank 1 will not gather if rank 0 does not read inputs.
-        if tp_rank == 0:
-            forward_inputs = await self._get_inputs_rank0()
-        else:
-            forward_inputs = await self._get_inputs_rankn()
+        forward_inputs = await self._get_inputs()
 
         if forward_inputs is not None:
             model_inputs = forward_inputs['inputs']

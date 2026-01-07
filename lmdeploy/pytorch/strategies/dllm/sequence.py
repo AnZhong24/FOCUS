@@ -395,7 +395,7 @@ class DLLMSequenceStrategy(SequenceStrategy):
             stop = stopped[idx]
             model_meta = model_metas[idx]
             mask = dllm_mask[idx]
-            if msg.status != MessageStatus.LOCKED:
+            if msg.status != MessageStatus.RUNNING:
                 continue
 
             prev_focus_mask = None
@@ -423,4 +423,4 @@ class DLLMSequenceStrategy(SequenceStrategy):
                     msg.update_focus_stats(decoded_count)
             if stop:
                 msg.set_stop_pos(stop_pos[idx])
-                msg.status = MessageStatus.TO_BE_MIGRATED if msg.preserve_cache else MessageStatus.STOPPED
+                msg.state.finish()

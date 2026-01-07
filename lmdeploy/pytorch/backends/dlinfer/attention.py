@@ -66,6 +66,7 @@ class DlinferAttentionImpl(AttentionImpl[DlinferAttentionMetadata]):
         k_scales_zeros: Tensor = None,
         v_scales_zeros: Tensor = None,
         learnable_sink: Tensor = None,
+        nsa_indices: Tensor = None,
         inplace: bool = True,
     ) -> Tensor:
         """forward."""
@@ -158,7 +159,7 @@ class DlinferAttentionBuilder(AttentionBuilder[DlinferAttentionMetadata]):
         v_head_size: int = None,
         alibi_scale: float = None,
         sliding_window: int = None,
-        logical_softcapping: float = None,
+        logit_softcapping: float = None,
         causal: bool = True,
         learnable_sink: bool = False,
         **kwargs,
@@ -171,6 +172,6 @@ class DlinferAttentionBuilder(AttentionBuilder[DlinferAttentionMetadata]):
                                     v_head_size=v_head_size,
                                     alibi_scale=alibi_scale,
                                     sliding_window=sliding_window,
-                                    logical_softcapping=logical_softcapping,
+                                    logit_softcapping=logit_softcapping,
                                     causal=causal,
                                     **kwargs)

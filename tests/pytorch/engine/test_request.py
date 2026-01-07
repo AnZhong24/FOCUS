@@ -42,7 +42,7 @@ class TestRequestHander:
                     return
 
         sender = manager.build_sender()
-        manager.start_loop(__dummy_loop)
+        manager.set_main_loop_func(__dummy_loop)
 
         # test not bind
         resp = sender.send_async(RequestType.STOP_ENGINE, None)
@@ -58,4 +58,8 @@ class TestRequestHander:
         resp = sender.recv(resp)
         assert resp.data == 'test success'
 
+        # cleanup, cancel main task
+        task_to_cancel = manager._loop_task
         manager.stop_loop()
+        asyncio.run
+        event_loop.run_until_complete(asyncio.gather(task_to_cancel, return_exceptions=True))
