@@ -251,6 +251,11 @@ MODULE_MAP.update({
     'SDARMoeForCausalLM': f'{LMDEPLOY_PYTORCH_MODEL_PATH}.sdar_moe.SDARMoeForCausalLM',
 })
 
+# LLaDA2
+MODULE_MAP.update({
+    'LLaDA2MoeModelLM': f'{LMDEPLOY_PYTORCH_MODEL_PATH}.llada2.LLaDA2MoeModelLM',
+})
+
 CUSTOM_MODULE_MAP = dict()
 
 # spec models

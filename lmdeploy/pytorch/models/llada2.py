@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 
-from typing import Any, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+import math
 import weakref
 
 import torch
@@ -12,6 +13,7 @@ from lmdeploy.pytorch.model_inputs import StepContext, StepContextManager, get_s
 from lmdeploy.pytorch.nn import ApplyRotaryEmb, Attention, RMSNorm, SiluAndMul, build_rotary_embedding_from_config
 from lmdeploy.pytorch.nn.linear import (build_down_linear, build_gateup_linear, build_o_proj, build_qkv_proj,
                                         build_rowwise_linear)
+from lmdeploy.pytorch.nn.moe import build_fused_moe
 from lmdeploy.pytorch.weight_loader.model_weight_loader import load_weight
 from lmdeploy.pytorch.kernels.cuda.focus import (focus_compact_states, focus_compute_targets,
                                                  focus_importance_ragged, focus_select_and_enforce_ragged)
@@ -19,76 +21,86 @@ from lmdeploy.pytorch.kernels.cuda.focus import (focus_compact_states, focus_com
 from .utils.cudagraph import CudaGraphMeta, CudaGraphMixin
 
 
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """Repeat KV heads to match attention heads."""
-    if n_rep == 1:
-        return hidden_states
-    batch, num_kv_heads, seq_len, head_dim = hidden_states.shape
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_kv_heads, n_rep, seq_len, head_dim)
-    return hidden_states.reshape(batch, num_kv_heads * n_rep, seq_len, head_dim)
+def _get_router_dtype(config: PretrainedConfig, fallback: Optional[torch.dtype]) -> torch.dtype:
+    router_dtype = getattr(config, 'router_dtype', None)
+    if isinstance(router_dtype, torch.dtype):
+        return router_dtype
+    if isinstance(router_dtype, str):
+        dtype_str = router_dtype.lower()
+        if dtype_str in ('fp32', 'float32'):
+            return torch.float32
+        if dtype_str in ('bf16', 'bfloat16'):
+            return torch.bfloat16
+        if dtype_str in ('fp16', 'float16'):
+            return torch.float16
+    return fallback or torch.float32
 
 
-class SDARAttention(nn.Module):
-    """attention."""
+class LLaDA2MoeAttention(nn.Module):
+    """Attention with block diffusion + FOCUS support."""
 
     def __init__(self,
                  config: PretrainedConfig,
                  layer_idx: int,
-                 focus_enabled: bool = False,
-                 focus_max_batch_size: Optional[int] = 0,
                  dtype: torch.dtype = None,
                  device: torch.device = None):
         super().__init__()
         self.layer_idx = layer_idx
         quantization_config = getattr(config, 'quantization_config', None)
         num_heads = config.num_attention_heads
-        num_key_value_heads = config.num_key_value_heads
+        num_key_value_heads = config.num_key_value_heads or num_heads
         hidden_size = config.hidden_size
         head_dim = getattr(config, 'head_dim', hidden_size // num_heads)
         num_replicate_kv_heads = getattr(config, 'num_replicate_key_value_heads', 1)
-        # packed qkv
-        # Qwen3 uses 'config.attention_bias = False' for q/k/o projections
-        self.qkv_proj = build_qkv_proj(hidden_size,
-                                       num_q_heads=num_heads,
-                                       num_kv_heads=num_key_value_heads,
-                                       head_size=head_dim,
-                                       bias=config.attention_bias,
-                                       quant_config=quantization_config,
-                                       dtype=dtype,
-                                       device=device,
-                                       num_replicate_kv_heads=num_replicate_kv_heads)
+        use_qkv_bias = getattr(config, 'use_qkv_bias', getattr(config, 'attention_bias', False))
+        use_bias = getattr(config, 'use_bias', getattr(config, 'attention_bias', False))
 
-        # rotary embedding
+        self.query_key_value = build_qkv_proj(hidden_size,
+                                              num_q_heads=num_heads,
+                                              num_kv_heads=num_key_value_heads,
+                                              head_size=head_dim,
+                                              bias=use_qkv_bias,
+                                              quant_config=quantization_config,
+                                              dtype=dtype,
+                                              device=device,
+                                              num_replicate_kv_heads=num_replicate_kv_heads)
+
         self.apply_rotary_pos_emb = ApplyRotaryEmb()
         dllm_block_length = config.dllm_block_length
 
-        # attention
+        sliding_window = getattr(config, 'sliding_window', None)
+        if not (getattr(config, 'use_sliding_window', False) and sliding_window is not None and
+                layer_idx >= getattr(config, 'max_window_layers', 0)):
+            sliding_window = None
+
         self.attn_fwd = Attention(
             num_heads,
             head_dim,
             num_kv_heads=num_key_value_heads,
             v_head_size=head_dim,
-            sliding_window=config.sliding_window,
+            sliding_window=sliding_window,
             block_sparse_size=dllm_block_length,
         )
+
+        self.dense = build_o_proj(num_heads * head_dim,
+                                  hidden_size,
+                                  bias=use_bias,
+                                  quant_config=quantization_config,
+                                  dtype=dtype,
+                                  device=device,
+                                  is_tp=True)
+
+        self.use_qk_norm = getattr(config, 'use_qk_norm', True)
+        if self.use_qk_norm:
+            self.query_layernorm = RMSNorm(head_dim, config.rms_norm_eps, dtype=dtype, device=device)
+            self.key_layernorm = RMSNorm(head_dim, config.rms_norm_eps, dtype=dtype, device=device)
+
         self.num_attention_heads = num_heads
         self.num_key_value_heads = num_key_value_heads
         self.num_key_value_groups = max(1, num_heads // num_key_value_heads)
         self.head_dim = head_dim
         self.scale = head_dim**-0.5
 
-        # o_proj
-        self.o_proj = build_o_proj(num_heads * head_dim,
-                                   hidden_size,
-                                   bias=config.attention_bias,
-                                   quant_config=quantization_config,
-                                   dtype=dtype,
-                                   device=device,
-                                   is_tp=True)
-
-        # q, k norm
-        self.q_norm = RMSNorm(head_dim, config.rms_norm_eps, dtype=dtype, device=device)
-        self.k_norm = RMSNorm(head_dim, config.rms_norm_eps, dtype=dtype, device=device)
         self._keep_tokens_host: Optional[torch.Tensor] = None
         self._keep_tokens_event: Optional[torch.cuda.Event] = None
 
@@ -100,24 +112,21 @@ class SDARAttention(nn.Module):
         attn_metadata: Any = None,
         residual: Optional[torch.Tensor] = None,
     ):
-        """Rewrite of LlamaAttention.forward."""
+        """Forward attention."""
         updated_residual = residual
         context = self._get_context()
-        focus_active = bool(context.focus_enabled() and context.is_decoding)
+        focus_active = bool(context is not None and context.focus_enabled() and context.is_decoding)
         if focus_active:
             attn_metadata = context.attn_metadata
 
-        # qkv proj
-        qkv_states = self.qkv_proj(hidden_states)
-        # (-1, heads, head_dim)
+        qkv_states = self.query_key_value(hidden_states)
         qkv_states = qkv_states.flatten(0, -2)
-        query_states, key_states, value_states = self.qkv_proj.split_qkv(qkv_states)
+        query_states, key_states, value_states = self.query_key_value.split_qkv(qkv_states)
 
-        # apply q, k norm
-        query_states = self.q_norm(query_states)
-        key_states = self.k_norm(key_states)
+        if self.use_qk_norm:
+            query_states = self.query_layernorm(query_states)
+            key_states = self.key_layernorm(key_states)
 
-        # apply rotary embedding
         cos, sin = rotary_pos_emb
         query_states, key_states = self.apply_rotary_pos_emb(
             query_states,
@@ -138,12 +147,10 @@ class SDARAttention(nn.Module):
             # torch.cuda.nvtx.range_pop()
         elif focus_fill_only:
             if context.focus_view.processing_mask_prunable:
-                # For better overlap.
                 new_q_lens = torch.zeros_like(context.q_seqlens)
                 # torch.cuda.nvtx.range_push("self._prepare_focus_pruning")
                 retain_processing_mask = self._prepare_focus_pruning(context, query_states, key_states)
                 # torch.cuda.nvtx.range_pop()
-                # Preserve the original ragged view for KV fill before pruning.
                 self.attn_fwd.forward_only_fill_kv(key_states, value_states, k_cache, v_cache, attn_metadata,
                                                    k_scales_zeros=k_scales, v_scales_zeros=v_scales)
                 # torch.cuda.nvtx.range_push("self._apply_focus_pruning")
@@ -166,7 +173,6 @@ class SDARAttention(nn.Module):
                 self.attn_fwd.forward_only_fill_kv(key_states, value_states, k_cache, v_cache, attn_metadata,
                                                    k_scales_zeros=k_scales, v_scales_zeros=v_scales)
 
-        # attention
         if focus_fill_only:
             attn_output = self.attn_fwd.forward_only_attention(
                 query_states,
@@ -191,11 +197,10 @@ class SDARAttention(nn.Module):
             )
         attn_output = attn_output.reshape(*hidden_states.shape[:-1], -1)
 
-        # o proj
-        attn_output = self.o_proj(attn_output)
+        attn_output = self.dense(attn_output)
         return attn_output, updated_residual
 
-    def _get_context(self) -> StepContext:
+    def _get_context(self) -> Optional[StepContext]:
         mgr = get_step_ctx_manager()
         return mgr.current_context()
 
@@ -331,24 +336,18 @@ class SDARAttention(nn.Module):
         attn_metadata: Any = None,
         residual: Optional[torch.Tensor] = None,
     ):
-        """Forward through QKV, norms, rotary, and FOCUS pruning for layer 1.
-
-        This is the prefix part that runs eagerly before CUDA graph capture.
-        Returns compacted query_states, hidden_states, and residual for the suffix.
-        """
+        """Forward through QKV, norms, rotary, and FOCUS pruning for layer 1."""
         context = self._get_context()
         updated_residual = residual
 
-        # qkv proj
-        qkv_states = self.qkv_proj(hidden_states)
+        qkv_states = self.query_key_value(hidden_states)
         qkv_states = qkv_states.flatten(0, -2)
-        query_states, key_states, value_states = self.qkv_proj.split_qkv(qkv_states)
+        query_states, key_states, value_states = self.query_key_value.split_qkv(qkv_states)
 
-        # apply q, k norm
-        query_states = self.q_norm(query_states)
-        key_states = self.k_norm(key_states)
+        if self.use_qk_norm:
+            query_states = self.query_layernorm(query_states)
+            key_states = self.key_layernorm(key_states)
 
-        # apply rotary embedding
         cos, sin = rotary_pos_emb
         query_states, key_states = self.apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
@@ -364,17 +363,14 @@ class SDARAttention(nn.Module):
                                                k_scales_zeros=k_scales, v_scales_zeros=v_scales)
             return query_states, hidden_states, updated_residual
 
-        # Prepare pruning
         new_q_lens = torch.zeros_like(context.q_seqlens)
         # torch.cuda.nvtx.range_push("self._prepare_focus_pruning")
         retain_processing_mask = self._prepare_focus_pruning(context, query_states, key_states)
         # torch.cuda.nvtx.range_pop()
 
-        # Fill KV cache before pruning
         self.attn_fwd.forward_only_fill_kv(key_states, value_states, k_cache, v_cache, attn_metadata,
                                            k_scales_zeros=k_scales, v_scales_zeros=v_scales)
 
-        # Apply pruning
         # torch.cuda.nvtx.range_push("self._apply_focus_pruning")
         (query_states, key_states, value_states, hidden_states, updated_residual,
             new_proc_indices, new_q_lens, new_q_lens_host) = self._apply_focus_pruning(
@@ -400,17 +396,13 @@ class SDARAttention(nn.Module):
         attn_metadata: Any = None,
         residual: Optional[torch.Tensor] = None,
     ):
-        """Forward through attention and o_proj for layer 1 after FOCUS pruning.
-
-        This is the suffix part that can be captured in CUDA graph.
-        """
+        """Forward through attention and o_proj for layer 1 after FOCUS pruning."""
         k_cache = past_key_value[0]
         v_cache = past_key_value[1]
         has_scales = len(past_key_value) > 2
         k_scales = None if not has_scales else past_key_value[2]
         v_scales = None if not has_scales else past_key_value[3]
 
-        # attention
         attn_output = self.attn_fwd.forward_only_attention(
             query_states,
             k_cache,
@@ -421,50 +413,161 @@ class SDARAttention(nn.Module):
             inplace=True,
         )
         attn_output = attn_output.reshape(*hidden_states.shape[:-1], -1)
-
-        # o proj
-        attn_output = self.o_proj(attn_output)
+        attn_output = self.dense(attn_output)
         return attn_output, residual
 
 
-class SDARMLP(nn.Module):
-    """mlp."""
+class LLaDA2MoeMLP(nn.Module):
+    """MLP."""
 
-    def __init__(self, config: PretrainedConfig, dtype: torch.dtype = None, device: torch.device = None):
+    def __init__(self,
+                 config: PretrainedConfig,
+                 intermediate_size: int,
+                 dtype: torch.dtype = None,
+                 device: torch.device = None):
         super().__init__()
         quantization_config = getattr(config, 'quantization_config', None)
-        # gate up
         self.gate_up_proj = build_gateup_linear(
             config.hidden_size,
-            [config.intermediate_size, config.intermediate_size],
+            [intermediate_size, intermediate_size],
             bias=False,
             dtype=dtype,
             device=device,
             quant_config=quantization_config,
             is_tp=True,
         )
-
-        # silu and mul
         self.act_fn = SiluAndMul(inplace=True)
-
-        # down
-        self.down_proj = build_down_linear(config.intermediate_size,
-                                           config.hidden_size,
-                                           bias=False,
-                                           quant_config=quantization_config,
-                                           dtype=dtype,
-                                           device=device,
-                                           is_tp=True)
+        self.down_proj = build_down_linear(
+            intermediate_size,
+            config.hidden_size,
+            bias=False,
+            quant_config=quantization_config,
+            dtype=dtype,
+            device=device,
+            is_tp=True,
+        )
 
     def forward(self, x):
-        """forward."""
         gate_up = self.gate_up_proj(x)
         act = self.act_fn(gate_up)
         return self.down_proj(act)
 
 
-class SDARDecoderLayer(nn.Module):
-    """Decode layer."""
+class LLaDA2MoeGate(nn.Module):
+    """LLaDA2 MoE gate."""
+
+    def __init__(self, config: PretrainedConfig, dtype: torch.dtype = None, device: torch.device = None):
+        super().__init__()
+        self.top_k = config.num_experts_per_tok
+        self.num_experts = config.num_experts
+        self.n_group = getattr(config, 'n_group', 1)
+        self.topk_group = getattr(config, 'topk_group', self.n_group)
+        self.routed_scaling_factor = getattr(config, 'routed_scaling_factor', 1.0)
+        self.norm_topk_prob = getattr(config, 'norm_topk_prob', True)
+        self.score_function = getattr(config, 'score_function', 'sigmoid')
+        router_dtype = _get_router_dtype(config, dtype)
+        self.weight = nn.Parameter(torch.empty((self.num_experts, config.hidden_size),
+                                               dtype=router_dtype,
+                                               device=device))
+        self.expert_bias = None
+        if getattr(config, 'moe_router_enable_expert_bias', False):
+            self.expert_bias = nn.Parameter(torch.zeros(self.num_experts, dtype=router_dtype, device=device),
+                                            requires_grad=False)
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    def group_limited_topk(self, scores: torch.Tensor):
+        num_tokens, _ = scores.size()
+        if self.n_group <= 0 or self.topk_group <= 0 or self.num_experts % self.n_group != 0:
+            return torch.topk(scores, k=self.top_k, dim=-1)
+        group_size = self.num_experts // self.n_group
+        grouped_scores = scores.view(num_tokens, self.n_group, group_size)
+        top2 = min(2, group_size)
+        group_scores = grouped_scores.topk(top2, dim=-1).values.sum(dim=-1)
+        topk_group = min(self.topk_group, self.n_group)
+        group_idx = torch.topk(group_scores, k=topk_group, dim=-1, sorted=False).indices
+        group_mask = torch.zeros_like(group_scores)
+        group_mask.scatter_(1, group_idx, 1)
+        score_mask = group_mask.unsqueeze(-1).expand(num_tokens, self.n_group, group_size).reshape(num_tokens, -1)
+        masked_scores = scores.masked_fill(~score_mask.bool(), float("-inf"))
+        return torch.topk(masked_scores, k=self.top_k, dim=-1)
+
+    def forward(self, hidden_states: torch.Tensor):
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        logits = F.linear(hidden_states.to(self.weight.dtype), self.weight)
+        if self.score_function == 'softmax':
+            scores = logits.softmax(dim=-1, dtype=torch.float32)
+        else:
+            scores = torch.sigmoid(logits.float())
+
+        scores_for_routing = scores
+        if self.expert_bias is not None:
+            scores_for_routing = scores_for_routing + self.expert_bias
+        _, topk_idx = self.group_limited_topk(scores_for_routing)
+
+        topk_weight = scores.gather(dim=1, index=topk_idx)
+        if self.top_k > 1 and self.norm_topk_prob:
+            topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
+        topk_weight = topk_weight * self.routed_scaling_factor
+        if not topk_weight.is_contiguous():
+            topk_weight = topk_weight.contiguous()
+        return topk_weight, topk_idx
+
+
+class LLaDA2MoeSparseMoeBlock(nn.Module):
+    """MoE block with group-limited routing."""
+
+    def __init__(self,
+                 config: PretrainedConfig,
+                 layer_idx: int,
+                 dtype: torch.dtype = None,
+                 device: torch.device = None):
+        super().__init__()
+        self.config = config
+        quantization_config = getattr(config, 'quantization_config', None)
+        self.hidden_dim = config.hidden_size
+        self.ffn_dim = config.moe_intermediate_size or config.intermediate_size
+        self.num_experts = config.num_experts
+        self.top_k = config.num_experts_per_tok
+
+        self.gate = LLaDA2MoeGate(config, dtype=dtype, device=device)
+        self.experts = build_fused_moe(
+            self.hidden_dim,
+            self.ffn_dim,
+            self.num_experts,
+            top_k=self.top_k,
+            renormalize=False,
+            dtype=dtype,
+            device=device,
+            all_reduce=True,
+            quant_config=quantization_config,
+            layer_idx=layer_idx,
+        )
+
+        self.shared_experts = None
+        num_shared_experts = getattr(config, 'num_shared_experts', 0)
+        if num_shared_experts:
+            shared_dim = self.ffn_dim * num_shared_experts
+            self.shared_experts = LLaDA2MoeMLP(config, intermediate_size=shared_dim, dtype=dtype, device=device)
+
+    def forward(self, hidden_states: torch.Tensor):
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        topk_weights, topk_ids = self.gate(hidden_states)
+
+        out_states = self.experts(hidden_states, topk_weights, topk_ids)
+
+        if self.shared_experts is not None:
+            out_states = out_states + self.shared_experts(hidden_states)
+
+        out_states = out_states.reshape(batch_size, sequence_length, -1)
+        return out_states
+
+
+class LLaDA2MoeDecoderLayer(nn.Module):
+    """Decoder layer."""
 
     def __init__(self,
                  config: PretrainedConfig,
@@ -477,25 +580,20 @@ class SDARDecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         quantization_config = getattr(config, 'quantization_config', None)
 
-        # build attention layer
-        self.self_attn = SDARAttention(config,
-                                       layer_idx=layer_idx,
-                                       focus_enabled=focus_enabled,
-                                       focus_max_batch_size=focus_max_batch_size,
-                                       dtype=dtype,
-                                       device=device)
+        self.attention = LLaDA2MoeAttention(config, layer_idx=layer_idx, dtype=dtype, device=device)
 
-        # build MLP
-        self.mlp = SDARMLP(config, dtype=dtype, device=device)
+        use_moe = (getattr(config, 'num_experts', 0) > 0 and layer_idx >= getattr(config, 'first_k_dense_replace', 0))
+        if use_moe:
+            self.mlp = LLaDA2MoeSparseMoeBlock(config, layer_idx=layer_idx, dtype=dtype, device=device)
+        else:
+            self.mlp = LLaDA2MoeMLP(config, intermediate_size=config.intermediate_size, dtype=dtype, device=device)
 
-        # build input layer norm
         self.input_layernorm = RMSNorm(config.hidden_size,
                                        config.rms_norm_eps,
                                        quant_config=quantization_config,
                                        dtype=dtype,
                                        device=device)
 
-        # build attention layer norm
         self.post_attention_layernorm = RMSNorm(config.hidden_size,
                                                 config.rms_norm_eps,
                                                 quant_config=quantization_config,
@@ -517,8 +615,7 @@ class SDARDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        # Self Attention
-        hidden_states, residual = self.self_attn(
+        hidden_states, residual = self.attention(
             hidden_states=hidden_states,
             rotary_pos_emb=rotary_pos_emb,
             past_key_value=past_key_value,
@@ -526,7 +623,6 @@ class SDARDecoderLayer(nn.Module):
             residual=residual,
         )
 
-        # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
 
@@ -541,14 +637,10 @@ class SDARDecoderLayer(nn.Module):
         residual: torch.Tensor,
         attn_metadata: Any = None,
     ):
-        """Forward the prefix part of layer 1 with FOCUS.
-
-        Does layernorm, QKV projection, and pruning. Returns compacted states for the suffix.
-        This runs eagerly before CUDA graph capture.
-        """
+        """Forward the prefix part of layer 1 with FOCUS."""
         hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        query_states, hidden_states, residual = self.self_attn.forward_focus_qkv_and_prune(
+        query_states, hidden_states, residual = self.attention.forward_focus_qkv_and_prune(
             hidden_states=hidden_states,
             rotary_pos_emb=rotary_pos_emb,
             past_key_value=past_key_value,
@@ -566,12 +658,8 @@ class SDARDecoderLayer(nn.Module):
         residual: torch.Tensor,
         attn_metadata: Any = None,
     ):
-        """Forward the suffix part of layer 1 with FOCUS.
-
-        Does attention, o_proj, post-attention layernorm, and MLP.
-        This can be captured in CUDA graph.
-        """
-        hidden_states, residual = self.self_attn.forward_focus_attention(
+        """Forward the suffix part of layer 1 with FOCUS."""
+        hidden_states, residual = self.attention.forward_focus_attention(
             query_states=query_states,
             hidden_states=hidden_states,
             past_key_value=past_key_value,
@@ -579,15 +667,14 @@ class SDARDecoderLayer(nn.Module):
             residual=residual,
         )
 
-        # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
 
         return hidden_states, residual
 
 
-class SDARModel(nn.Module):
-    """model."""
+class LLaDA2MoeModel(nn.Module):
+    """LLaDA2 MoE model."""
 
     def __init__(self,
                  config: PretrainedConfig,
@@ -599,27 +686,23 @@ class SDARModel(nn.Module):
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
-        self.embed_tokens = nn.Embedding(config.vocab_size,
-                                         config.hidden_size,
-                                         self.padding_idx,
-                                         dtype=dtype,
-                                         device=device)
+        self.word_embeddings = nn.Embedding(config.vocab_size,
+                                            config.hidden_size,
+                                            self.padding_idx,
+                                            dtype=dtype,
+                                            device=device)
 
-        # build all decode layers
         self.layers = nn.ModuleList([
-            SDARDecoderLayer(config,
-                             layer_idx,
-                             focus_enabled=focus_enabled,
-                             focus_max_batch_size=focus_max_batch_size,
-                             dtype=dtype,
-                             device=device)
+            LLaDA2MoeDecoderLayer(config,
+                                  layer_idx,
+                                  focus_enabled=focus_enabled,
+                                  focus_max_batch_size=focus_max_batch_size,
+                                  dtype=dtype,
+                                  device=device)
             for layer_idx in range(config.num_hidden_layers)
         ])
 
-        # build norm
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps, dtype=dtype, device=device)
-
-        # build rotary embedding
         self.rotary_emb = build_rotary_embedding_from_config(config)
 
     def forward(
@@ -630,15 +713,12 @@ class SDARModel(nn.Module):
         attn_metadata: Any = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
     ):
-        """Rewrite of forward."""
-
-        # token embedding
+        """Forward."""
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            inputs_embeds = self.word_embeddings(input_ids)
 
         hidden_states = inputs_embeds
 
-        # rotary embedding
         cos, sin = self.rotary_emb(hidden_states, position_ids)
         cos, sin = cos[0], sin[0]
         rotary_pos_emb = (cos, sin)
@@ -646,7 +726,6 @@ class SDARModel(nn.Module):
         if context is not None:
             context.rotary_pos_emb = rotary_pos_emb
 
-        # decoding
         residual = None
         for idx, decoder_layer in enumerate(self.layers):
             past_key_value = past_key_values[idx]
@@ -662,9 +741,7 @@ class SDARModel(nn.Module):
                 attn_metadata=attn_metadata,
             )
 
-        # norm
         hidden_states, _ = self.norm(hidden_states, residual)
-
         return hidden_states
 
     def forward_focus_prefix(
@@ -675,23 +752,12 @@ class SDARModel(nn.Module):
         attn_metadata: Any = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
     ):
-        """Run the prefix part of the first two decoder layers eagerly.
-
-        This helper is used by the CUDA graph runner when FOCUS is enabled.
-        FOCUS prunes tokens inside layer 1, so we execute layer 0 fully and
-        layer 1's QKV/pruning eagerly, then capture the remaining suffix
-        (layer 1's attention + layers 2+) with fixed shapes.
-
-        Returns:
-            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: (hidden_states, residual, query_states)
-            where query_states is the compacted query for layer 1's attention.
-        """
+        """Run the prefix part of the first two decoder layers eagerly."""
         if inputs_embeds is None:
-            inputs_embeds = self.embed_tokens(input_ids)
+            inputs_embeds = self.word_embeddings(input_ids)
 
         hidden_states = inputs_embeds
 
-        # initial rotary embedding (pre-pruning)
         cos, sin = self.rotary_emb(hidden_states, position_ids)
         cos, sin = cos[0], sin[0]
         rotary_pos_emb = (cos, sin)
@@ -700,7 +766,6 @@ class SDARModel(nn.Module):
             context.rotary_pos_emb = rotary_pos_emb
 
         residual = None
-        # Layer 0: full forward
         hidden_states, residual = self.layers[0](
             hidden_states,
             rotary_pos_emb=rotary_pos_emb,
@@ -709,8 +774,6 @@ class SDARModel(nn.Module):
             attn_metadata=attn_metadata,
         )
 
-        # Layer 1: only prefix (QKV projection, norms, rotary, pruning)
-        # The attention and o_proj will be done in the suffix (CUDA graph)
         query_states, hidden_states, residual = self.layers[1].forward_focus_prefix(
             hidden_states,
             rotary_pos_emb=rotary_pos_emb,
@@ -723,18 +786,13 @@ class SDARModel(nn.Module):
 
     def get_input_embeddings(self):
         """Get input embeddings."""
-        return self.embed_tokens
+        return self.word_embeddings
 
 
-class SDARForCausalLM(nn.Module, CudaGraphMixin):
-    """ModelForCausalLM."""
+class LLaDA2MoeModelLM(nn.Module, CudaGraphMixin):
+    """LLaDA2 MoE LM head."""
 
     packed_modules_mapping = {
-        'qkv_proj': [
-            'q_proj',
-            'k_proj',
-            'v_proj',
-        ],
         'gate_up_proj': [
             'gate_proj',
             'up_proj',
@@ -749,18 +807,22 @@ class SDARForCausalLM(nn.Module, CudaGraphMixin):
         super().__init__()
         self.config = config
         self.ctx_mgr = ctx_mgr
-        dllm_cfg = ctx_mgr.build_ctx.dllm_config
+        if getattr(config, 'num_key_value_heads', 0) in (0, None):
+            config.num_key_value_heads = config.num_attention_heads
+        if getattr(config, 'head_dim', None) is None:
+            config.head_dim = config.hidden_size // config.num_attention_heads
+        dllm_cfg = getattr(ctx_mgr.build_ctx, 'dllm_config', None)
         if dllm_cfg is not None:
             config.dllm_block_length = dllm_cfg.block_length
+        elif not hasattr(config, 'dllm_block_length'):
+            config.dllm_block_length = 1
         focus_enabled = bool(dllm_cfg is not None and getattr(dllm_cfg, 'enable_focus', False))
         focus_max_batch_size = getattr(ctx_mgr.build_ctx, 'max_batch_size', None)
-        # build model
-        self.model = SDARModel(config,
-                               focus_enabled=focus_enabled,
-                               focus_max_batch_size=focus_max_batch_size,
-                               dtype=dtype,
-                               device=device)
-        # build lm_head
+        self.model = LLaDA2MoeModel(config,
+                                    focus_enabled=focus_enabled,
+                                    focus_max_batch_size=focus_max_batch_size,
+                                    dtype=dtype,
+                                    device=device)
         self.lm_head = build_rowwise_linear(config.hidden_size,
                                             config.vocab_size,
                                             bias=False,
@@ -777,10 +839,7 @@ class SDARForCausalLM(nn.Module, CudaGraphMixin):
         inputs_embeds: torch.Tensor = None,
         **kwargs,
     ):
-        # context = get_step_ctx_manager().current_context()
-        # if context.is_decoding:
-        #     print("batch_size:", attn_metadata.q_seqlens.size(0), "num_tokens:", input_ids.size(1))
-        """Model forward, return logits."""
+        # print("input_ids.shape:", input_ids.shape)
         hidden_states = self.model(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -797,7 +856,7 @@ class SDARForCausalLM(nn.Module, CudaGraphMixin):
     def update_weights(self):
         """Update weights."""
         if self.config.tie_word_embeddings:
-            self.lm_head.weight = self.model.embed_tokens.weight
+            self.lm_head.weight = self.model.word_embeddings.weight
 
     def get_input_embeddings(self):
         """Get input embeddings."""
@@ -810,12 +869,10 @@ class SDARForCausalLM(nn.Module, CudaGraphMixin):
         context: StepContext = None,
     ):
         """Prepare input."""
-        # get input_ids, position_ids and attention metadatas
         input_ids = context.input_ids
         position_ids = context.position_ids
         attn_metadata = context.attn_metadata
 
-        # process vision embeddings
         vision_embeddings = context.input_embeddings
         vision_embedding_indexing = context.input_embedding_indexing
         if vision_embeddings is not None and len(vision_embeddings) > 0:
@@ -823,7 +880,6 @@ class SDARForCausalLM(nn.Module, CudaGraphMixin):
                 inputs_embeds = self.get_input_embeddings()(input_ids)
             inputs_embeds[:, vision_embedding_indexing, :] = vision_embeddings.to(inputs_embeds)
 
-        # inputs of forward
         return dict(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -833,32 +889,44 @@ class SDARForCausalLM(nn.Module, CudaGraphMixin):
         )
 
     def forward_focus_prefix(self, **kwargs):
-        """Expose SDARModel.forward_focus_prefix."""
+        """Expose LLaDA2MoeModel.forward_focus_prefix."""
         return self.model.forward_focus_prefix(**kwargs)
 
     def get_focus_suffix_model(self):
-        """Build or return a cudagraph-compatible suffix module.
-
-        The suffix runs layer 1's attention/o_proj (using query_states from prefix),
-        followed by decoder layers from layer 2 to the end. It inherits
-        :class:`CudaGraphMixin` so the CUDA graph runner can allocate and fill
-        static buffers.
-        """
+        """Build or return a cudagraph-compatible suffix module."""
         if self._focus_suffix_model is None:
-            self._focus_suffix_model = SDARPostFocusSuffix(self)
+            self._focus_suffix_model = LLaDA2PostFocusSuffix(self)
         return self._focus_suffix_model
+
+    def _load_weight_experts(self, name: str, loaded_weight: torch.Tensor, params_dict: Dict[str, nn.Parameter],
+                             expert_params_mapping: List):
+        """Load weight experts."""
+        for (param_name, weight_name, expert_id, shard_id) in expert_params_mapping:
+            if weight_name not in name:
+                continue
+            name = name.replace(weight_name, param_name)
+            param = params_dict[name]
+            load_weight(param, loaded_weight, expert_id=expert_id, shard_id=shard_id)
+            break
+        else:
+            param = params_dict.get(name, None)
+            if param is not None:
+                load_weight(param, loaded_weight)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights."""
-        # modify from vllm
         stacked_params_mapping = [
-            # (param_name, shard_name, shard_id)
-            ('.qkv_proj', '.q_proj', 'q'),
-            ('.qkv_proj', '.k_proj', 'k'),
-            ('.qkv_proj', '.v_proj', 'v'),
             ('.gate_up_proj', '.gate_proj', 0),
             ('.gate_up_proj', '.up_proj', 1),
         ]
+
+        num_experts = getattr(self.config, 'num_experts', 0) or 0
+        expert_params_mapping = []
+        for exp_id in range(num_experts):
+            gate_param = ('.experts.gate_up', f'.experts.{exp_id}.gate_proj', exp_id, 'gate')
+            up_param = ('.experts.gate_up', f'.experts.{exp_id}.up_proj', exp_id, 'up')
+            down_param = ('.experts.down', f'.experts.{exp_id}.down_proj', exp_id, 'down')
+            expert_params_mapping += [gate_param, up_param, down_param]
 
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
@@ -869,38 +937,46 @@ class SDARForCausalLM(nn.Module, CudaGraphMixin):
             if self.config.tie_word_embeddings and 'lm_head.weight' in name:
                 continue
 
+            if '.query_key_value' in name:
+                param = params_dict.get(name, None)
+                if param is None:
+                    continue
+                q, k, v = param.weight_spliter(loaded_weight)
+                load_weight(param, q, shard_id='q')
+                load_weight(param, k, shard_id='k')
+                load_weight(param, v, shard_id='v')
+                continue
+
+            if '.experts.' in name:
+                self._load_weight_experts(name, loaded_weight, params_dict, expert_params_mapping=expert_params_mapping)
+                continue
+
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 if weight_name not in name:
                     continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
+                mapped_name = name.replace(weight_name, param_name)
+                param = params_dict.get(mapped_name, None)
+                if param is None:
+                    break
                 load_weight(param, loaded_weight, shard_id=shard_id)
                 break
             else:
-                param = params_dict[name]
+                param = params_dict.get(name, None)
+                if param is None:
+                    continue
                 load_weight(param, loaded_weight)
 
 
-class SDARPostFocusSuffix(nn.Module, CudaGraphMixin):
-    """Suffix of SDAR used for CUDA graph after FOCUS eviction.
+class LLaDA2PostFocusSuffix(nn.Module, CudaGraphMixin):
+    """Suffix of LLaDA2 used for CUDA graph after FOCUS eviction."""
 
-    This module takes pruned hidden_states/residual/query_states (after layer 1's
-    QKV projection and pruning) and runs layer 1's attention + o_proj, followed by
-    the remaining decoder layers and final norm. Input tensors are padded to
-    ``graph_meta.max_tokens`` so CUDA graph shapes stay fixed.
-    """
-
-    def __init__(self, parent: SDARForCausalLM):
+    def __init__(self, parent: LLaDA2MoeModelLM):
         super().__init__()
-        # Keep a weak reference to avoid registering the parent as a submodule
-        # (which would create a module cycle).
         self._parent_ref = weakref.ref(parent)
         self.ctx_mgr = parent.ctx_mgr
         self.config = parent.config
 
     def make_buffers_cudagraph(self, graph_meta: CudaGraphMeta, **kwargs):
-        # FOCUS does not need input_ids in the graph; allocate only what the
-        # suffix actually consumes to keep buffers light.
         max_batches = graph_meta.max_buffer_batch_size
         max_tokens = graph_meta.max_tokens
         num_blocks = graph_meta.num_blocks
@@ -928,7 +1004,6 @@ class SDARPostFocusSuffix(nn.Module, CudaGraphMixin):
         input_buffers['seq_tile_offsets'] = torch.zeros(max_batches, dtype=torch.int32, device=device)
         input_buffers['tile_to_seq'] = torch.zeros(total_tiles, dtype=torch.int32, device=device)
 
-        # Allocate buffers for prefix outputs.
         hs = kwargs.get('hidden_states', None)
         res = kwargs.get('residual', None)
         dtype = (hs.dtype if hs is not None else res.dtype if res is not None else getattr(self.config, 'torch_dtype',
@@ -937,7 +1012,6 @@ class SDARPostFocusSuffix(nn.Module, CudaGraphMixin):
         input_buffers['hidden_states'] = torch.zeros((1, max_tokens, hidden_size), dtype=dtype, device=device)
         input_buffers['residual'] = torch.zeros((1, max_tokens, hidden_size), dtype=dtype, device=device)
 
-        # Allocate buffer for query_states (for layer 1's attention in CUDA graph).
         input_buffers['query_states'] = torch.zeros((max_tokens, self.config.num_attention_heads, self.config.head_dim),
                                                      dtype=dtype, device=device)
 
@@ -948,7 +1022,6 @@ class SDARPostFocusSuffix(nn.Module, CudaGraphMixin):
                                input_ids: torch.Tensor = None,
                                position_ids: torch.Tensor = None, past_key_values=None, attn_metadata=None,
                                inputs_embeds: torch.Tensor = None, **kwargs):
-        """Fill static buffers for the FOCUS suffix capture."""
         block_offsets: torch.Tensor = attn_metadata.block_offsets
         q_start_loc: torch.Tensor = attn_metadata.q_start_loc
         q_seqlens: torch.Tensor = attn_metadata.q_seqlens
@@ -957,7 +1030,6 @@ class SDARPostFocusSuffix(nn.Module, CudaGraphMixin):
 
         batch_size, num_blocks = block_offsets.size()
         num_tokens = hidden_states.size(1)
-        # Fill metadata buffers (no input_ids copy needed for FOCUS).
         input_buffers['position_ids'][:, :num_tokens] = position_ids
         input_buffers['block_offsets'][:batch_size, :num_blocks] = block_offsets
 
@@ -974,7 +1046,6 @@ class SDARPostFocusSuffix(nn.Module, CudaGraphMixin):
             attn_metadata=attn_metadata,
         )
 
-        # create inputs
         attn_metadata.block_offsets = input_buffers['block_offsets']
         attn_metadata.q_start_loc = input_buffers['q_start_loc']
         attn_metadata.q_seqlens = input_buffers['q_seqlens']
@@ -999,12 +1070,10 @@ class SDARPostFocusSuffix(nn.Module, CudaGraphMixin):
         attn_metadata.tile_to_seq = tile_buf
         attn_metadata.seq_tile_offsets = offset_buf
 
-        # Fill prefix outputs.
         hs_buf = input_buffers['hidden_states']
         hs_buf[:, :num_tokens] = hidden_states
         res_buf = input_buffers['residual']
         res_buf[:, :num_tokens] = residual
-        # Fill query_states for layer 1's attention.
         qs_buf = input_buffers['query_states']
         qs_buf[:num_tokens] = query_states
 
@@ -1025,18 +1094,11 @@ class SDARPostFocusSuffix(nn.Module, CudaGraphMixin):
         query_states: torch.Tensor = None,
         **kwargs,
     ):
-        """Run decoder layers from layer 1 onward.
-
-        Runs layer 1's attention suffix (attention + o_proj) plus
-        post-attention layernorm and MLP, then proceeds with layers 2+.
-        """
         parent = self._parent_ref()
-        # Recompute rotary embeddings for the (padded) pruned inputs.
         cos, sin = parent.model.rotary_emb(hidden_states, position_ids)
         cos, sin = cos[0], sin[0]
         rotary_pos_emb = (cos, sin)
 
-        # Layer 1: run the suffix part (attention + o_proj + post_attn_norm + MLP)
         past_key_value = past_key_values[1]
         hidden_states, residual = parent.model.layers[1].forward_focus_suffix(
             query_states=query_states,
@@ -1045,7 +1107,6 @@ class SDARPostFocusSuffix(nn.Module, CudaGraphMixin):
             residual=residual,
             attn_metadata=attn_metadata,
         )
-        # Layers 2+
         for idx in range(2, len(parent.model.layers)):
             past_key_value = past_key_values[idx]
             hidden_states, residual = parent.model.layers[idx](
@@ -1058,6 +1119,3 @@ class SDARPostFocusSuffix(nn.Module, CudaGraphMixin):
 
         hidden_states, _ = parent.model.norm(hidden_states, residual)
         return hidden_states
-
-    # The suffix module reuses parameters from the parent SDARForCausalLM;
-    # it does not own weights and should not be passed to the weight loader.
