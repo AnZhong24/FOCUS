@@ -21,7 +21,7 @@ from lmdeploy.pytorch.kernels.cuda.focus import (focus_compact_states, focus_com
 from .utils.cudagraph import CudaGraphMeta, CudaGraphMixin
 
 
-def _get_router_dtype(config: PretrainedConfig, fallback: Optional[torch.dtype]) -> torch.dtype:
+def _get_router_dtype(config: PretrainedConfig) -> torch.dtype:
     router_dtype = getattr(config, 'router_dtype', None)
     if isinstance(router_dtype, torch.dtype):
         return router_dtype
@@ -33,7 +33,10 @@ def _get_router_dtype(config: PretrainedConfig, fallback: Optional[torch.dtype])
             return torch.bfloat16
         if dtype_str in ('fp16', 'float16'):
             return torch.float16
-    return fallback or torch.float32
+    # HF reference LLaDA2 uses fp32 router weights + fp32 routing logits even
+    # when the model runs in bf16/fp16. Default to fp32 unless users override
+    # `router_dtype` explicitly.
+    return torch.float32
 
 
 class LLaDA2MoeAttention(nn.Module):
@@ -465,7 +468,7 @@ class LLaDA2MoeGate(nn.Module):
         self.routed_scaling_factor = getattr(config, 'routed_scaling_factor', 1.0)
         self.norm_topk_prob = getattr(config, 'norm_topk_prob', True)
         self.score_function = getattr(config, 'score_function', 'sigmoid')
-        router_dtype = _get_router_dtype(config, dtype)
+        router_dtype = _get_router_dtype(config)
         self.weight = nn.Parameter(torch.empty((self.num_experts, config.hidden_size),
                                                dtype=router_dtype,
                                                device=device))
@@ -839,7 +842,9 @@ class LLaDA2MoeModelLM(nn.Module, CudaGraphMixin):
         inputs_embeds: torch.Tensor = None,
         **kwargs,
     ):
-        # print("input_ids.shape:", input_ids.shape)
+        # context = get_step_ctx_manager().current_context()
+        # if context.is_decoding:
+        #     print("batch_size:", attn_metadata.q_seqlens.size(0), "num_tokens:", input_ids.size(1))
         hidden_states = self.model(
             input_ids=input_ids,
             position_ids=position_ids,

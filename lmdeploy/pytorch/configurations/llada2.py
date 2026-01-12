@@ -13,9 +13,13 @@ class LLaDA2ModelConfigBuilder(AutoModelConfigBuilder):
     def build(cls, hf_config, model_path: str = None, **kwargs):
         """build."""
         cfg = DefaultModelConfigBuilder.build(hf_config, model_path, **kwargs)
+        # LLaDA2 is a diffusion LLM and is typically evaluated with
+        # `block_length=32, steps=32` (see the official model card). LMDeploy's
+        # generic DLLM fallback defaults to `block_length=4`, which can
+        # noticeably degrade quality (e.g., HumanEval) if users don't override
+        # it via `PytorchEngineConfig.dllm_block_length`.
+        if cfg.dllm_block_length is None:
+            cfg.dllm_block_length = 32
+        cfg.dllm_mask_token = 156895
         cfg.model_paradigm = 'dllm'
-        mask_token = getattr(hf_config, 'mask_token_id', None)
-        if mask_token is None:
-            mask_token = 156895
-        cfg.dllm_mask_token = mask_token
         return cfg
