@@ -19,6 +19,38 @@ python profile_throughput.py \
  --concurrency 64
 ```
 
+### ShareGPT (HuggingFace)
+
+You can also pass the HuggingFace dataset ID directly (requires the `datasets` package):
+
+```bash
+python profile_throughput.py \
+  anon8231489123/ShareGPT_Vicuna_unfiltered \
+  /path/to/your/model \
+  --dataset-format sharegpt \
+  --hf-split train \
+  --concurrency 64
+```
+
+If the dataset repo doesn't load via `datasets.load_dataset`, use `--hf-data-file` to point to the JSON/JSONL file.
+By default, HuggingFace dataset IDs are loaded in non-streaming mode for accurate shuffling; use `--hf-streaming` to enable streaming.
+
+### WildChat
+
+`profile_throughput.py` also supports the WildChat dataset from HuggingFace:
+
+```bash
+python profile_throughput.py \
+  allenai/WildChat \
+  /path/to/your/model \
+  --dataset-format wildchat \
+  --hf-split train \
+  --concurrency 64
+```
+
+Note: loading HuggingFace datasets requires the `datasets` package.
+By default, HuggingFace dataset IDs are loaded in non-streaming mode for accurate shuffling; use `--hf-streaming` to enable streaming.
+
 ## profile restful api
 
 `profile_restful_api.py` is used to do benchmark on api server.

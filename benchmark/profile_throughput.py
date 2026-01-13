@@ -1,15 +1,19 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import argparse
 import asyncio
+import itertools
 import json
 import os
 import random
 from queue import Queue
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 import numpy as np
 from tqdm import tqdm
-from transformers import PreTrainedTokenizerBase
+try:
+    from transformers import PreTrainedTokenizerBase
+except Exception:  # pragma: no cover
+    PreTrainedTokenizerBase = Any  # type: ignore
 
 from lmdeploy.cli.utils import ArgumentHelper, DefaultsAndTypesHelpFormatter
 from lmdeploy.messages import GenerationConfig, PytorchEngineConfig, TurbomindEngineConfig
@@ -20,48 +24,313 @@ from lmdeploy.utils import get_logger
 get_logger('lmdeploy').setLevel('ERROR')
 os.environ['TM_LOG_LEVEL'] = 'ERROR'
 
+DatasetFormat = str
+DEFAULT_HF_SHUFFLE_BUFFER_SIZE = 10_000
+
+
+def _normalize_role(role: Any) -> str:
+    role = str(role).strip().lower()
+    if role in ('human', 'user'):
+        return 'user'
+    if role in ('gpt', 'assistant', 'bot', 'model'):
+        return 'assistant'
+    if role in ('system',):
+        return 'system'
+    return role
+
+
+def _extract_messages(example: Dict[str, Any], dataset_format: DatasetFormat = 'auto') -> Optional[List[Dict[str, str]]]:
+    """Extract a list of {role, content} messages from a dataset row."""
+    turns = None
+    if dataset_format == 'sharegpt':
+        key_order = ('conversations', 'conversation', 'messages')
+    elif dataset_format == 'wildchat':
+        key_order = ('conversation', 'messages', 'conversations')
+    else:
+        key_order = ('conversation', 'conversations', 'messages')
+
+    for key in key_order:
+        if key in example:
+            turns = example[key]
+            break
+    if not isinstance(turns, list):
+        return None
+
+    messages: List[Dict[str, str]] = []
+    for turn in turns:
+        if not isinstance(turn, dict):
+            continue
+        role = None
+        content = None
+        if 'role' in turn and 'content' in turn:
+            role = turn.get('role')
+            content = turn.get('content')
+        elif 'from' in turn and 'value' in turn:
+            role = turn.get('from')
+            content = turn.get('value')
+        elif 'speaker' in turn and 'text' in turn:
+            role = turn.get('speaker')
+            content = turn.get('text')
+
+        if role is None or content is None:
+            continue
+        content = str(content)
+        if not content.strip():
+            continue
+        messages.append({'role': _normalize_role(role), 'content': content})
+
+    return messages or None
+
+
+def _pick_prompt_completion(messages: List[Dict[str, str]]) -> Optional[Tuple[List[Dict[str, str]], str]]:
+    """Pick a (prompt_messages, completion_text) pair from a conversation."""
+    for idx, msg in enumerate(messages):
+        if msg.get('role') != 'user':
+            continue
+        prompt_messages: List[Dict[str, str]] = [
+            m for m in messages[:idx] if m.get('role') == 'system' and m.get('content')
+        ] + [msg]
+        for j in range(idx + 1, len(messages)):
+            if messages[j].get('role') == 'assistant' and messages[j].get('content'):
+                return prompt_messages, messages[j]['content']
+    return None
+
+
+def _iter_jsonl(path: str) -> Iterator[Dict[str, Any]]:
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            yield json.loads(line)
+
+
+def _iter_pairs_from_rows(rows: Iterable[Dict[str, Any]],
+                          dataset_format: DatasetFormat = 'auto') -> Iterable[Tuple[List[Dict[str, str]], str]]:
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        messages = _extract_messages(row, dataset_format=dataset_format)
+        if not messages or len(messages) < 2:
+            continue
+        picked = _pick_prompt_completion(messages)
+        if picked is None:
+            continue
+        yield picked
+
+
+def _iter_pairs_from_file(dataset_path: str,
+                          dataset_format: DatasetFormat = 'auto',
+                          *,
+                          streaming: bool = False,
+                          seed: Optional[int] = None,
+                          shuffle: bool = True) -> Iterable[Tuple[List[Dict[str, str]], str]]:
+    rng = random.Random(seed)
+    if dataset_path.endswith('.jsonl'):
+        rows: Iterable[Dict[str, Any]] = _iter_jsonl(dataset_path)
+        if shuffle:
+            if streaming:
+                buffer_size = DEFAULT_HF_SHUFFLE_BUFFER_SIZE
+
+                def _buffered() -> Iterator[Dict[str, Any]]:
+                    it = iter(rows)
+                    buf: List[Dict[str, Any]] = []
+                    for _ in range(buffer_size):
+                        item = next(it, None)
+                        if item is None:
+                            break
+                        buf.append(item)
+                    while buf:
+                        idx = rng.randrange(len(buf))
+                        yield buf[idx]
+                        nxt = next(it, None)
+                        if nxt is None:
+                            buf.pop(idx)
+                        else:
+                            buf[idx] = nxt
+
+                rows = _buffered()
+            else:
+                materialized = list(rows)
+                rng.shuffle(materialized)
+                rows = materialized
+        return _iter_pairs_from_rows(rows, dataset_format=dataset_format)
+
+    with open(dataset_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        raise ValueError(f'Unsupported dataset JSON root type: {type(data)}')
+    if shuffle:
+        rng.shuffle(data)
+    return _iter_pairs_from_rows(data, dataset_format=dataset_format)
+
+
+def _iter_pairs_from_hf(dataset_id: str,
+                        split: str,
+                        streaming: bool,
+                        seed: Optional[int] = None,
+                        dataset_format: DatasetFormat = 'auto') -> Iterable[Tuple[List[Dict[str, str]], str]]:
+    try:
+        from datasets import load_dataset  # type: ignore
+    except Exception as e:
+        raise ImportError('HuggingFace dataset loading requires the `datasets` package. '
+                          'Install it (e.g. `pip install datasets`).') from e
+
+    ds = load_dataset(dataset_id, split=split, streaming=streaming)
+    if not streaming and seed is not None:
+        try:
+            ds = ds.shuffle(seed=seed)
+        except Exception:
+            # Best-effort: if shuffling is unsupported, fall back to dataset order.
+            pass
+    elif streaming and seed is not None:
+        # Streaming datasets cannot be fully shuffled without scanning everything; use buffered shuffle.
+        try:
+            ds = ds.shuffle(seed=seed, buffer_size=DEFAULT_HF_SHUFFLE_BUFFER_SIZE)
+        except TypeError:
+            try:
+                ds = ds.shuffle(buffer_size=DEFAULT_HF_SHUFFLE_BUFFER_SIZE, seed=seed)
+            except Exception:
+                pass
+        except Exception:
+            # Best-effort: if shuffling is unsupported, fall back to dataset order.
+            pass
+
+    def _iter_rows() -> Iterator[Tuple[List[Dict[str, str]], str]]:
+        it = iter(ds)
+        first = next(it, None)
+        if first is None:
+            return
+        for row in itertools.chain([first], it):
+            if not isinstance(row, dict):
+                continue
+            messages = _extract_messages(row, dataset_format=dataset_format)
+            if not messages or len(messages) < 2:
+                continue
+            picked = _pick_prompt_completion(messages)
+            if picked is None:
+                continue
+            yield picked
+
+    return _iter_rows()
+
+
+def _download_hf_data_file(dataset_id: str,
+                           *,
+                           filename: Optional[str] = None,
+                           revision: Optional[str] = None) -> str:
+    """Download a JSON/JSONL data file from a HuggingFace dataset repo."""
+    try:
+        from huggingface_hub import hf_hub_download, list_repo_files  # type: ignore
+    except Exception as e:
+        raise ImportError('Downloading a HuggingFace dataset file requires `huggingface_hub`. '
+                          'Install it (e.g. `pip install huggingface_hub`).') from e
+
+    if filename is None:
+        files = list_repo_files(repo_id=dataset_id, repo_type='dataset', revision=revision)
+        candidates = [f for f in files if f.endswith('.json') or f.endswith('.jsonl')]
+        preferred = 'ShareGPT_V3_unfiltered_cleaned_split.json'
+        if preferred in candidates:
+            filename = preferred
+        elif len(candidates) == 1:
+            filename = candidates[0]
+        else:
+            preview = ', '.join(candidates[:20])
+            raise ValueError('Cannot infer which dataset file to download from '
+                             f'`{dataset_id}`; use `--hf-data-file`. '
+                             f'Found candidates: {preview}')
+
+    local_path = hf_hub_download(repo_id=dataset_id,
+                                 repo_type='dataset',
+                                 filename=filename,
+                                 revision=revision)
+    return str(local_path)
+
 
 def sample_requests(
     dataset_path: str,
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
     chat_template=None,  # Add chat_template parameter
+    dataset_format: DatasetFormat = 'auto',
+    hf_split: str = 'train',
+    hf_streaming: bool = False,
+    hf_data_file: Optional[str] = None,
+    hf_revision: Optional[str] = None,
+    max_scan_examples: Optional[int] = None,
+    seed: Optional[int] = None,
 ) -> List[Tuple[str, int]]:
     """Sample requests from dataset for DLLM benchmarking.
     
     Returns:
         List of tuples containing (prompt, prompt_len)
     """
-    # Load the dataset.
-    with open(dataset_path) as f:
-        dataset = json.load(f)
-    # Filter out the conversations with less than 2 turns.
-    dataset = [data for data in dataset if len(data['conversations']) >= 2]
-    # Only keep the first two turns of each conversation.
-    dataset = [(data['conversations'][0]['value'], data['conversations'][1]['value']) for data in dataset]
-
-    # Shuffle the dataset.
-    random.shuffle(dataset)
+    pairs_iter: Iterable[Tuple[List[Dict[str, str]], str]]
+    if os.path.isfile(dataset_path):
+        if dataset_path.endswith('.jsonl'):
+            pairs_iter = _iter_pairs_from_rows(_iter_jsonl(dataset_path), dataset_format=dataset_format)
+        else:
+            with open(dataset_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if not isinstance(data, list) or not data:
+                return []
+            # Best-effort shuffle for JSON arrays without materializing the extracted pairs list.
+            random.shuffle(data)
+            pairs_iter = _iter_pairs_from_rows(data, dataset_format=dataset_format)
+    else:
+        # Treat as a HuggingFace dataset ID (e.g. allenai/WildChat).
+        try:
+            pairs_iter = _iter_pairs_from_hf(dataset_path,
+                                             split=hf_split,
+                                             streaming=hf_streaming,
+                                             seed=seed,
+                                             dataset_format=dataset_format)
+        except ImportError:
+            # Allow file-based fallback even without `datasets` (common for ShareGPT dataset repos).
+            local_path = _download_hf_data_file(dataset_path, filename=hf_data_file, revision=hf_revision)
+            pairs_iter = _iter_pairs_from_file(local_path,
+                                               dataset_format=dataset_format,
+                                               streaming=hf_streaming,
+                                               seed=seed,
+                                               shuffle=True)
+            # Continue; no `datasets`-based iteration available.
+        except Exception as e:
+            try:
+                from datasets.exceptions import DataFilesNotFoundError  # type: ignore
+            except Exception:
+                raise
+            if not isinstance(e, DataFilesNotFoundError):
+                raise
+            # Fallback for dataset repos that don't contain supported data files for `datasets.load_dataset`,
+            # such as ShareGPT repos that host the JSON directly.
+            local_path = _download_hf_data_file(dataset_path, filename=hf_data_file, revision=hf_revision)
+            pairs_iter = _iter_pairs_from_file(local_path,
+                                               dataset_format=dataset_format,
+                                               streaming=hf_streaming,
+                                               seed=seed,
+                                               shuffle=True)
 
     # Filter out sequences that are too long or too short
     filtered_dataset: List[Tuple[str, int]] = []
-    for i in range(len(dataset)):
+    scanned = 0
+
+    for messages, completion in pairs_iter:
         if len(filtered_dataset) == num_requests:
             break
 
-        # Tokenize the prompts.
-        prompt = dataset[i][0]
-        
-        # Apply chat template to format the prompt
+        scanned += 1
+        if max_scan_examples is not None and scanned > max_scan_examples:
+            break
+
+        # Apply chat template to format the prompt.
         if chat_template is not None:
-            # Convert raw prompt to message format
-            messages = [{'role': 'user', 'content': prompt}]
-            # Apply chat template
             prompt = chat_template.messages2prompt(messages, sequence_start=True, enable_thinking=False)
-        
+        else:
+            # Fallback: use the selected user message.
+            prompt = messages[-1]['content']
+
         prompt_token_ids = tokenizer.encode(prompt)
         prompt_len = len(prompt_token_ids)
-        completion = dataset[i][1]
         completion_token_ids = tokenizer.encode(completion)
         output_len = len(completion_token_ids)
         
@@ -387,11 +656,45 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Benchmark DLLM request throughput of lmdeploy '
                                      'in localhost',
                                      formatter_class=DefaultsAndTypesHelpFormatter)
-    parser.add_argument('dataset', type=str, help='the path dataset')
+    parser.add_argument('dataset',
+                        type=str,
+                        help='Dataset path (.json/.jsonl) or HuggingFace dataset ID (e.g. allenai/WildChat).')
     parser.add_argument('model_path',
                         type=str,
                         help='the path of model in localhost or '
                         'the repo_id of model in huggingface.co')
+    parser.add_argument('--dataset-format',
+                        type=str,
+                        default='auto',
+                        choices=['auto', 'sharegpt', 'wildchat'],
+                        help='Dataset format: ShareGPT JSON, WildChat (HF or JSON/JSONL), or auto-detect.')
+    parser.add_argument('--hf-split',
+                        type=str,
+                        default='train',
+                        help='HuggingFace dataset split when `dataset` is a dataset ID (e.g. allenai/WildChat).')
+    hf_streaming_group = parser.add_mutually_exclusive_group()
+    hf_streaming_group.add_argument('--hf-streaming',
+                                    dest='hf_streaming',
+                                    action='store_true',
+                                    default=False,
+                                    help='Enable HuggingFace streaming mode (iterates without loading the full split).')
+    hf_streaming_group.add_argument('--no-hf-streaming',
+                                    dest='hf_streaming',
+                                    action='store_false',
+                                    help='Disable HuggingFace streaming mode (default; loads the full split into memory).')
+    parser.add_argument('--hf-data-file',
+                        type=str,
+                        default=None,
+                        help='Optional HF dataset filename to download when the repo hosts JSON/JSONL directly '
+                        '(e.g. ShareGPT).')
+    parser.add_argument('--hf-revision',
+                        type=str,
+                        default=None,
+                        help='Optional HuggingFace dataset revision (branch/tag/commit).')
+    parser.add_argument('--max-scan-examples',
+                        type=int,
+                        default=None,
+                        help='Optional cap on how many dataset rows to scan while sampling prompts.')
     parser.add_argument('-c',
                         '--concurrency',
                         type=int,
@@ -547,6 +850,13 @@ def main():
         num_requests=args.num_prompts,
         tokenizer=engine.tokenizer.model.model,
         chat_template=engine.chat_template,  # Pass the automatically detected chat template
+        dataset_format=args.dataset_format,
+        hf_split=args.hf_split,
+        hf_streaming=args.hf_streaming,
+        hf_data_file=args.hf_data_file,
+        hf_revision=args.hf_revision,
+        max_scan_examples=args.max_scan_examples,
+        seed=args.seed,
     )
 
     stream_output = not args.no_stream_output
