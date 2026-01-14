@@ -46,7 +46,7 @@ BATCH_SIZES=(32 64 128 256)
 # --use-uvloop: Use uvloop for async operations
 # --max-new-tokens 2048: Maximum number of new tokens to generate
 # --repeat-block-detect: Enable repeat block detection
-# --repeat-block-window 64: Window size for repeat block detection
+# --repeat-block-window 32: Window size for repeat block detection
 
 COMMON_PARAMS="--eager-mode \
     --backend pytorch \
@@ -56,7 +56,7 @@ COMMON_PARAMS="--eager-mode \
     --use-uvloop \
     --max-new-tokens 2048 \
     --repeat-block-detect \
-    --repeat-block-window 64"
+    --repeat-block-window 32"
 
 # ============================================
 # Loop through each block size

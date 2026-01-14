@@ -2,33 +2,41 @@
 
 # Script to run throughput benchmark with different batch sizes, datasets, and models
 # This script executes the profile_throughput.py benchmark for multiple configurations:
-# - Dataset: Specified as command line argument
+# - Dataset: Specified as command line argument (first parameter)
+# - Model: Specified as command line argument (second parameter)
 # - 2 experiment types: Focus (threshold 0.8) and Base (threshold 0.9)
 # - 4 batch sizes: 32, 64, 128, and 256
-# - 2 models: SDAR-8B-Chat-b32 and LLaDA2.0-mini
-# Total per dataset: 2 experiment types × 4 batch sizes × 2 models = 16 benchmarks
+# Total per dataset: 2 experiment types × 4 batch sizes = 8 benchmarks
 # Output is saved to ./results directory
 #
-# Usage: ./run_focus_throughput_evaluation.sh <dataset_id>
-# Example: ./run_focus_throughput_evaluation.sh anon8231489123/ShareGPT_Vicuna_unfiltered
-#          ./run_focus_throughput_evaluation.sh allenai/WildChat
+# Usage: ./run_focus_throughput_evaluation.sh <dataset_id> <model_id>
+# Example: ./run_focus_throughput_evaluation.sh anon8231489123/ShareGPT_Vicuna_unfiltered JetLM/SDAR-8B-Chat-b32
+#          ./run_focus_throughput_evaluation.sh allenai/WildChat inclusionAI/LLaDA2.0-mini
 
 # Check if dataset argument is provided
 if [ -z "$1" ]; then
     echo "Error: Dataset ID is required as a command line argument"
-    echo "Usage: $0 <dataset_id>"
-    echo "Example: $0 anon8231489123/ShareGPT_Vicuna_unfiltered"
+    echo "Usage: $0 <dataset_id> <model_id>"
+    echo "Example: $0 anon8231489123/ShareGPT_Vicuna_unfiltered JetLM/SDAR-8B-Chat-b32"
+    exit 1
+fi
+
+# Check if model argument is provided
+if [ -z "$2" ]; then
+    echo "Error: Model ID is required as a command line argument"
+    echo "Usage: $0 <dataset_id> <model_id>"
+    echo "Example: $0 anon8231489123/ShareGPT_Vicuna_unfiltered JetLM/SDAR-8B-Chat-b32"
     exit 1
 fi
 
 # Get dataset from command line argument
 DATASET=$1
 
+# Get model from command line argument
+MODEL=$2
+
 # Create results directory if it doesn't exist
 mkdir -p ./results
-
-# Array of models to test
-MODELS=("JetLM/SDAR-8B-Chat-b32" "inclusionAI/LLaDA2.0-mini")
 
 # Array of batch sizes to test
 BATCH_SIZES=(32 64 128 256)
@@ -46,7 +54,7 @@ BATCH_SIZES=(32 64 128 256)
 # --dllm-denoising-steps 32: DLLM denoising steps
 # --max-new-tokens 2048: Maximum number of new tokens to generate
 # --repeat-block-detect: Enable repeat block detection
-# --repeat-block-window 64: Window size for repeat block detection
+# --repeat-block-window 32: Window size for repeat block detection
 
 COMMON_PARAMS="--eager-mode \
     --backend pytorch \
@@ -58,28 +66,26 @@ COMMON_PARAMS="--eager-mode \
     --dllm-denoising-steps 32 \
     --max-new-tokens 2048 \
     --repeat-block-detect \
-    --repeat-block-window 64"
+    --repeat-block-window 32"
 
 # ============================================
-# Loop through each model
+# Process the specified model
 # ============================================
-for MODEL in "${MODELS[@]}"
-do
-    # Extract model name from path for output file naming
-    MODEL_NAME=$(basename ${MODEL})
-    
-    echo "========================================="
-    echo "Processing model: ${MODEL}"
-    echo "========================================="
-    echo ""
-    
-    # Extract dataset name from path for output file naming
-    DATASET_NAME=$(basename ${DATASET})
-    
-    echo "========================================="
-    echo "Processing dataset: ${DATASET} with model: ${MODEL_NAME}"
-    echo "========================================="
-    echo ""
+# Extract model name from path for output file naming
+MODEL_NAME=$(basename ${MODEL})
+
+echo "========================================="
+echo "Processing model: ${MODEL}"
+echo "========================================="
+echo ""
+
+# Extract dataset name from path for output file naming
+DATASET_NAME=$(basename ${DATASET})
+
+echo "========================================="
+echo "Processing dataset: ${DATASET} with model: ${MODEL_NAME}"
+echo "========================================="
+echo ""
         
         # ============================================
         # Run Focus Experiment for this dataset and model
@@ -167,15 +173,9 @@ do
             
             echo ""
         done
-        
-    echo "========================================="
-    echo "Completed all benchmarks for ${DATASET_NAME} - ${MODEL_NAME}"
-    echo "========================================="
-    echo ""
-done
 
 echo "========================================="
-echo "Completed all benchmarks for model: ${MODEL_NAME}"
+echo "Completed all benchmarks for ${DATASET_NAME} - ${MODEL_NAME}"
 echo "========================================="
 echo ""
 
@@ -185,7 +185,8 @@ echo "========================================="
 echo ""
 echo "Results summary:"
 echo "  Dataset: ${DATASET}"
-echo "  Total benchmarks run: 16 (2 experiment types × 4 batch sizes × 2 models)"
-echo "  Focus experiments: ./results/focus_${DATASET_NAME}_*_batch_*.log"
-echo "  Base experiments: ./results/base_${DATASET_NAME}_*_batch_*.log"
+echo "  Model: ${MODEL}"
+echo "  Total benchmarks run: 8 (2 experiment types × 4 batch sizes)"
+echo "  Focus experiments: ./results/focus_${DATASET_NAME}_${MODEL_NAME}_batch_*.log"
+echo "  Base experiments: ./results/base_${DATASET_NAME}_${MODEL_NAME}_batch_*.log"
 echo "========================================="
