@@ -420,7 +420,7 @@ class _UInt64RollingHasher:
 class RepetitionDetector:
     """Detect repeated blocks of generated tokens using rolling hashes."""
 
-    MIN_CHECK_BLOCK = 16
+    MIN_CHECK_BLOCK = 8
     HASH_BASES = (911382323, 972663749)
 
     def __init__(self, block_size: int, repeats: int):
@@ -729,7 +729,7 @@ def parse_args():
                         help='Optional block size for repetition detection; defaults to dllm-block-length when unset.')
     parser.add_argument('--repeat-block-threshold',
                         type=int,
-                        default=2,
+                        default=3,
                         help='Number of consecutive repeated blocks required to trigger early stop.')
     # other args
     ArgumentHelper.top_p(parser)
