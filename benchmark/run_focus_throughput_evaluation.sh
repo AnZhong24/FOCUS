@@ -9,15 +9,16 @@
 # Total per dataset: 2 experiment types × 4 batch sizes = 8 benchmarks
 # Output is saved to ./results directory
 #
-# Usage: ./run_focus_throughput_evaluation.sh <dataset_id> <model_id>
+# Usage: ./run_focus_throughput_evaluation.sh <dataset_id> <model_id> [alpha]
 # Example: ./run_focus_throughput_evaluation.sh anon8231489123/ShareGPT_Vicuna_unfiltered JetLM/SDAR-8B-Chat-b32
+#          ./run_focus_throughput_evaluation.sh anon8231489123/ShareGPT_Vicuna_unfiltered JetLM/SDAR-8B-Chat-b32 1.8
 #          ./run_focus_throughput_evaluation.sh allenai/WildChat inclusionAI/LLaDA2.0-mini
 #          ./run_focus_throughput_evaluation.sh nlile/hendrycks-MATH-benchmark <model_id>
 
 # Check if dataset argument is provided
 if [ -z "$1" ]; then
     echo "Error: Dataset ID is required as a command line argument"
-    echo "Usage: $0 <dataset_id> <model_id>"
+    echo "Usage: $0 <dataset_id> <model_id> [alpha]"
     echo "Example: $0 anon8231489123/ShareGPT_Vicuna_unfiltered JetLM/SDAR-8B-Chat-b32"
     exit 1
 fi
@@ -25,7 +26,7 @@ fi
 # Check if model argument is provided
 if [ -z "$2" ]; then
     echo "Error: Model ID is required as a command line argument"
-    echo "Usage: $0 <dataset_id> <model_id>"
+    echo "Usage: $0 <dataset_id> <model_id> [alpha]"
     echo "Example: $0 anon8231489123/ShareGPT_Vicuna_unfiltered JetLM/SDAR-8B-Chat-b32"
     exit 1
 fi
@@ -35,6 +36,9 @@ DATASET=$1
 
 # Get model from command line argument
 MODEL=$2
+
+# Get alpha from command line argument (optional, default: 1.5)
+ALPHA=${3:-1.5}
 
 # Dataset-specific arguments
 DATASET_ARGS=()
@@ -105,13 +109,13 @@ echo ""
         # --dllm-confidence-threshold 0.8: DLLM confidence threshold
         # --dllm-enable-delayed-cache: Enable DLLM delayed cache
         # --dllm-enable-focus: Enable DLLM focus mechanism
-        # --dllm-focus-alpha 1.5: DLLM focus alpha parameter
-        
+        # --dllm-focus-alpha ${ALPHA}: DLLM focus alpha parameter (default: 1.5)
+
         FOCUS_PARAMS="${COMMON_PARAMS} \
             --dllm-confidence-threshold 0.8 \
             --dllm-enable-delayed-cache \
             --dllm-enable-focus \
-            --dllm-focus-alpha 1.5"
+            --dllm-focus-alpha ${ALPHA}"
         
         for BATCH_SIZE in "${BATCH_SIZES[@]}"
         do
@@ -120,8 +124,8 @@ echo ""
             echo "========================================="
             
             # Define output file paths for stdout and stderr
-            OUTPUT_FILE="./results/focus_${DATASET_NAME}_${MODEL_NAME}_batch_${BATCH_SIZE}.log"
-            ERROR_FILE="./results/focus_${DATASET_NAME}_${MODEL_NAME}_batch_${BATCH_SIZE}.err"
+            OUTPUT_FILE="./results/focus_${DATASET_NAME}_${MODEL_NAME}_alpha_${ALPHA}_batch_${BATCH_SIZE}.log"
+            ERROR_FILE="./results/focus_${DATASET_NAME}_${MODEL_NAME}_alpha_${ALPHA}_batch_${BATCH_SIZE}.err"
             
             # Execute the command with the current batch size
             # --concurrency parameter controls the batch size
@@ -193,7 +197,8 @@ echo ""
 echo "Results summary:"
 echo "  Dataset: ${DATASET}"
 echo "  Model: ${MODEL}"
+echo "  Alpha: ${ALPHA}"
 echo "  Total benchmarks run: 8 (2 experiment types × 4 batch sizes)"
-echo "  Focus experiments: ./results/focus_${DATASET_NAME}_${MODEL_NAME}_batch_*.log"
+echo "  Focus experiments: ./results/focus_${DATASET_NAME}_${MODEL_NAME}_alpha_${ALPHA}_batch_*.log"
 echo "  Base experiments: ./results/base_${DATASET_NAME}_${MODEL_NAME}_batch_*.log"
 echo "========================================="
