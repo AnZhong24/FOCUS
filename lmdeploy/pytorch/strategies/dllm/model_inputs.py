@@ -87,7 +87,7 @@ class DLLMModelInputsStrategy(ModelInputsStrategy):
             )
             inputs.ragged_tile_to_seq = tile_to_seq
             inputs.ragged_seq_tile_offsets = seq_tile_offsets
-            # FOCUS-only warmup metadata. FOCUS runs (and prunes) tokens before
+            # FOCUS-only warmup metadata. FOCUS runs (and evicts) tokens before
             # CUDA graph capture, so the warmup path also needs a valid (even if
             # degenerate) focus view to avoid hitting None attributes.
             if self.enable_focus:

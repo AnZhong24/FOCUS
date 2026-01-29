@@ -283,32 +283,32 @@ class CUDAGraphRunner(GraphRunner):
             prefix_fn = self.model.forward_focus_prefix
             suffix_fn = self.model.get_focus_suffix_model
 
-            # stage 1: eager prefix (includes FOCUS pruning)
+            # stage 1: eager prefix (includes FOCUS eviction)
             hidden_states, residual, query_states = prefix_fn(**kwargs)
 
-            # updated/pruned inputs live on the context
-            pruned_input_ids = context.input_ids
-            pruned_position_ids = context.position_ids
-            pruned_attn_metadata = context.attn_metadata
+            # post-eviction inputs live on the context
+            post_eviction_input_ids = context.input_ids
+            post_eviction_position_ids = context.position_ids
+            post_eviction_attn_metadata = context.attn_metadata
 
-            # graph key based on post-pruning (stable) shapes
+            # graph key based on post-eviction (stable) shapes
             suffix_graph_key = self.get_graph_key(
-                input_ids=pruned_input_ids,
-                position_ids=pruned_position_ids,
+                input_ids=post_eviction_input_ids,
+                position_ids=post_eviction_position_ids,
                 past_key_values=kwargs['past_key_values'],
-                attn_metadata=pruned_attn_metadata,
+                attn_metadata=post_eviction_attn_metadata,
                 inputs_embeds=None,
             )
             max_batches = suffix_graph_key[0]
             is_decoding = suffix_graph_key[1]
-            use_delayed_cache = getattr(pruned_attn_metadata, 'use_delayed_cache', False)
+            use_delayed_cache = getattr(post_eviction_attn_metadata, 'use_delayed_cache', False)
             decode_query_len = suffix_graph_key[3]
 
             runner = self._runner_map.get(suffix_graph_key, None)
             if runner is None:
                 max_tokens = self._get_max_tokens(suffix_graph_key,
-                                                  pruned_input_ids,
-                                                  pruned_attn_metadata.q_seqlens,
+                                                  post_eviction_input_ids,
+                                                  post_eviction_attn_metadata.q_seqlens,
                                                   use_delayed_cache=use_delayed_cache)
                 suffix_model = suffix_fn()
                 runner = CUDASingleGraphRunner(
@@ -326,10 +326,10 @@ class CUDAGraphRunner(GraphRunner):
                     max_buffer_batch_size=self.max_batches if use_delayed_cache else None,
                 )
                 output = runner.capture(
-                    input_ids=pruned_input_ids,
-                    position_ids=pruned_position_ids,
+                    input_ids=post_eviction_input_ids,
+                    position_ids=post_eviction_position_ids,
                     past_key_values=kwargs['past_key_values'],
-                    attn_metadata=pruned_attn_metadata,
+                    attn_metadata=post_eviction_attn_metadata,
                     inputs_embeds=None,
                     hidden_states=hidden_states,
                     residual=residual,
@@ -339,10 +339,10 @@ class CUDAGraphRunner(GraphRunner):
                 return output
             else:
                 output = runner.forward(
-                    input_ids=pruned_input_ids,
-                    position_ids=pruned_position_ids,
+                    input_ids=post_eviction_input_ids,
+                    position_ids=post_eviction_position_ids,
                     past_key_values=kwargs['past_key_values'],
-                    attn_metadata=pruned_attn_metadata,
+                    attn_metadata=post_eviction_attn_metadata,
                     inputs_embeds=None,
                     hidden_states=hidden_states,
                     residual=residual,

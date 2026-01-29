@@ -28,6 +28,29 @@ DatasetFormat = str
 DEFAULT_HF_SHUFFLE_BUFFER_SIZE = 100_000
 
 
+def _looks_like_math(example: Dict[str, Any]) -> bool:
+    if not isinstance(example, dict):
+        return False
+    if 'problem' not in example:
+        return False
+    return 'solution' in example or 'answer' in example
+
+
+def _extract_math_messages(example: Dict[str, Any]) -> Optional[List[Dict[str, str]]]:
+    problem = example.get('problem')
+    solution = example.get('solution', example.get('answer'))
+    if problem is None or solution is None:
+        return None
+    problem_text = str(problem).strip()
+    solution_text = str(solution).strip()
+    if not problem_text or not solution_text:
+        return None
+    return [
+        {'role': 'user', 'content': problem_text},
+        {'role': 'assistant', 'content': solution_text},
+    ]
+
+
 def _normalize_role(role: Any) -> str:
     role = str(role).strip().lower()
     if role in ('human', 'user'):
@@ -41,6 +64,12 @@ def _normalize_role(role: Any) -> str:
 
 def _extract_messages(example: Dict[str, Any], dataset_format: DatasetFormat = 'auto') -> Optional[List[Dict[str, str]]]:
     """Extract a list of {role, content} messages from a dataset row."""
+    if dataset_format == 'math':
+        return _extract_math_messages(example)
+    if dataset_format == 'auto' and _looks_like_math(example):
+        messages = _extract_math_messages(example)
+        if messages is not None:
+            return messages
     turns = None
     if dataset_format == 'sharegpt':
         key_order = ('conversations', 'conversation', 'messages')
@@ -372,27 +401,6 @@ def _summarize_profiler_slice(profiler: Profiler, sessions, title: str, hyperpar
     partial_profiler.summarize(title=title, hyperparams=hyperparams)
 
 
-def _full_batch_completion_target(total_prompts: int, concurrency: int) -> int:
-    """Return the number of completions that keep the system fully saturated."""
-    if total_prompts <= 0 or concurrency <= 0:
-        return 0
-    target = total_prompts - concurrency + 1
-    if target <= 0 or target >= total_prompts:
-        return 0
-    return target
-
-
-def _earliest_completed_sessions(profiler: Profiler, count: int):
-    """Pick the earliest `count` completed sessions based on finish timestamps."""
-    if count <= 0:
-        return []
-    completed = [sess for sess in profiler.sessions if sess.status == Session.SUCCESS and sess.ts]
-    if not completed:
-        return []
-    completed.sort(key=lambda sess: sess.ts[-1])
-    return completed[:min(count, len(completed))]
-
-
 class _UInt64RollingHasher:
     """Simple rolling hash helper that works modulo 2**64."""
 
@@ -555,6 +563,7 @@ class Engine:
             token_ids = input_ids.copy()
             stop_due_to_repetition = False
             repetition_state = repetition_detector.create_state() if repetition_detector else None
+            last_dllm_stats = None
 
             generator = model_inst.async_stream_infer(session_id,
                                                       input_ids=input_ids,
@@ -588,10 +597,7 @@ class Engine:
                     sess.tick(n_token)
                     stats = getattr(outputs.req_metrics, 'dllm_stats', None) if outputs.req_metrics else None
                     if stats:
-                        processed = stats.get('processed_tokens', 0)
-                        steps = stats.get('decode_steps', 0)
-                        self.dllm_processed_tokens += processed
-                        self.dllm_decode_steps += steps
+                        last_dllm_stats = stats
                     if repetition_hit:
                         stop_due_to_repetition = True
                         if not skip_detokenize:
@@ -599,6 +605,9 @@ class Engine:
                             print('[INFO] Early stop: repetitive output detected.')
                         await model_inst.async_cancel(session_id)
                         break
+                if last_dllm_stats:
+                    self.dllm_processed_tokens += last_dllm_stats.get('processed_tokens', 0)
+                    self.dllm_decode_steps += last_dllm_stats.get('decode_steps', 0)
                 sess.finish(Session.SUCCESS)
                 if not skip_detokenize:
                     print()
@@ -658,7 +667,8 @@ def parse_args():
                                      formatter_class=DefaultsAndTypesHelpFormatter)
     parser.add_argument('dataset',
                         type=str,
-                        help='Dataset path (.json/.jsonl) or HuggingFace dataset ID (e.g. allenai/WildChat).')
+                        help='Dataset path (.json/.jsonl) or HuggingFace dataset ID '
+                        '(e.g. allenai/WildChat, nlile/hendrycks-MATH-benchmark).')
     parser.add_argument('model_path',
                         type=str,
                         help='the path of model in localhost or '
@@ -666,8 +676,9 @@ def parse_args():
     parser.add_argument('--dataset-format',
                         type=str,
                         default='auto',
-                        choices=['auto', 'sharegpt', 'wildchat'],
-                        help='Dataset format: ShareGPT JSON, WildChat (HF or JSON/JSONL), or auto-detect.')
+                        choices=['auto', 'sharegpt', 'wildchat', 'math'],
+                        help='Dataset format: ShareGPT JSON, WildChat (HF or JSON/JSONL), '
+                        'Hendrycks MATH, or auto-detect.')
     parser.add_argument('--hf-split',
                         type=str,
                         default='train',
@@ -889,16 +900,6 @@ def main():
             ('Repeat block window', args.repeat_block_window),
             ('Repeat block threshold', args.repeat_block_threshold),
         ])
-    total_requests = len(requests)
-    completion_target = _full_batch_completion_target(total_requests, effective_concurrency)
-    subset_sessions = _earliest_completed_sessions(profiler, completion_target)
-    if subset_sessions:
-        partial_hyperparams = hyperparams + [('Prompts covered', len(subset_sessions))]
-        _summarize_profiler_slice(profiler,
-                                  sessions=subset_sessions,
-                                  title='Profile LLM Throughput (Full Batches)',
-                                  hyperparams=partial_hyperparams)
-
     profiler.compute_metrics()
     profiler.summarize(title='Profile LLM Throughput', hyperparams=hyperparams)
     if getattr(engine, 'repetition_stops', 0):

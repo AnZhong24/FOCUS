@@ -104,11 +104,11 @@ def _reference_focus_enforce_rules(block_positions: torch.Tensor, block_progress
 
 
 def _reference_focus_select_and_enforce(delta: torch.Tensor, valid_mask: torch.Tensor, targets: torch.Tensor,
-                                        should_prune: torch.Tensor, block_positions: torch.Tensor,
+                                        should_evict: torch.Tensor, block_positions: torch.Tensor,
                                         block_progress: torch.Tensor) -> torch.Tensor:
-    effective_targets = torch.where(should_prune, targets, torch.zeros_like(targets))
+    effective_targets = torch.where(should_evict, targets, torch.zeros_like(targets))
     selection = _reference_focus_select_mask(delta, valid_mask, effective_targets)
-    retain = torch.where(should_prune.unsqueeze(1), selection, valid_mask)
+    retain = torch.where(should_evict.unsqueeze(1), selection, valid_mask)
     return _reference_focus_enforce_rules(block_positions, block_progress, retain, valid_mask)
 
 
@@ -350,7 +350,7 @@ def test_focus_select_and_enforce_ragged_matches_reference():
     block_positions = torch.randint(0, block_count, (total, ), device=device, dtype=torch.long)
     block_progress = torch.randint(-1, block_count, (num_seq, ), device=device, dtype=torch.long)
     targets = torch.randint(0, max_len + 1, (num_seq, ), device=device, dtype=torch.int32)
-    should_prune = torch.rand(num_seq, device=device) > 0.4
+    should_evict = torch.rand(num_seq, device=device) > 0.4
     base_offset = 3
     mask_indices = torch.arange(total, device=device, dtype=torch.long) + base_offset
     proc_length = total + base_offset
@@ -378,11 +378,11 @@ def test_focus_select_and_enforce_ragged_matches_reference():
                                             proc_indices.clone(),
                                             mask_indptr.clone(),
                                             targets.clone(),
-                                            should_prune.clone(),
+                                            should_evict.clone(),
                                             block_progress.clone(),
                                             runtime_max_len)
     reference = _reference_focus_select_and_enforce(padded_delta.cpu(), valid_mask.cpu(), targets.cpu(),
-                                                    should_prune.cpu(), padded_positions.cpu(),
+                                                    should_evict.cpu(), padded_positions.cpu(),
                                                     block_progress.cpu())
     expected = []
     for idx, length in enumerate(lengths.tolist()):

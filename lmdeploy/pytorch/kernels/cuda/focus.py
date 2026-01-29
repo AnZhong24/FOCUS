@@ -172,8 +172,8 @@ def _focus_select_enforce_ragged_kernel(
     counts = tl.sum(valid_f32, axis=0).to(tl.float32)
 
     target = tl.load(TARGETS + seq).to(tl.int32)
-    should_prune = tl.load(SHOULD + seq).to(tl.int1)
-    target = tl.where(should_prune, target, 0)
+    should_evict = tl.load(SHOULD + seq).to(tl.int1)
+    target = tl.where(should_evict, target, 0)
     target = tl.maximum(target, 0)
     max_counts = counts.to(tl.int32)
     target = tl.minimum(target, max_counts)
@@ -211,7 +211,7 @@ def _focus_select_enforce_ragged_kernel(
     selection = tl.where(use_threshold, candidate_mask, selected)
     selection = selection & valid_row & in_bounds
 
-    base_retain = tl.where(should_prune, selection, (valid_row & in_bounds))
+    base_retain = tl.where(should_evict, selection, (valid_row & in_bounds))
     retain_ptr = OUTPUT + start
     tl.store(retain_ptr + offs, base_retain, mask=in_bounds)
 
@@ -647,7 +647,7 @@ def focus_select_and_enforce_ragged(importance: torch.Tensor,
                                     proc_indices: torch.Tensor,
                                     mask_indptr: torch.Tensor,
                                     targets: torch.Tensor,
-                                    should_prune: torch.Tensor,
+                                    should_evict: torch.Tensor,
                                     block_progress: torch.Tensor,
                                     max_len: int) -> torch.Tensor:
     """Ragged variant that also computes delta/block positions inside the Triton kernel."""
@@ -662,7 +662,7 @@ def focus_select_and_enforce_ragged(importance: torch.Tensor,
                                               proc_indices,
                                               mask_indptr,
                                               targets,
-                                              should_prune,
+                                              should_evict,
                                               block_progress,
                                               output,
                                               block_progress.stride(0),

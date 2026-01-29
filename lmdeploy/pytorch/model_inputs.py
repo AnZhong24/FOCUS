@@ -141,7 +141,7 @@ class FocusRuntimeView:
     processing_mask_lengths: torch.Tensor
     processing_mask_total: int = 0
     processing_mask_max_len: int = 0
-    processing_mask_prunable: bool = False
+    processing_mask_evictable: bool = False
     block_progress_host: torch.LongTensor = None
     block_progress_event: Optional[torch.cuda.Event] = None
     new_q_lens_host_buffer: Optional[torch.Tensor] = None
@@ -542,7 +542,7 @@ class StepContext:
             processing_mask_max_len = mask_lengths_cpu.max().item()
             retain_cpu = torch.ceil(avg_tokens_cpu * focus_params.focus_alpha).to(dtype=mask_lengths_cpu.dtype)
             targets_cpu = torch.minimum(mask_lengths_cpu, retain_cpu)
-            should_prune = ((targets_cpu > 0) & (mask_lengths_cpu > targets_cpu)).any().item()
+            should_evict = ((targets_cpu > 0) & (mask_lengths_cpu > targets_cpu)).any().item()
             block_progress_host = inputs.focus_block_progress
             block_progress = block_progress_host.to(device=device, non_blocking=True)
             focus_view = FocusRuntimeView(
@@ -553,7 +553,7 @@ class StepContext:
                 processing_mask_lengths=mask_lengths,
                 processing_mask_total=processing_mask_total,
                 processing_mask_max_len=processing_mask_max_len,
-                processing_mask_prunable=should_prune,
+                processing_mask_evictable=should_evict,
                 block_progress_host=block_progress_host,
                 new_q_lens_host_buffer=q_lens_host_buffer,
             )

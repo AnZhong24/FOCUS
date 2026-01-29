@@ -258,7 +258,11 @@ class EngineLoop:
             if num_draft_tokens is not None and model_inputs.is_decoding and self.config.enable_metrics:
                 num_accepted_tokens = (batched_outputs.next_token_ids[idx] > -1).sum() - 1
                 spec_info = dict(num_draft_tokens=num_draft_tokens, num_accepted_tokens=num_accepted_tokens)
-            req_metrics = RequestMetrics(new_token_timestamp, msg.engine_events, spec_info=spec_info)
+            # get dllm stats if available
+            dllm_stats = None
+            if hasattr(msg, 'get_dllm_request_stats'):
+                dllm_stats = msg.get_dllm_request_stats()
+            req_metrics = RequestMetrics(new_token_timestamp, msg.engine_events, spec_info=spec_info, dllm_stats=dllm_stats)
             out = InferOutput(session_id=session_id,
                               resp=msg.resp,
                               finish=finish,
@@ -401,7 +405,11 @@ class EngineLoop:
             token_ids = [msg.migration_request.remote_token_id]
             # MUST be a wall-clock time
             new_token_timestamp = time.time()
-            req_metrics = RequestMetrics(new_token_timestamp, msg.engine_events)
+            # get dllm stats if available
+            dllm_stats = None
+            if hasattr(msg, 'get_dllm_request_stats'):
+                dllm_stats = msg.get_dllm_request_stats()
+            req_metrics = RequestMetrics(new_token_timestamp, msg.engine_events, dllm_stats=dllm_stats)
             out = InferOutput(
                 session_id=session_id,
                 resp=msg.resp,

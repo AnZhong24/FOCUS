@@ -132,23 +132,23 @@ class SDARAttention(nn.Module):
         k_scales = None if not has_scales else past_key_value[2]
         v_scales = None if not has_scales else past_key_value[3]
         focus_fill_only = focus_active and self.layer_idx == 1
-        if focus_active and self.layer_idx == 0 and context.focus_view.processing_mask_prunable:
+        if focus_active and self.layer_idx == 0 and context.focus_view.processing_mask_evictable:
             # torch.cuda.nvtx.range_push("self._compute_focus_importance")
             self._compute_focus_importance(context, query_states, key_states)
             # torch.cuda.nvtx.range_pop()
         elif focus_fill_only:
-            if context.focus_view.processing_mask_prunable:
+            if context.focus_view.processing_mask_evictable:
                 # For better overlap.
                 new_q_lens = torch.zeros_like(context.q_seqlens)
-                # torch.cuda.nvtx.range_push("self._prepare_focus_pruning")
-                retain_processing_mask = self._prepare_focus_pruning(context, query_states, key_states)
+                # torch.cuda.nvtx.range_push("self._prepare_focus_eviction")
+                retain_processing_mask = self._prepare_focus_eviction(context, query_states, key_states)
                 # torch.cuda.nvtx.range_pop()
-                # Preserve the original ragged view for KV fill before pruning.
+                # Preserve the original ragged view for KV fill before eviction.
                 self.attn_fwd.forward_only_fill_kv(key_states, value_states, k_cache, v_cache, attn_metadata,
                                                    k_scales_zeros=k_scales, v_scales_zeros=v_scales)
-                # torch.cuda.nvtx.range_push("self._apply_focus_pruning")
+                # torch.cuda.nvtx.range_push("self._apply_focus_eviction")
                 (query_states, key_states, value_states, hidden_states, updated_residual,
-                    new_proc_indices, new_q_lens, new_q_lens_host) = self._apply_focus_pruning(
+                    new_proc_indices, new_q_lens, new_q_lens_host) = self._apply_focus_eviction(
                     context,
                     hidden_states,
                     query_states,
@@ -226,7 +226,7 @@ class SDARAttention(nn.Module):
         importance.index_copy_(0, mask_indices, importance_flat)
         context.focus_first_layer_scores = importance
 
-    def _prepare_focus_pruning(
+    def _prepare_focus_eviction(
         self,
         context: StepContext,
         query_states: torch.Tensor,
@@ -241,13 +241,13 @@ class SDARAttention(nn.Module):
         mask_lengths = view.processing_mask_lengths
         avg_tokens = view.avg_decoded_tokens
         targets = focus_compute_targets(mask_lengths, avg_tokens, context.focus_params.focus_alpha)
-        should_prune = (targets > 0) & (mask_lengths > targets)
+        should_evict = (targets > 0) & (mask_lengths > targets)
 
         retain_processing_mask = torch.ones_like(proc_indices, dtype=torch.bool, device=device)
 
         total_masked = view.processing_mask_total
-        should_prune_any = view.processing_mask_prunable
-        if total_masked > 0 and should_prune_any:
+        should_evict_any = view.processing_mask_evictable
+        if total_masked > 0 and should_evict_any:
             max_mask_len = view.processing_mask_max_len
             mask_importance_flat = focus_importance_ragged(query_states,
                                                            key_states,
@@ -262,7 +262,7 @@ class SDARAttention(nn.Module):
                                                                proc_indices,
                                                                mask_indptr,
                                                                targets,
-                                                               should_prune,
+                                                               should_evict,
                                                                view.block_progress,
                                                                max_mask_len)
             retain_processing_mask[mask_globals] = retain_mask_flat
@@ -274,7 +274,7 @@ class SDARAttention(nn.Module):
         keep_tokens_event.record()
         return retain_processing_mask
 
-    def _apply_focus_pruning(
+    def _apply_focus_eviction(
         self,
         context: StepContext,
         attn_output: torch.Tensor,
@@ -323,7 +323,7 @@ class SDARAttention(nn.Module):
         context.rotary_pos_emb = new_rotary
         return query_states, key_states, value_states, attn_output, new_residual, new_proc_indices, new_q_lens, new_q_lens_host
 
-    def forward_focus_qkv_and_prune(
+    def forward_focus_qkv_and_evict(
         self,
         hidden_states: torch.Tensor,
         rotary_pos_emb: Tuple[torch.FloatTensor, torch.FloatTensor],
@@ -331,7 +331,7 @@ class SDARAttention(nn.Module):
         attn_metadata: Any = None,
         residual: Optional[torch.Tensor] = None,
     ):
-        """Forward through QKV, norms, rotary, and FOCUS pruning for layer 1.
+        """Forward through QKV, norms, rotary, and FOCUS eviction for layer 1.
 
         This is the prefix part that runs eagerly before CUDA graph capture.
         Returns compacted query_states, hidden_states, and residual for the suffix.
@@ -358,26 +358,26 @@ class SDARAttention(nn.Module):
         k_scales = None if not has_scales else past_key_value[2]
         v_scales = None if not has_scales else past_key_value[3]
 
-        if not context.focus_view.processing_mask_prunable:
+        if not context.focus_view.processing_mask_evictable:
             context.update_focus_progress_only()
             self.attn_fwd.forward_only_fill_kv(key_states, value_states, k_cache, v_cache, attn_metadata,
                                                k_scales_zeros=k_scales, v_scales_zeros=v_scales)
             return query_states, hidden_states, updated_residual
 
-        # Prepare pruning
+        # Prepare eviction
         new_q_lens = torch.zeros_like(context.q_seqlens)
-        # torch.cuda.nvtx.range_push("self._prepare_focus_pruning")
-        retain_processing_mask = self._prepare_focus_pruning(context, query_states, key_states)
+        # torch.cuda.nvtx.range_push("self._prepare_focus_eviction")
+        retain_processing_mask = self._prepare_focus_eviction(context, query_states, key_states)
         # torch.cuda.nvtx.range_pop()
 
-        # Fill KV cache before pruning
+        # Fill KV cache before eviction
         self.attn_fwd.forward_only_fill_kv(key_states, value_states, k_cache, v_cache, attn_metadata,
                                            k_scales_zeros=k_scales, v_scales_zeros=v_scales)
 
-        # Apply pruning
-        # torch.cuda.nvtx.range_push("self._apply_focus_pruning")
+        # Apply eviction
+        # torch.cuda.nvtx.range_push("self._apply_focus_eviction")
         (query_states, key_states, value_states, hidden_states, updated_residual,
-            new_proc_indices, new_q_lens, new_q_lens_host) = self._apply_focus_pruning(
+            new_proc_indices, new_q_lens, new_q_lens_host) = self._apply_focus_eviction(
             context,
             hidden_states,
             query_states,
@@ -400,7 +400,7 @@ class SDARAttention(nn.Module):
         attn_metadata: Any = None,
         residual: Optional[torch.Tensor] = None,
     ):
-        """Forward through attention and o_proj for layer 1 after FOCUS pruning.
+        """Forward through attention and o_proj for layer 1 after FOCUS eviction.
 
         This is the suffix part that can be captured in CUDA graph.
         """
@@ -543,12 +543,12 @@ class SDARDecoderLayer(nn.Module):
     ):
         """Forward the prefix part of layer 1 with FOCUS.
 
-        Does layernorm, QKV projection, and pruning. Returns compacted states for the suffix.
+        Does layernorm, QKV projection, and eviction. Returns compacted states for the suffix.
         This runs eagerly before CUDA graph capture.
         """
         hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        query_states, hidden_states, residual = self.self_attn.forward_focus_qkv_and_prune(
+        query_states, hidden_states, residual = self.self_attn.forward_focus_qkv_and_evict(
             hidden_states=hidden_states,
             rotary_pos_emb=rotary_pos_emb,
             past_key_value=past_key_value,
@@ -678,8 +678,8 @@ class SDARModel(nn.Module):
         """Run the prefix part of the first two decoder layers eagerly.
 
         This helper is used by the CUDA graph runner when FOCUS is enabled.
-        FOCUS prunes tokens inside layer 1, so we execute layer 0 fully and
-        layer 1's QKV/pruning eagerly, then capture the remaining suffix
+        FOCUS evicts tokens inside layer 1, so we execute layer 0 fully and
+        layer 1's QKV/eviction eagerly, then capture the remaining suffix
         (layer 1's attention + layers 2+) with fixed shapes.
 
         Returns:
@@ -691,7 +691,7 @@ class SDARModel(nn.Module):
 
         hidden_states = inputs_embeds
 
-        # initial rotary embedding (pre-pruning)
+        # initial rotary embedding (pre-eviction)
         cos, sin = self.rotary_emb(hidden_states, position_ids)
         cos, sin = cos[0], sin[0]
         rotary_pos_emb = (cos, sin)
@@ -709,7 +709,7 @@ class SDARModel(nn.Module):
             attn_metadata=attn_metadata,
         )
 
-        # Layer 1: only prefix (QKV projection, norms, rotary, pruning)
+        # Layer 1: only prefix (QKV projection, norms, rotary, eviction)
         # The attention and o_proj will be done in the suffix (CUDA graph)
         query_states, hidden_states, residual = self.layers[1].forward_focus_prefix(
             hidden_states,
@@ -884,8 +884,8 @@ class SDARForCausalLM(nn.Module, CudaGraphMixin):
 class SDARPostFocusSuffix(nn.Module, CudaGraphMixin):
     """Suffix of SDAR used for CUDA graph after FOCUS eviction.
 
-    This module takes pruned hidden_states/residual/query_states (after layer 1's
-    QKV projection and pruning) and runs layer 1's attention + o_proj, followed by
+    This module takes compacted hidden_states/residual/query_states (after layer 1's
+    QKV projection and eviction) and runs layer 1's attention + o_proj, followed by
     the remaining decoder layers and final norm. Input tensors are padded to
     ``graph_meta.max_tokens`` so CUDA graph shapes stay fixed.
     """
@@ -1031,7 +1031,7 @@ class SDARPostFocusSuffix(nn.Module, CudaGraphMixin):
         post-attention layernorm and MLP, then proceeds with layers 2+.
         """
         parent = self._parent_ref()
-        # Recompute rotary embeddings for the (padded) pruned inputs.
+        # Recompute rotary embeddings for the (padded) post-eviction inputs.
         cos, sin = parent.model.rotary_emb(hidden_states, position_ids)
         cos, sin = cos[0], sin[0]
         rotary_pos_emb = (cos, sin)

@@ -463,7 +463,7 @@ class BaseModelAgent:
 
             # warmup decoding(with cuda graph)
             capture_batch_sizes = self.patched_model.get_capture_batch_sizes()
-            if self.inputs_strategy.enable_focus:
+            if self.model_config.model_paradigm == 'dllm' and self.inputs_strategy.enable_focus:
                 focus_cap = (max_batches + 1) // 2
                 capture_batch_sizes = sorted({min(bs, focus_cap) for bs in capture_batch_sizes})
             else:

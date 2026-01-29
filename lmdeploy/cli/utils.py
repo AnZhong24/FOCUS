@@ -716,11 +716,11 @@ class ArgumentHelper:
 
     @staticmethod
     def dllm_enable_focus(parser):
-        """Enable FOCUS pruning for DLLM decoding."""
+        """Enable FOCUS eviction for DLLM decoding."""
         return parser.add_argument('--dllm-enable-focus',
                                    action='store_true',
                                    default=False,
-                                   help='Enable FOCUS token-importance pruning between the first two SDAR layers.')
+                                   help='Enable FOCUS token-importance eviction between the first two SDAR layers.')
 
     @staticmethod
     def dllm_focus_alpha(parser):
