@@ -28,3 +28,4 @@ triton<=3.4.0,>=3.0.0; sys_platform == "linux" and "aarch64" not in platform_mac
 uvicorn
 xgrammar
 uvloop
+datasets>=4.4.1
