@@ -21,7 +21,7 @@ From inspecting this repo and the git diff, the main FOCUS-related changes are i
 - `lmdeploy/pytorch/engine/inputs_maker.py`: builds focus masks and pinned buffers for delayed cache batches.
 - `lmdeploy/pytorch/engine/model_agent.py`: propagates processed positions back to the scheduler.
 - `tests/pytorch/kernel/test_focus_kernels.py` and `tests/pytorch/models/test_focus_pruning.py`: FOCUS test coverage.
-- `benchmark/run_focus_throughput_evaluation.sh`, `benchmark/run_block_size_comparison.sh`, and `benchmark/run_sdar_delayed_cache_benchmark.sh`: benchmarking entry points.
+- `benchmark/run_focus_throughput_evaluation.sh`, `benchmark/run_baseline_throughput_evaluation.sh`, `benchmark/run_block_size_comparison.sh`, and `benchmark/run_sdar_delayed_cache_benchmark.sh`: benchmarking entry points.
 
 ## Install (CUDA)
 
@@ -46,7 +46,7 @@ DISABLE_TURBOMIND=1 pip install -e .
 
 All scripts write logs to `./results`. Run them from the repo root.
 
-- Focus vs base throughput:
+- FOCUS throughput:
 
 ```bash
 benchmark/run_focus_throughput_evaluation.sh <dataset_id> <model_id> [alpha]
@@ -62,6 +62,21 @@ benchmark/run_focus_throughput_evaluation.sh anon8231489123/ShareGPT_Vicuna_unfi
 Notes:
 - For `hendrycks-MATH` datasets, the script automatically sets `--dataset-format math`.
 - Focus uses `--dllm-enable-delayed-cache` and `--dllm-enable-focus` with `--dllm-focus-alpha` (default: 1.5).
+
+- LMDeploy throughput:
+
+```bash
+benchmark/run_baseline_throughput_evaluation.sh <dataset_id> <model_id>
+```
+
+Example:
+
+```bash
+benchmark/run_baseline_throughput_evaluation.sh anon8231489123/ShareGPT_Vicuna_unfiltered JetLM/SDAR-8B-Chat-b32
+```
+
+Notes:
+- For `hendrycks-MATH` datasets, the script automatically sets `--dataset-format math`.
 - Base uses `--dllm-confidence-threshold 0.9` without focus.
 
 - Block size comparison for SDAR:

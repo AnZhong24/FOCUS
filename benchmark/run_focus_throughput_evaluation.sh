@@ -1,12 +1,13 @@
 #!/bin/bash
 
-# Script to run throughput benchmark with different batch sizes, datasets, and models
-# This script executes the profile_throughput.py benchmark for multiple configurations:
+# Script to run focus throughput benchmark with different batch sizes, datasets, and models
+# This script executes the profile_throughput.py benchmark for focus configuration:
 # - Dataset: Specified as command line argument (first parameter)
 # - Model: Specified as command line argument (second parameter)
-# - 2 experiment types: Focus (threshold 0.8) and Base (threshold 0.9)
+# - Focus experiment type: threshold 0.8
+# - Alpha: Specified as command line argument (third parameter, default: 1.5)
 # - 4 batch sizes: 32, 64, 128, and 256
-# Total per dataset: 2 experiment types × 4 batch sizes = 8 benchmarks
+# Total per dataset: 4 benchmarks
 # Output is saved to ./results directory
 #
 # Usage: ./run_focus_throughput_evaluation.sh <dataset_id> <model_id> [alpha]
@@ -143,47 +144,6 @@ echo ""
             
             echo ""
         done
-        
-        # ============================================
-        # Run Base Experiment for this dataset and model
-        # ============================================
-        echo "========================================="
-        echo "Starting BASE EXPERIMENT for ${DATASET_NAME} - ${MODEL_NAME}"
-        echo "========================================="
-        
-        # Base experiment specific parameters
-        # --dllm-confidence-threshold 0.9: Higher confidence threshold for base experiment
-        # Note: delayed cache and focus are disabled by default (no flags)
-        
-        BASE_PARAMS="${COMMON_PARAMS} \
-            --dllm-confidence-threshold 0.9"
-        
-        for BATCH_SIZE in "${BATCH_SIZES[@]}"
-        do
-            echo "========================================="
-            echo "Running BASE benchmark: ${DATASET_NAME}, ${MODEL_NAME}, batch size: ${BATCH_SIZE}"
-            echo "========================================="
-            
-            # Define output file paths for stdout and stderr
-            OUTPUT_FILE="./results/base_${DATASET_NAME}_${MODEL_NAME}_batch_${BATCH_SIZE}.log"
-            ERROR_FILE="./results/base_${DATASET_NAME}_${MODEL_NAME}_batch_${BATCH_SIZE}.err"
-            
-            # Execute the command with the current batch size
-            # --concurrency parameter controls the batch size
-            # Redirect stdout to OUTPUT_FILE and stderr to ERROR_FILE
-            python benchmark/profile_throughput.py ${BASE_PARAMS} "${DATASET_ARGS[@]}" --concurrency ${BATCH_SIZE} ${DATASET} ${MODEL} > ${OUTPUT_FILE} 2> ${ERROR_FILE}
-            
-            # Check if the command executed successfully
-            if [ $? -eq 0 ]; then
-                echo "Benchmark completed successfully"
-                echo "Output saved to: ${OUTPUT_FILE}"
-            else
-                echo "Benchmark failed"
-                echo "Check error log: ${ERROR_FILE}"
-            fi
-            
-            echo ""
-        done
 
 echo "========================================="
 echo "Completed all benchmarks for ${DATASET_NAME} - ${MODEL_NAME}"
@@ -198,7 +158,6 @@ echo "Results summary:"
 echo "  Dataset: ${DATASET}"
 echo "  Model: ${MODEL}"
 echo "  Alpha: ${ALPHA}"
-echo "  Total benchmarks run: 8 (2 experiment types × 4 batch sizes)"
+echo "  Total benchmarks run: 4 (1 experiment type × 4 batch sizes)"
 echo "  Focus experiments: ./results/focus_${DATASET_NAME}_${MODEL_NAME}_alpha_${ALPHA}_batch_*.log"
-echo "  Base experiments: ./results/base_${DATASET_NAME}_${MODEL_NAME}_batch_*.log"
 echo "========================================="
