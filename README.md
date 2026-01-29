@@ -98,3 +98,7 @@ This runs `JetLM/SDAR-8B-Chat-b32` with delayed cache enabled and FOCUS disabled
 Dataset notes:
 - `dataset_id` can be a HuggingFace dataset ID or a local JSON/JSONL path supported by `benchmark/profile_throughput.py`.
 - HuggingFace dataset IDs require the `datasets` package and network access.
+
+## Generation quality testing
+
+For generation quality evaluation of SDAR/LLaDA2 models, see [`opencompass-0.5.1.post1/README.md`](opencompass-0.5.1.post1/README.md) for OpenCompass benchmarking instructions with either HuggingFace/Transformers or LMDeploy backends.
