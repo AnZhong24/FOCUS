@@ -22,13 +22,22 @@ from transformers.utils import TransformersKwargs, auto_docstring, can_return_tu
 from .configuration_sdar import SDARConfig
 from opencompass.models.sdar_utils import get_context, set_context
 
-from flash_attn.ops.triton.layer_norm import rms_norm_fn as flash_rms_norm
-
 import torch.nn.functional as F
-try:
-    from flash_attn import flash_attn_func
-except:
-    pass
+
+flash_rms_norm = None
+flash_attn_func = None
+if torch.cuda.is_available():
+    try:
+        from flash_attn.ops.triton.layer_norm import rms_norm_fn as flash_rms_norm
+    except Exception:
+        flash_rms_norm = None
+
+    try:
+        from flash_attn import flash_attn_func as _flash_attn_func
+
+        flash_attn_func = _flash_attn_func
+    except Exception:
+        flash_attn_func = None
 
 try:
     from liger_kernel.ops.swiglu import LigerSiLUMulFunction  # noqa: F401
@@ -64,16 +73,15 @@ class SDARRMSNorm(nn.Module):
         self.variance_epsilon = eps
 
     def forward(self, hidden_states):
-        return flash_rms_norm(
-            hidden_states, weight=self.weight, bias=None, eps=self.variance_epsilon)
-        '''
         input_dtype = hidden_states.dtype
-        hidden_states = hidden_states.to(torch.float32)
-        variance = hidden_states.pow(2).mean(-1, keepdim=True)
-        hidden_states = hidden_states * \
-            torch.rsqrt(variance + self.variance_epsilon)
-        return self.weight * hidden_states.to(input_dtype)
-        '''
+        if flash_rms_norm is not None and hidden_states.is_cuda:
+            return flash_rms_norm(
+                hidden_states, weight=self.weight, bias=None, eps=self.variance_epsilon)
+
+        hidden_states_fp32 = hidden_states.to(torch.float32)
+        variance = hidden_states_fp32.pow(2).mean(-1, keepdim=True)
+        hidden_states_norm = hidden_states_fp32 * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states_norm.to(input_dtype)
 
     def extra_repr(self):
         return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
@@ -353,17 +361,29 @@ class SDARAttention(nn.Module):
                 [past_value_states, value_states], dim=-2)
 
         attention_mask = attention_mask.bool() if attention_mask is not None else None
-        if torch.all(attention_mask):  # decoding
-            query_states = query_states.transpose(1, 2)
-            key_states = key_states.transpose(1, 2)
-            value_states = value_states.transpose(1, 2)
-            attn_output = flash_attn_func(
-                query_states,
-                key_states,
-                value_states,
-                causal=False,
-                softmax_scale=self.scaling
-            )
+        if attention_mask is not None and torch.all(attention_mask):  # decoding
+            if flash_attn_func is not None and query_states.is_cuda:
+                query_states = query_states.transpose(1, 2)
+                key_states = key_states.transpose(1, 2)
+                value_states = value_states.transpose(1, 2)
+                attn_output = flash_attn_func(
+                    query_states,
+                    key_states,
+                    value_states,
+                    causal=False,
+                    softmax_scale=self.scaling
+                )
+            else:
+                attn_output = F.scaled_dot_product_attention(
+                    query=query_states,
+                    key=key_states,
+                    value=value_states,
+                    attn_mask=None,
+                    is_causal=False,
+                    scale=self.scaling,
+                    enable_gqa=True,
+                )
+                attn_output = attn_output.transpose(1, 2).contiguous()
 
         else:  # prefilling
             attn_output = F.scaled_dot_product_attention(
