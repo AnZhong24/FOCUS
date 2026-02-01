@@ -8,6 +8,10 @@ FOCUS uses attention-derived token importance from early layers to predict which
 
 ![FOCUS architecture overview](assets/FOCUS.svg)
 
+## Efficiency Improvement
+
+![Efficiency improvement](assets/Figure6.svg)
+
 ## Key Implementation Files (FOCUS)
 
 Based on LMDeploy, the main FOCUS-related implementations are in:
@@ -98,10 +102,6 @@ This runs `JetLM/SDAR-8B-Chat-b32` with delayed cache enabled and FOCUS disabled
 Dataset notes:
 - `dataset_id` can be a HuggingFace dataset ID or a local JSON/JSONL path supported by `benchmark/profile_throughput.py`.
 - HuggingFace dataset IDs require the `datasets` package and network access.
-
-## Efficiency Improvement
-
-![Efficiency improvement](assets/Figure6.svg)
 
 ## Generation Quality Testing
 
