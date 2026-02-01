@@ -4,7 +4,7 @@ from opencompass.models import SDARFocus
 models = [
     dict(
         type=SDARFocus,
-        abbr='sdar-focus-8b',
+        abbr='sdar-8b',
         path='opencompass/models/SDAR-8B-Chat-b32',
         hf_repo='JetLM/SDAR-8B-Chat-b32',
         max_seq_len=1024,
@@ -19,6 +19,12 @@ models = [
         confidence_threshold=0.8,
         use_block_cache=True,
         device='cuda',
+        # FOCUS token-eviction selection strategy.
+        # Options: 'none', 'dynamic', 'top', 'bottom', 'random'.
+        # - 'none': disable token eviction (baseline; no eviction step)
+        # - 'top'/'bottom': keep K tokens with highest/lowest scores
+        # - 'random': keep K random tokens
+        # - 'dynamic': default FOCUS rule
         strategy='dynamic',
         # K=8,
         alpha=1.5,

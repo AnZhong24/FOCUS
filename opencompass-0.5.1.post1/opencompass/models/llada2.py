@@ -334,7 +334,7 @@ class LLaDA2(BaseModel):
         temperature: float = 0.0,
         top_k: int = 0,
         top_p: float = 1.0,
-        threshold: float = 0.9,
+        confidence_threshold: float = 0.9,
         use_block_cache: bool = False,
         K: int = 1,
         strategy: str = "none",
@@ -363,7 +363,7 @@ class LLaDA2(BaseModel):
         self.temperature = temperature
         self.top_k = top_k
         self.top_p = top_p
-        self.threshold = threshold
+        self.confidence_threshold = confidence_threshold
         self.dtype = dtype
         self.use_block_cache = use_block_cache
         self.K = K
@@ -449,7 +449,7 @@ class LLaDA2(BaseModel):
                 temperature=self.temperature,
                 top_k=self.top_k,
                 top_p=self.top_p,
-                threshold=self.threshold,
+                threshold=self.confidence_threshold,
                 eos_id=self.eos_id,
                 eos_early_stop=True,
                 use_block_cache=self.use_block_cache,

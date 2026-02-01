@@ -1,27 +1,27 @@
 # FOCUS
 
-FOCUS is implemented on top of LMDeploy's PyTorch engine. It adds token-importance eviction for DLLM decoding (used by SDAR and LLaDA2) and builds on LMDeploy's delayed KV cache flow.
+FOCUS is an inference system for diffusion LLMs (DLLMs) built on top of the [LMDeploy](https://github.com/InternLM/lmdeploy) engine. It targets a key compute-bound bottleneck in block-diffusion decoding: models compute over a full token block each step, yet only a small fraction of tokens are actually decodable.
 
-## Architecture overview
+FOCUS uses attention-derived token importance from early layers to predict which tokens are likely decodable, then evicts non-decodable ones on the fly to avoid redundant computation. This training-free strategy increases the effective batch size and enables scalable throughput. FOCUS achieves up to **3.52× throughput** improvement without compromising quality across benchmarks. This repo contains the LMDeploy-based implementation for [SDAR](https://github.com/JetAstra/SDAR) and [LLaDA2.0](https://github.com/inclusionAI/LLaDA2.0)-mini.
 
-![FOCUS architecture overview](FOCUS.svg)
+## Design Overview
 
-See [Figure5.pdf](Figure5.pdf) for the PDF version.
+![FOCUS architecture overview](assets/FOCUS.svg)
 
-## Key modified files (FOCUS)
+## Key Implementation Files (FOCUS)
 
-From inspecting this repo and the git diff, the main FOCUS-related changes are in:
+Based on LMDeploy, the main FOCUS-related implementations are in:
 
-- `lmdeploy/pytorch/kernels/cuda/focus.py`: Triton kernels for importance scoring, target selection, and state compaction.
-- `lmdeploy/pytorch/models/sdar.py`: FOCUS eviction integrated into SDAR layers.
-- `lmdeploy/pytorch/models/llada2.py`: FOCUS eviction integrated into LLaDA2 layers.
-- `lmdeploy/pytorch/strategies/dllm/sequence.py`: FocusState tracking and per-step statistics.
-- `lmdeploy/pytorch/strategies/dllm/model_inputs.py`: focus-specific inputs for DLLM batches.
-- `lmdeploy/pytorch/model_inputs.py`: focus runtime view and host/device synchronization.
-- `lmdeploy/pytorch/engine/inputs_maker.py`: builds focus masks and pinned buffers for delayed cache batches.
-- `lmdeploy/pytorch/engine/model_agent.py`: propagates processed positions back to the scheduler.
-- `tests/pytorch/kernel/test_focus_kernels.py` and `tests/pytorch/models/test_focus_pruning.py`: FOCUS test coverage.
-- `benchmark/run_focus_throughput_evaluation.sh`, `benchmark/run_baseline_throughput_evaluation.sh`, `benchmark/run_block_size_comparison.sh`, and `benchmark/run_sdar_delayed_cache_benchmark.sh`: benchmarking entry points.
+- [`lmdeploy/pytorch/kernels/cuda/focus.py`](lmdeploy/pytorch/kernels/cuda/focus.py): Triton kernels for importance scoring, target selection, and state compaction.
+- [`lmdeploy/pytorch/kernels/cuda/pagedattention.py`](lmdeploy/pytorch/kernels/cuda/pagedattention.py): attention kernels (including ragged paged attention).
+- [`lmdeploy/pytorch/kernels/cuda/fill_kv_cache.py`](lmdeploy/pytorch/kernels/cuda/fill_kv_cache.py): KV-cache fill kernels (including sparse KV fill for paged attention).
+- [`lmdeploy/pytorch/models/sdar.py`](lmdeploy/pytorch/models/sdar.py): FOCUS eviction integrated into SDAR layers.
+- [`lmdeploy/pytorch/models/llada2.py`](lmdeploy/pytorch/models/llada2.py): FOCUS eviction integrated into LLaDA2.0-mini layers.
+- [`lmdeploy/pytorch/strategies/dllm/sequence.py`](lmdeploy/pytorch/strategies/dllm/sequence.py): FocusState tracking and per-step statistics.
+- [`lmdeploy/pytorch/strategies/dllm/model_inputs.py`](lmdeploy/pytorch/strategies/dllm/model_inputs.py): focus-specific inputs for DLLM batches.
+- [`lmdeploy/pytorch/model_inputs.py`](lmdeploy/pytorch/model_inputs.py): focus runtime view and host/device synchronization.
+- [`lmdeploy/pytorch/engine/inputs_maker.py`](lmdeploy/pytorch/engine/inputs_maker.py): builds focus masks and pinned buffers for delayed cache batches.
+- [`lmdeploy/pytorch/engine/model_agent.py`](lmdeploy/pytorch/engine/model_agent.py): propagates processed positions back to the scheduler.
 
 ## Install (CUDA)
 
@@ -36,17 +36,17 @@ CUDA 11+ is supported when building from source, but ensure your local CUDA tool
 pip install -r requirements/runtime_cuda.txt
 ```
 
-1. Install the repo using the PyTorch engine:
+3. Install the repo using the PyTorch engine:
 
 ```bash
 DISABLE_TURBOMIND=1 pip install -e .
 ```
 
-## Benchmarking scripts (./benchmark)
+## Benchmarking
 
 All scripts write logs to `./results`. Run them from the repo root.
 
-- FOCUS throughput:
+- FOCUS throughput: [`benchmark/run_focus_throughput_evaluation.sh`](benchmark/run_focus_throughput_evaluation.sh)
 
 ```bash
 benchmark/run_focus_throughput_evaluation.sh <dataset_id> <model_id> [alpha]
@@ -61,9 +61,9 @@ benchmark/run_focus_throughput_evaluation.sh anon8231489123/ShareGPT_Vicuna_unfi
 
 Notes:
 - For `hendrycks-MATH` datasets, the script automatically sets `--dataset-format math`.
-- Focus uses `--dllm-enable-delayed-cache` and `--dllm-enable-focus` with `--dllm-focus-alpha` (default: 1.5).
+- FOCUS uses `--dllm-enable-delayed-cache` and `--dllm-enable-focus` with `--dllm-focus-alpha` (default: 1.5).
 
-- LMDeploy throughput:
+- LMDeploy throughput: [`benchmark/run_baseline_throughput_evaluation.sh`](benchmark/run_baseline_throughput_evaluation.sh)
 
 ```bash
 benchmark/run_baseline_throughput_evaluation.sh <dataset_id> <model_id>
@@ -77,17 +77,17 @@ benchmark/run_baseline_throughput_evaluation.sh anon8231489123/ShareGPT_Vicuna_u
 
 Notes:
 - For `hendrycks-MATH` datasets, the script automatically sets `--dataset-format math`.
-- Base uses `--dllm-confidence-threshold 0.9` without focus.
+- Base uses `--dllm-confidence-threshold 0.9` without FOCUS.
 
-- Block size comparison for SDAR:
+- Block size comparison for SDAR: [`benchmark/run_block_size_comparison.sh`](benchmark/run_block_size_comparison.sh)
 
 ```bash
 benchmark/run_block_size_comparison.sh <dataset_id>
 ```
 
-This runs SDAR models `JetLM/SDAR-8B-Chat-b16` and `JetLM/SDAR-8B-Chat-b64` for both Focus and Base settings.
+This runs SDAR models `JetLM/SDAR-8B-Chat-b16` and `JetLM/SDAR-8B-Chat-b64` for both FOCUS and Base settings.
 
-- Delayed cache baseline for SDAR:
+- Delayed cache baseline for SDAR: [`benchmark/run_sdar_delayed_cache_benchmark.sh`](benchmark/run_sdar_delayed_cache_benchmark.sh)
 
 ```bash
 benchmark/run_sdar_delayed_cache_benchmark.sh <dataset_id>
@@ -99,6 +99,19 @@ Dataset notes:
 - `dataset_id` can be a HuggingFace dataset ID or a local JSON/JSONL path supported by `benchmark/profile_throughput.py`.
 - HuggingFace dataset IDs require the `datasets` package and network access.
 
-## Generation quality testing
+## Efficiency Improvement
 
-For generation quality evaluation of SDAR/LLaDA2 models, see [`opencompass-0.5.1.post1/README.md`](opencompass-0.5.1.post1/README.md) for OpenCompass benchmarking instructions with either HuggingFace/Transformers or LMDeploy backends.
+![Efficiency improvement](assets/Figure6.svg)
+
+## Generation Quality Testing
+
+For generation quality evaluation of SDAR/LLaDA2.0-mini models, see [`opencompass-0.5.1.post1/README.md`](opencompass-0.5.1.post1/README.md) for OpenCompass benchmarking instructions with either HuggingFace/Transformers or LMDeploy backends.
+
+## Acknowledgements
+
+FOCUS builds on and/or includes code and models from:
+
+- [LMDeploy](https://github.com/InternLM/lmdeploy)
+- [OpenCompass](https://github.com/open-compass/opencompass) (vendored snapshot under `opencompass-0.5.1.post1/`)
+- SDAR: [JetAstra/SDAR](https://github.com/JetAstra/SDAR) | weights: [JetLM/SDAR-8B-Chat-b16](https://huggingface.co/JetLM/SDAR-8B-Chat-b16), [JetLM/SDAR-8B-Chat-b32](https://huggingface.co/JetLM/SDAR-8B-Chat-b32), [JetLM/SDAR-8B-Chat-b64](https://huggingface.co/JetLM/SDAR-8B-Chat-b64)
+- LLaDA2.0: [inclusionAI/LLaDA2.0](https://github.com/inclusionAI/LLaDA2.0) | weights: [inclusionAI/LLaDA2.0-mini](https://huggingface.co/inclusionAI/LLaDA2.0-mini)

@@ -1,8 +1,12 @@
 # OpenCompass (benchmarking)
 
 This directory contains a vendored OpenCompass snapshot used to benchmark
-SDAR/LLaDA2 model quality with either the HuggingFace/Transformers backend or
+SDAR/LLaDA2.0-mini model quality with either the HuggingFace/Transformers backend or
 the LMDeploy PyTorch engine.
+
+## Upstream
+
+- OpenCompass: https://github.com/open-compass/opencompass
 
 ## Environment
 
@@ -25,11 +29,11 @@ OpenCompass can run with either the HuggingFace/Transformers backend or the
 LMDeploy backend. Adjust paths and runtime knobs in:
 
 - HuggingFace/Transformers:
-  - `opencompass/configs/models/sdar.py`
-  - `opencompass/configs/models/llada2.py`
+  - [`opencompass/configs/models/sdar.py`](opencompass/configs/models/sdar.py)
+  - [`opencompass/configs/models/llada2.py`](opencompass/configs/models/llada2.py)
 - LMDeploy:
-  - `opencompass/configs/models/sdar_lmdeploy.py`
-  - `opencompass/configs/models/llada2_lmdeploy.py`
+  - [`opencompass/configs/models/sdar_lmdeploy.py`](opencompass/configs/models/sdar_lmdeploy.py)
+  - [`opencompass/configs/models/llada2_lmdeploy.py`](opencompass/configs/models/llada2_lmdeploy.py)
 
 ## Run
 
@@ -54,4 +58,4 @@ PYTHONPATH=$PWD python run.py --models sdar_lmdeploy --datasets gsm8k_gen math50
 ```
 
 Swap `--models sdar` / `--models sdar_lmdeploy` for `--models llada2` /
-`--models llada2_lmdeploy` to benchmark LLaDA2.
+`--models llada2_lmdeploy` to benchmark LLaDA2.0-mini.

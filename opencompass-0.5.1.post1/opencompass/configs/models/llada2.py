@@ -15,8 +15,14 @@ models = [
         temperature=0.0,
         top_k=0,
         top_p=1.0,
-        threshold=0.8,
+        confidence_threshold=0.8,
         use_block_cache=True,
+        # FOCUS token-eviction selection strategy.
+        # Options: "none", "dynamic", "top", "bottom", "random".
+        # - "none": disable token eviction (baseline; no eviction step)
+        # - "top"/"bottom": keep K tokens with highest/lowest scores
+        # - "random": keep K random tokens
+        # - "dynamic": default FOCUS rule
         strategy="dynamic",
         # K=8,
         alpha=1.5,
