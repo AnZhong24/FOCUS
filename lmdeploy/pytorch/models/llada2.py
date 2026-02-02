@@ -1,4 +1,4 @@
-# Copyright (c) OpenMMLab. All rights reserved.
+# Copyright (c) 2026 SANDS Lab. All rights reserved.
 
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 import math

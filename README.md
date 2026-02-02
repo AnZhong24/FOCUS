@@ -1,5 +1,7 @@
 # FOCUS
 
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE) [![arXiv](https://img.shields.io/badge/arXiv-2601.23278-b31b1b.svg)](https://arxiv.org/abs/2601.23278)
+
 FOCUS is an inference system for diffusion LLMs (DLLMs) built on top of the [LMDeploy](https://github.com/InternLM/lmdeploy) engine. It targets a key compute-bound bottleneck in block-diffusion decoding: models compute over a full token block each step, yet only a small fraction of tokens are actually decodable.
 
 FOCUS uses attention-derived token importance from early layers to predict which tokens are likely decodable, then evicts non-decodable ones on the fly to avoid redundant computation. This training-free strategy increases the effective batch size and enables scalable throughput. FOCUS achieves up to **3.52× throughput** improvement without compromising quality across benchmarks. This repo contains the LMDeploy-based implementation for [SDAR](https://github.com/JetAstra/SDAR) and [LLaDA2.0](https://github.com/inclusionAI/LLaDA2.0)-mini.
@@ -106,6 +108,20 @@ Dataset notes:
 ## Generation Quality Testing
 
 For generation quality evaluation of SDAR/LLaDA2.0-mini models, see [`opencompass-0.5.1.post1/README.md`](opencompass-0.5.1.post1/README.md) for OpenCompass benchmarking instructions with either HuggingFace/Transformers or LMDeploy backends.
+
+## Citation
+
+If you find FOCUS useful in your work, please cite:
+
+```bibtex
+@article{liang2026focus,
+  title   = {FOCUS: DLLMs Know How to Tame Their Compute Bound},
+  author  = {Kaihua Liang and Xin Tan and An Zhong and Hong Xu and Marco Canini},
+  journal = {arXiv preprint arXiv:2601.23278},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2601.23278}
+}
+```
 
 ## Acknowledgements
 

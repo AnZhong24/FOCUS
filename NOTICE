@@ -1,0 +1,10 @@
+FOCUS
+Copyright (c) 2026 SANDS Lab.
+
+This product includes software developed by OpenMMLab and contributors:
+- LMDeploy (https://github.com/InternLM/lmdeploy), licensed under the Apache License, Version 2.0.
+
+This product includes a vendored snapshot of OpenCompass:
+- opencompass-0.5.1.post1/ (https://github.com/open-compass/opencompass), licensed under the Apache License, Version 2.0.
+
+FOCUS-specific modifications and additions are Copyright (c) 2026 SANDS Lab and contributors.

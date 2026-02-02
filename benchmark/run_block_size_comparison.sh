@@ -1,5 +1,7 @@
 #!/bin/bash
 
+# Copyright (c) 2026 SANDS Lab. All rights reserved.
+
 # Script to run throughput benchmark with different block sizes for SDAR models
 # This script executes the profile_throughput.py benchmark for multiple configurations:
 # - Dataset: Specified as command line argument

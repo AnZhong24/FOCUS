@@ -1,3 +1,4 @@
+# Copyright (c) 2026 SANDS Lab. All rights reserved.
 import torch
 
 import triton

@@ -1,5 +1,7 @@
 #!/bin/bash
 
+# Copyright (c) 2026 SANDS Lab. All rights reserved.
+
 # Script to run focus throughput benchmark with different batch sizes, datasets, and models
 # This script executes the profile_throughput.py benchmark for focus configuration:
 # - Dataset: Specified as command line argument (first parameter)

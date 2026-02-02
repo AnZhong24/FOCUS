@@ -1,5 +1,7 @@
 #!/bin/bash
 
+# Copyright (c) 2026 SANDS Lab. All rights reserved.
+
 # Script to run throughput benchmark with SDAR model in Delayed Cache mode
 # This script executes the profile_throughput.py benchmark for multiple configurations:
 # - Dataset: Specified as command line argument (first parameter)
