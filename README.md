@@ -8,7 +8,7 @@ FOCUS uses attention-derived token importance from early layers to predict which
 
 ## Design Overview
 
-![FOCUS architecture overview](assets/FOCUS.svg)
+![FOCUS architecture overview](assets/FOCUS.png)
 
 ## Efficiency Improvement
 
