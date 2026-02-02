@@ -1,18 +1,42 @@
-# FOCUS
+<div align="center">
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE) [![arXiv](https://img.shields.io/badge/arXiv-2601.23278-b31b1b.svg)](https://arxiv.org/abs/2601.23278)
+<p>
+  <img src="assets/logo.png" alt="FOCUS logo" width="350"/>
+</p>
 
-FOCUS is an inference system for diffusion LLMs (DLLMs) built on top of the [LMDeploy](https://github.com/InternLM/lmdeploy) engine. It targets a key compute-bound bottleneck in block-diffusion decoding: models compute over a full token block each step, yet only a small fraction of tokens are actually decodable.
+<h2>FOCUS: DLLMs Know How to Tame Their Compute Bound</h2>
 
-FOCUS uses attention-derived token importance from early layers to predict which tokens are likely decodable, then evicts non-decodable ones on the fly to avoid redundant computation. This training-free strategy increases the effective batch size and enables scalable throughput. FOCUS achieves up to **3.52× throughput** improvement without compromising quality across benchmarks. This repo contains the LMDeploy-based implementation for [SDAR](https://github.com/JetAstra/SDAR) and [LLaDA2.0](https://github.com/inclusionAI/LLaDA2.0)-mini.
+<p>
+<b>Kaihua Liang</b><sup>1</sup>, <b>Xin Tan</b><sup>2</sup>, <b>An Zhong</b><sup>1</sup>, <b>Hong Xu</b><sup>2</sup>, <b>Marco Canini</b><sup>1</sup>
+</p>
+
+<p>
+<sup>1</sup>King Abdullah University of Science and Technology &nbsp;&nbsp;
+<sup>2</sup>The Chinese University of Hong Kong
+</p>
+
+</div>
+
+<p align="center">
+  <a href="https://arxiv.org/abs/2601.23278">
+    <img src="https://img.shields.io/badge/arXiv-2601.23278-b31b1b.svg" alt="Paper on arXiv"/>
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License"/>
+  </a>
+</p>
 
 ## Design Overview
 
 ![FOCUS architecture overview](assets/FOCUS.png)
 
+FOCUS is an inference system for diffusion LLMs (DLLMs) built on top of the [LMDeploy](https://github.com/InternLM/lmdeploy) engine. It targets a key compute-bound bottleneck in block-diffusion decoding: models compute over a full token block each step, yet only a small fraction of tokens are actually decodable.
+
+Using attention-derived token importance delta from early layers, this training-free solution predicts which tokens are likely decodable and evicts non-decodable ones on the fly to avoid redundant computation, increasing the effective batch size and enabling scalable throughput. FOCUS achieves up to **3.52× throughput** improvement without compromising quality across benchmarks. This repo contains the LMDeploy-based implementation for [SDAR](https://github.com/JetAstra/SDAR) and [LLaDA2.0](https://github.com/inclusionAI/LLaDA2.0)-mini.
+
 ## Efficiency Improvement
 
-![Efficiency improvement](assets/Figure6.svg)
+![Efficiency improvement](assets/Efficiency.svg)
 
 ## Key Implementation Files (FOCUS)
 
