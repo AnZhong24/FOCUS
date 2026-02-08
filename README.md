@@ -89,10 +89,6 @@ benchmark/run_focus_throughput_evaluation.sh anon8231489123/ShareGPT_Vicuna_unfi
 benchmark/run_focus_throughput_evaluation.sh anon8231489123/ShareGPT_Vicuna_unfiltered JetLM/SDAR-8B-Chat-b32 1.8
 ```
 
-Notes:
-- For `hendrycks-MATH` datasets, the script automatically sets `--dataset-format math`.
-- FOCUS uses `--dllm-enable-delayed-cache` and `--dllm-enable-focus` with `--dllm-focus-alpha` (default: 1.5).
-
 - LMDeploy throughput: [`benchmark/run_baseline_throughput_evaluation.sh`](benchmark/run_baseline_throughput_evaluation.sh)
 
 ```bash
@@ -104,10 +100,6 @@ Example:
 ```bash
 benchmark/run_baseline_throughput_evaluation.sh anon8231489123/ShareGPT_Vicuna_unfiltered JetLM/SDAR-8B-Chat-b32
 ```
-
-Notes:
-- For `hendrycks-MATH` datasets, the script automatically sets `--dataset-format math`.
-- Base uses `--dllm-confidence-threshold 0.9` without FOCUS.
 
 - Block size comparison for SDAR: [`benchmark/run_block_size_comparison.sh`](benchmark/run_block_size_comparison.sh)
 
