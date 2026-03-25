@@ -78,44 +78,44 @@ All scripts write logs to `./results`. Run them from the repo root.
 
 - FOCUS throughput: [`benchmark/run_focus_throughput_evaluation.sh`](benchmark/run_focus_throughput_evaluation.sh)
 
-```bash
-benchmark/run_focus_throughput_evaluation.sh <dataset_id> <model_id> [alpha]
-```
+  ```bash
+  benchmark/run_focus_throughput_evaluation.sh <dataset_id> <model_id> [alpha]
+  ```
 
-Example:
+  Example:
 
-```bash
-benchmark/run_focus_throughput_evaluation.sh anon8231489123/ShareGPT_Vicuna_unfiltered JetLM/SDAR-8B-Chat-b32
-benchmark/run_focus_throughput_evaluation.sh anon8231489123/ShareGPT_Vicuna_unfiltered JetLM/SDAR-8B-Chat-b32 1.8
-```
+  ```bash
+  benchmark/run_focus_throughput_evaluation.sh anon8231489123/ShareGPT_Vicuna_unfiltered JetLM/SDAR-8B-Chat-b32
+  benchmark/run_focus_throughput_evaluation.sh anon8231489123/ShareGPT_Vicuna_unfiltered JetLM/SDAR-8B-Chat-b32 1.8
+  ```
 
 - LMDeploy throughput: [`benchmark/run_baseline_throughput_evaluation.sh`](benchmark/run_baseline_throughput_evaluation.sh)
 
-```bash
-benchmark/run_baseline_throughput_evaluation.sh <dataset_id> <model_id>
-```
+  ```bash
+  benchmark/run_baseline_throughput_evaluation.sh <dataset_id> <model_id>
+  ```
 
-Example:
+  Example:
 
-```bash
-benchmark/run_baseline_throughput_evaluation.sh anon8231489123/ShareGPT_Vicuna_unfiltered JetLM/SDAR-8B-Chat-b32
-```
+  ```bash
+  benchmark/run_baseline_throughput_evaluation.sh anon8231489123/ShareGPT_Vicuna_unfiltered JetLM/SDAR-8B-Chat-b32
+  ```
 
 - Block size comparison for SDAR: [`benchmark/run_block_size_comparison.sh`](benchmark/run_block_size_comparison.sh)
 
-```bash
-benchmark/run_block_size_comparison.sh <dataset_id>
-```
+  ```bash
+  benchmark/run_block_size_comparison.sh <dataset_id>
+  ```
 
-This runs SDAR models `JetLM/SDAR-8B-Chat-b16` and `JetLM/SDAR-8B-Chat-b64` for both FOCUS and Base settings.
+  This runs SDAR models `JetLM/SDAR-8B-Chat-b16` and `JetLM/SDAR-8B-Chat-b64` for both FOCUS and Base settings.
 
 - Delayed cache baseline for SDAR: [`benchmark/run_sdar_delayed_cache_benchmark.sh`](benchmark/run_sdar_delayed_cache_benchmark.sh)
 
-```bash
-benchmark/run_sdar_delayed_cache_benchmark.sh <dataset_id>
-```
+  ```bash
+  benchmark/run_sdar_delayed_cache_benchmark.sh <dataset_id>
+  ```
 
-This runs `JetLM/SDAR-8B-Chat-b32` with delayed cache enabled and FOCUS disabled.
+  This runs `JetLM/SDAR-8B-Chat-b32` with delayed cache enabled and FOCUS disabled.
 
 Dataset notes:
 - `dataset_id` can be a HuggingFace dataset ID or a local JSON/JSONL path supported by `benchmark/profile_throughput.py`.
