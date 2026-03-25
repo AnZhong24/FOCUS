@@ -355,6 +355,10 @@ class PytorchEngineConfig:
         dllm_confidence_threshold (float): dllm unmasking threshold for
             dynamic unmasking.
         dllm_enable_delayed_cache (bool): enable delayed KV cache flow for DLLM decoding.
+        dllm_enable_sub_block_cache_reuse (bool): enable Fast-dLLM-v2-style
+            sub-block decoding and block-cache reuse on top of delayed cache.
+        dllm_sub_block_size (int): inner sub-block size used by sub-block cache
+            reuse mode.
         dllm_enable_focus (bool): enable FOCUS token-eviction refinement for DLLM decoding.
         dllm_focus_alpha (float): Optional multiplier to derive a dynamic retain count when FOCUS is enabled.
         dllm_track (bool): Enable processed-token tracking for DLLM decode steps.
@@ -405,6 +409,8 @@ class PytorchEngineConfig:
     dllm_denoising_steps: int = None
     dllm_confidence_threshold: float = 0.85
     dllm_enable_delayed_cache: bool = False
+    dllm_enable_sub_block_cache_reuse: bool = False
+    dllm_sub_block_size: int = None
     dllm_enable_focus: bool = False
     dllm_focus_alpha: float = 1.0
     dllm_track: bool = False
@@ -431,6 +437,20 @@ class PytorchEngineConfig:
         if self.dllm_enable_focus:
             assert self.dllm_enable_delayed_cache, '--dllm-enable-focus requires --dllm-enable-delayed-cache.'
             assert self.dllm_focus_alpha >= 1, '--dllm-enable-focus requires dllm-focus-alpha >= 1.0.'
+        if self.dllm_enable_sub_block_cache_reuse:
+            assert self.dllm_enable_delayed_cache, (
+                '--dllm-enable-sub-block-cache-reuse requires --dllm-enable-delayed-cache.')
+            assert self.dllm_block_length is not None and self.dllm_block_length > 0, (
+                '--dllm-enable-sub-block-cache-reuse requires a positive --dllm-block-length.')
+            assert self.dllm_sub_block_size is not None and self.dllm_sub_block_size > 0, (
+                '--dllm-enable-sub-block-cache-reuse requires a positive --dllm-sub-block-size.')
+            assert self.dllm_block_length % self.dllm_sub_block_size == 0, (
+                '--dllm-block-length must be divisible by --dllm-sub-block-size.')
+            assert self.block_size % self.dllm_block_length == 0, (
+                '--dllm-enable-sub-block-cache-reuse requires cache block size to be a multiple of '
+                '--dllm-block-length.')
+            assert not self.dllm_enable_focus, (
+                '--dllm-enable-sub-block-cache-reuse is not yet compatible with --dllm-enable-focus.')
         if self.quant_policy > 0 and self.device_type not in ['cuda', 'ascend']:
             assert False, \
                    'kv cache quantization only works for CUDA and ASCEND.'

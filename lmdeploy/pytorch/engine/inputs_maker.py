@@ -50,6 +50,10 @@ class _DelayedCachePinnedBuffers:
     max_tokens: int
     processing_q_lens: torch.Tensor
     processing_indices: torch.Tensor
+    processing_fill_kv_lens: torch.Tensor
+    processing_attn_kv_lens: torch.Tensor
+    processing_target_starts: torch.Tensor
+    processing_target_ends: torch.Tensor
     focus_block_progress: Optional[torch.Tensor] = None
     focus_avg_tokens: Optional[torch.Tensor] = None
     focus_mask_seq_offsets: Optional[torch.Tensor] = None
@@ -213,6 +217,10 @@ class InputsMakerAsync:
         if need_capacity or need_focus:
             processing_q_lens = torch.empty((max_batches, ), dtype=torch.long, device='cpu', pin_memory=True)
             processing_indices = torch.empty((max_tokens, ), dtype=torch.long, device='cpu', pin_memory=True)
+            processing_fill_kv_lens = torch.empty((max_batches, ), dtype=torch.long, device='cpu', pin_memory=True)
+            processing_attn_kv_lens = torch.empty((max_batches, ), dtype=torch.long, device='cpu', pin_memory=True)
+            processing_target_starts = torch.empty((max_batches, ), dtype=torch.long, device='cpu', pin_memory=True)
+            processing_target_ends = torch.empty((max_batches, ), dtype=torch.long, device='cpu', pin_memory=True)
 
             focus_block_progress = None
             focus_avg_tokens = None
@@ -229,6 +237,10 @@ class InputsMakerAsync:
                 max_tokens=max_tokens,
                 processing_q_lens=processing_q_lens,
                 processing_indices=processing_indices,
+                processing_fill_kv_lens=processing_fill_kv_lens,
+                processing_attn_kv_lens=processing_attn_kv_lens,
+                processing_target_starts=processing_target_starts,
+                processing_target_ends=processing_target_ends,
                 focus_block_progress=focus_block_progress,
                 focus_avg_tokens=focus_avg_tokens,
                 focus_mask_seq_offsets=focus_mask_seq_offsets,
@@ -267,6 +279,10 @@ class InputsMakerAsync:
 
         processing_indices = None
         processing_q_lens = None
+        processing_fill_kv_lens = None
+        processing_attn_kv_lens = None
+        processing_target_starts = None
+        processing_target_ends = None
         focus_block_progress = None
         focus_mask_global_indices = None
         focus_mask_seq_offsets = None
@@ -280,6 +296,10 @@ class InputsMakerAsync:
             pinned = self._get_delayed_cache_pinned_buffers(max_total_proc, focus_enabled=focus_enabled)
             processing_q_lens = pinned.processing_q_lens[:batch_size]
             processing_indices_buffer = pinned.processing_indices
+            processing_fill_kv_lens = pinned.processing_fill_kv_lens[:batch_size]
+            processing_attn_kv_lens = pinned.processing_attn_kv_lens[:batch_size]
+            processing_target_starts = pinned.processing_target_starts[:batch_size]
+            processing_target_ends = pinned.processing_target_ends[:batch_size]
             proc_write = 0
 
             focus_mask_buffer = None
@@ -292,9 +312,14 @@ class InputsMakerAsync:
                 focus_mask_buffer = pinned.focus_mask_indices
 
             for msg_idx, msg in enumerate(messages):
-                indices = msg.get_processing_indices()
+                plan = msg.get_processing_plan()
+                indices = plan.indices
                 proc_len = indices.numel()
                 processing_q_lens[msg_idx] = proc_len
+                processing_fill_kv_lens[msg_idx] = msg.num_history_ids + plan.fill_kv_len
+                processing_attn_kv_lens[msg_idx] = msg.num_history_ids + plan.attn_kv_len
+                processing_target_starts[msg_idx] = plan.target_start
+                processing_target_ends[msg_idx] = plan.target_end
                 processing_indices_buffer[proc_write:proc_write + proc_len].copy_(indices, non_blocking=False)
 
                 if focus_enabled:
@@ -343,6 +368,10 @@ class InputsMakerAsync:
         if processing_indices is not None:
             model_inputs.processing_indices = processing_indices
             model_inputs.processing_q_lens = processing_q_lens
+            model_inputs.processing_fill_kv_lens = processing_fill_kv_lens
+            model_inputs.processing_attn_kv_lens = processing_attn_kv_lens
+            model_inputs.processing_target_starts = processing_target_starts
+            model_inputs.processing_target_ends = processing_target_ends
             from .engine import build_delayed_cache_ragged_metadata
             tile_to_seq, seq_tile_offsets, max_proc_q_len = build_delayed_cache_ragged_metadata(
                 processing_q_lens,

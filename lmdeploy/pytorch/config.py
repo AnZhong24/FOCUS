@@ -435,6 +435,8 @@ class DLLMConfig:
     denoising_steps: int = None
     confidence_threshold: float = 0.85
     enable_delayed_cache: bool = False
+    enable_sub_block_cache_reuse: bool = False
+    sub_block_size: Optional[int] = None
     enable_focus: bool = False
     focus_alpha: Optional[float] = None
     track: bool = False
@@ -461,6 +463,8 @@ class MiscConfig:
                                  denoising_steps=engine_config.dllm_denoising_steps,
                                  confidence_threshold=engine_config.dllm_confidence_threshold,
                                  enable_delayed_cache=engine_config.dllm_enable_delayed_cache,
+                                 enable_sub_block_cache_reuse=engine_config.dllm_enable_sub_block_cache_reuse,
+                                 sub_block_size=engine_config.dllm_sub_block_size,
                                  enable_focus=engine_config.dllm_enable_focus,
                                  focus_alpha=engine_config.dllm_focus_alpha,
                                  track=engine_config.dllm_track)

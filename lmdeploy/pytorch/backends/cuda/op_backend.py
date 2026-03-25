@@ -155,6 +155,7 @@ class CudaOpsBackend(DefaultOpsBackend):
         attn_meta_cls = cls.get_attention_metadata_cls()
         q_seqlens = step_context.q_seqlens
         kv_seqlens = step_context.kv_seqlens
+        fill_kv_seqlens = step_context.fill_kv_seqlens
         kv_start_loc = None
         kv_flatten_size = None
         use_flash_mla = step_context.model_config.use_flash_mla
@@ -177,6 +178,7 @@ class CudaOpsBackend(DefaultOpsBackend):
             q_seqlens=q_seqlens,
             kv_start_loc=kv_start_loc,
             kv_seqlens=kv_seqlens,
+            fill_kv_seqlens=fill_kv_seqlens,
             kv_flatten_size=kv_flatten_size,
             max_q_seqlen=step_context.max_q_seqlen,
             quant_policy=step_context.kv_quant_policy,

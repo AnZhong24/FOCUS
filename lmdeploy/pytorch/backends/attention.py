@@ -15,6 +15,7 @@ class AttentionMetadata:
     q_start_loc: torch.Tensor = None
     q_seqlens: torch.Tensor = None
     kv_seqlens: torch.Tensor = None
+    fill_kv_seqlens: torch.Tensor = None
     fill_seqlens: torch.Tensor = None
     cu_seqlens_q: torch.Tensor = None
     cu_seqlens_k: torch.Tensor = None

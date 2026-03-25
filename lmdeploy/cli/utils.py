@@ -44,6 +44,11 @@ def convert_args(args):
         learnable_sink = getattr(args, 'learnable_sink', False)
         assert not learnable_sink, \
             '--dllm-enable-delayed-cache is incompatible with learnable sink attention.'
+    if getattr(args, 'dllm_enable_sub_block_cache_reuse', False):
+        assert getattr(args, 'dllm_enable_delayed_cache', False), (
+            '--dllm-enable-sub-block-cache-reuse requires --dllm-enable-delayed-cache.')
+        assert getattr(args, 'dllm_enable_focus', False) is False, (
+            '--dllm-enable-sub-block-cache-reuse is not yet compatible with --dllm-enable-focus.')
     special_names = ['run', 'command']
     kwargs = {k[0]: k[1] for k in args._get_kwargs() if k[0] not in special_names}
     return kwargs
@@ -713,6 +718,23 @@ class ArgumentHelper:
                                    action='store_true',
                                    default=False,
                                    help='Enable delayed KV-cache updates for DLLM diffusion decoding.')
+
+    @staticmethod
+    def dllm_enable_sub_block_cache_reuse(parser):
+        """Enable Fast-dLLM-v2-style sub-block cache reuse."""
+        return parser.add_argument('--dllm-enable-sub-block-cache-reuse',
+                                   action='store_true',
+                                   default=False,
+                                   help='Enable block-internal sub-block decoding with block-cache reuse on top of '
+                                   'DLLM delayed cache.')
+
+    @staticmethod
+    def dllm_sub_block_size(parser):
+        """DLLM sub-block size."""
+        return parser.add_argument('--dllm-sub-block-size',
+                                   type=int,
+                                   default=None,
+                                   help='Inner sub-block size used when --dllm-enable-sub-block-cache-reuse is set.')
 
     @staticmethod
     def dllm_enable_focus(parser):

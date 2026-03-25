@@ -44,12 +44,16 @@ class DLLMModelInputsStrategy(ModelInputsStrategy):
         self,
         block_size: int,
         enable_delayed_cache: bool = False,
+        enable_sub_block_cache_reuse: bool = False,
+        sub_block_size: int = None,
         enable_focus: bool = False,
         num_attention_heads: int = 1,
         num_key_value_heads: int = 1,
     ):
         self.block_size = block_size
         self.enable_delayed_cache = enable_delayed_cache
+        self.enable_sub_block_cache_reuse = enable_sub_block_cache_reuse
+        self.sub_block_size = sub_block_size
         self.enable_focus = enable_focus
         self.num_attention_heads = num_attention_heads
         self.num_key_value_heads = num_key_value_heads
@@ -77,6 +81,19 @@ class DLLMModelInputsStrategy(ModelInputsStrategy):
             inputs.processing_indices = per_seq_indices.repeat(batch_size)
             inputs.processing_q_lens = torch.full((batch_size,), self.block_size, dtype=torch.long, device=device)
             inputs.processing_max_q_len = self.block_size
+            inputs.processing_fill_kv_lens = torch.full((batch_size, ),
+                                                        self.block_size,
+                                                        dtype=torch.long,
+                                                        device=device)
+            inputs.processing_attn_kv_lens = torch.full((batch_size, ),
+                                                        self.block_size,
+                                                        dtype=torch.long,
+                                                        device=device)
+            inputs.processing_target_starts = torch.zeros((batch_size, ), dtype=torch.long, device=device)
+            target_end = self.block_size
+            if self.enable_sub_block_cache_reuse and self.sub_block_size is not None:
+                target_end = self.sub_block_size
+            inputs.processing_target_ends = torch.full((batch_size, ), target_end, dtype=torch.long, device=device)
             # Build ragged tile metadata for delayed cache
             tile_to_seq, seq_tile_offsets = _build_ragged_metadata_for_warmup(
                 batch_size=batch_size,

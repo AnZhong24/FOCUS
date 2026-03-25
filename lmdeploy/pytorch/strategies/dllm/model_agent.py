@@ -128,6 +128,11 @@ class DLLMModelAgentStrategy(ModelAgentStrategy):
         return (cfg.enable_delayed_cache and inputs.processing_indices is not None
                 and inputs.processing_q_lens is not None)
 
+    def _use_sub_block_cache_reuse(self, inputs: ModelInputs) -> bool:
+        cfg = self.unmasking_processor.dllm_config
+        return (cfg.enable_sub_block_cache_reuse and self._use_delayed_cache(inputs)
+                and inputs.processing_target_starts is not None and inputs.processing_target_ends is not None)
+
     def _get_full_logits_buffer(self, template: torch.Tensor, batch_size: int,
                                 vocab_size: int) -> torch.Tensor:
         """Return a view of a reusable logits buffer large enough for this batch."""
@@ -190,18 +195,25 @@ class DLLMModelAgentStrategy(ModelAgentStrategy):
         seq_count = proc_q_lens.numel()
 
         seq_mask_view = mask_view[:seq_count]
-        processed_mask = torch.zeros(seq_count * block_size, dtype=torch.bool, device=device)
-        if proc_indices.numel() > 0:
-            seq_ids = torch.repeat_interleave(torch.arange(seq_count, device=device, dtype=torch.long),
-                                              proc_q_lens,
-                                              output_size=int(proc_indices.numel()))
-            dense_offsets = seq_ids * block_size + proc_indices
-            processed_mask.index_fill_(0, dense_offsets, True)
-        processed_mask = processed_mask.view(seq_count, block_size)
-
         masked_slots = (seq_mask_view == consts.DLLM_MASKED)
-        cached_mask = (~processed_mask) & masked_slots
-        cached_mask &= (proc_q_lens < block_size).view(-1, 1)
+        if self._use_sub_block_cache_reuse(inputs):
+            target_starts = inputs.processing_target_starts.to(device=device, dtype=torch.long)
+            target_ends = inputs.processing_target_ends.to(device=device, dtype=torch.long)
+            positions = torch.arange(block_size, device=device, dtype=torch.long).unsqueeze(0)
+            target_mask = ((positions >= target_starts.unsqueeze(1))
+                           & (positions < target_ends.unsqueeze(1)))
+            cached_mask = masked_slots & ~target_mask
+        else:
+            processed_mask = torch.zeros(seq_count * block_size, dtype=torch.bool, device=device)
+            if proc_indices.numel() > 0:
+                seq_ids = torch.repeat_interleave(torch.arange(seq_count, device=device, dtype=torch.long),
+                                                  proc_q_lens,
+                                                  output_size=int(proc_indices.numel()))
+                dense_offsets = seq_ids * block_size + proc_indices
+                processed_mask.index_fill_(0, dense_offsets, True)
+            processed_mask = processed_mask.view(seq_count, block_size)
+            cached_mask = (~processed_mask) & masked_slots
+            cached_mask &= (proc_q_lens < block_size).view(-1, 1)
         seq_mask_view.masked_fill_(cached_mask, consts.DLLM_CACHED)
 
         if seq_count == total_seqs:

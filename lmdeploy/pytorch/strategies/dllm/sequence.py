@@ -40,6 +40,16 @@ class FocusInfo:
 
 
 @dataclass
+class DelayedCacheProcessingPlan:
+    indices: torch.Tensor
+    fill_kv_len: int
+    attn_kv_len: int
+    target_start: int
+    target_end: int
+    full_block: bool = False
+
+
+@dataclass
 class DelayedCacheState:
     block_length: int
     uncached_positions: torch.Tensor
@@ -82,6 +92,78 @@ class DelayedCacheState:
             return self._full_indices
         return indices
 
+    def get_processing_plan(self) -> DelayedCacheProcessingPlan:
+        indices = self.get_processing_indices()
+        if indices.numel() == 0:
+            fill_kv_len = self.block_length
+        else:
+            fill_kv_len = int(indices[-1].item()) + 1
+        if fill_kv_len <= 0:
+            fill_kv_len = self.block_length
+        return DelayedCacheProcessingPlan(indices=indices,
+                                          fill_kv_len=fill_kv_len,
+                                          attn_kv_len=fill_kv_len,
+                                          target_start=0,
+                                          target_end=self.block_length,
+                                          full_block=(fill_kv_len >= self.block_length))
+
+
+@dataclass
+class SubBlockDecodeState:
+    block_length: int
+    sub_block_size: int
+    _full_indices: torch.Tensor
+    _sub_block_indices: Sequence[torch.Tensor]
+
+    @classmethod
+    def new(cls, block_length: int, sub_block_size: int):
+        full_indices = torch.arange(block_length, dtype=torch.long)
+        sub_block_indices = tuple(
+            torch.arange(start, start + sub_block_size, dtype=torch.long)
+            for start in range(0, block_length, sub_block_size))
+        return cls(block_length=block_length,
+                   sub_block_size=sub_block_size,
+                   _full_indices=full_indices,
+                   _sub_block_indices=sub_block_indices)
+
+    def reset(self):
+        return
+
+    def _find_active_sub_block(self, dllm_mask: np.ndarray) -> Optional[int]:
+        masked = (dllm_mask == DLLM_MASKED)
+        for sub_block_idx, start in enumerate(range(0, self.block_length, self.sub_block_size)):
+            end = start + self.sub_block_size
+            if masked[start:end].any():
+                return sub_block_idx
+        return None
+
+    def get_processing_plan(self, dllm_mask: np.ndarray) -> DelayedCacheProcessingPlan:
+        active_sub_block = self._find_active_sub_block(dllm_mask)
+        if active_sub_block is None:
+            return DelayedCacheProcessingPlan(indices=self._full_indices,
+                                              fill_kv_len=self.block_length,
+                                              attn_kv_len=self.block_length,
+                                              target_start=0,
+                                              target_end=self.block_length,
+                                              full_block=True)
+
+        start = active_sub_block * self.sub_block_size
+        end = start + self.sub_block_size
+        if dllm_mask[start] == DLLM_MASKED:
+            return DelayedCacheProcessingPlan(indices=self._full_indices,
+                                              fill_kv_len=self.block_length,
+                                              attn_kv_len=self.block_length,
+                                              target_start=start,
+                                              target_end=end,
+                                              full_block=True)
+
+        return DelayedCacheProcessingPlan(indices=self._sub_block_indices[active_sub_block],
+                                          fill_kv_len=end,
+                                          attn_kv_len=self.block_length,
+                                          target_start=start,
+                                          target_end=end,
+                                          full_block=False)
+
 
 @dataclass
 class FocusState:
@@ -117,8 +199,13 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
         self._num_valid_ids: int = len(self.history_cache)
         self._strategy: DLLMSequenceStrategy = self._seq_meta.strategy
         self._delayed_cache_state: DelayedCacheState | None = None
+        self._sub_block_decode_state: SubBlockDecodeState | None = None
         if self._strategy.enable_delayed_cache:
-            self._delayed_cache_state = DelayedCacheState.new(self.dllm_block_length)
+            if self._strategy.enable_sub_block_cache_reuse:
+                self._sub_block_decode_state = SubBlockDecodeState.new(self.dllm_block_length,
+                                                                       self._strategy.sub_block_size)
+            else:
+                self._delayed_cache_state = DelayedCacheState.new(self.dllm_block_length)
         cfg = self.dllm_config
         focus_enabled = bool(cfg and getattr(cfg, 'enable_focus', False))
         self._focus_enabled = focus_enabled and self.delayed_cache_enabled
@@ -158,11 +245,17 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
 
     @property
     def delayed_cache_enabled(self) -> bool:
-        return self._delayed_cache_state is not None
+        return self._delayed_cache_state is not None or self._sub_block_decode_state is not None
+
+    @property
+    def sub_block_cache_reuse_enabled(self) -> bool:
+        return self._sub_block_decode_state is not None
 
     def _reset_delayed_cache_state(self):
         if self._delayed_cache_state is not None:
             self._delayed_cache_state.reset()
+        if self._sub_block_decode_state is not None:
+            self._sub_block_decode_state.reset()
         if self._focus_state is not None:
             self._focus_state.reset()
         self._focus_token_sum = 0.0
@@ -170,10 +263,16 @@ class SchedulerSequenceDLLM(SchedulerSequenceDefault):
 
     def _update_delayed_cache_state(self):
         mask = self.dllm_mask
-        self._delayed_cache_state.update_from_mask(mask)
+        if self._delayed_cache_state is not None:
+            self._delayed_cache_state.update_from_mask(mask)
+
+    def get_processing_plan(self) -> DelayedCacheProcessingPlan:
+        if self._sub_block_decode_state is not None:
+            return self._sub_block_decode_state.get_processing_plan(self.dllm_mask)
+        return self._delayed_cache_state.get_processing_plan()
 
     def get_processing_indices(self) -> torch.Tensor:
-        indices = self._delayed_cache_state.get_processing_indices()
+        indices = self.get_processing_plan().indices
         # NOTE: sparse kernels assume each per-sequence slice is sorted
         # ascending, so keep the natural torch.nonzero ordering.
         return indices
@@ -352,8 +451,12 @@ class DLLMSequenceStrategy(SequenceStrategy):
         self.enable_delayed_cache = enable_delayed_cache
         self.dllm_config = dllm_config
         self.track = False
+        self.enable_sub_block_cache_reuse = False
+        self.sub_block_size: int | None = None
         if dllm_config is not None:
             self.track = dllm_config.track
+            self.enable_sub_block_cache_reuse = dllm_config.enable_sub_block_cache_reuse
+            self.sub_block_size = dllm_config.sub_block_size
 
     def make_sequence(self,
                       seq_id: int,

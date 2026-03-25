@@ -170,6 +170,7 @@ class CudaGraphMixin:
         input_buffers['q_start_loc'] = input_buffers['qkv_lens'][0]
         input_buffers['q_seqlens'] = input_buffers['qkv_lens'][1]
         input_buffers['kv_seqlens'] = input_buffers['qkv_lens'][2]
+        input_buffers['fill_kv_seqlens'] = torch.zeros(max_batches, dtype=torch.int32, device=device)
         input_buffers['qkv_seqlens'] = input_buffers['qkv_lens'][1:]
         input_buffers['local_adapter_ids'] = torch.zeros(max_batches, dtype=torch.int64, device=device)
         # create buffer for cross_attn_metadata here
@@ -222,6 +223,7 @@ class CudaGraphMixin:
         q_start_loc: Tensor = attn_metadata.q_start_loc
         q_seqlens: Tensor = attn_metadata.q_seqlens
         kv_seqlens: Tensor = attn_metadata.kv_seqlens
+        fill_kv_seqlens: Tensor = getattr(attn_metadata, 'fill_kv_seqlens', None)
         input_buffers: BuffType = graph_meta.input_buffers
 
         batch_size, num_blocks = block_offsets.size()
@@ -238,6 +240,9 @@ class CudaGraphMixin:
         input_buffers['q_seqlens'].fill_(graph_meta.max_tokens // graph_meta.max_batchs)
         input_buffers['qkv_lens'][:, :batch_size] = qkv
         input_buffers['cu_seqlens'][:, 1:] = input_buffers['qkv_seqlens'].cumsum(1)
+        if fill_kv_seqlens is None:
+            fill_kv_seqlens = kv_seqlens
+        input_buffers['fill_kv_seqlens'][:batch_size] = fill_kv_seqlens
         # fill_seqlens is used to control KV fill; keep it on the static
         input_buffers['fill_seqlens'][:batch_size] = q_seqlens
         if inputs_embeds is not None:
@@ -253,6 +258,7 @@ class CudaGraphMixin:
         attn_metadata.q_start_loc = input_buffers['q_start_loc']
         attn_metadata.q_seqlens = input_buffers['q_seqlens']
         attn_metadata.kv_seqlens = input_buffers['kv_seqlens']
+        attn_metadata.fill_kv_seqlens = input_buffers['fill_kv_seqlens']
         attn_metadata.cu_seqlens_q = input_buffers['cu_seqlens_q']
         attn_metadata.cu_seqlens_k = input_buffers['cu_seqlens_k']
         attn_metadata.fill_seqlens = input_buffers['fill_seqlens']
@@ -341,6 +347,7 @@ class CudaGraphMixin:
             context.local_adapter_ids = input_buffers['local_adapter_ids']
         context.q_seqlens = input_buffers['q_seqlens']
         context.kv_seqlens = input_buffers['kv_seqlens']
+        context.fill_kv_seqlens = input_buffers['fill_kv_seqlens']
         context.q_start_loc = input_buffers['q_start_loc']
 
     def get_outputs_cudagraph(self, output_buffers: Dict[str, torch.Tensor], input_ids: Tensor, **kwargs):

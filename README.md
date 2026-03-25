@@ -60,6 +60,9 @@ LMDeploy's default prebuilt wheels target CUDA 12 (since v0.3.0); RTX 50-series 
 CUDA 11+ is supported when building from source, but ensure your local CUDA toolkit matches your PyTorch/Triton stack.
 
 1. Create and activate a Python environment.
+   Python 3.10-3.13 is recommended; Python 3.14 is not supported because key
+   runtime dependencies such as `ray` do not currently publish compatible
+   wheels.
 2. Install runtime dependencies:
 
 ```bash

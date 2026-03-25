@@ -197,6 +197,10 @@ class ModelInputs:
     target_position_ids: torch.Tensor = None
     processing_indices: torch.LongTensor = None
     processing_q_lens: torch.LongTensor = None
+    processing_fill_kv_lens: torch.LongTensor = None
+    processing_attn_kv_lens: torch.LongTensor = None
+    processing_target_starts: torch.LongTensor = None
+    processing_target_ends: torch.LongTensor = None
     processing_max_q_len: int = 0
     ragged_tile_to_seq: torch.IntTensor = None
     ragged_seq_tile_offsets: torch.IntTensor = None
@@ -218,6 +222,10 @@ class ModelInputs:
         self.input_ids = input_ids
         self.processing_indices = None
         self.processing_q_lens = None
+        self.processing_fill_kv_lens = None
+        self.processing_attn_kv_lens = None
+        self.processing_target_starts = None
+        self.processing_target_ends = None
         self.processing_max_q_len = 0
         self.ragged_tile_to_seq = None
         self.ragged_seq_tile_offsets = None
@@ -400,6 +408,7 @@ class StepContext:
     attention_mask: torch.LongTensor
     q_seqlens: torch.LongTensor
     kv_seqlens: torch.IntTensor
+    fill_kv_seqlens: torch.IntTensor
     q_start_loc: torch.LongTensor
     kv_caches: List
     is_decoding: bool
@@ -432,6 +441,8 @@ class StepContext:
     state_caches: List = None
     state_offsets: torch.LongTensor = None
     processing_indices: torch.LongTensor = None
+    processing_target_starts: torch.LongTensor = None
+    processing_target_ends: torch.LongTensor = None
     use_delayed_cache: bool = False
 
     _outputs: Dict = field(default_factory=dict)
@@ -458,6 +469,8 @@ class StepContext:
         history_seqlens = inputs.history_lengths
         processing_indices = inputs.processing_indices
         processing_q_lens = inputs.processing_q_lens
+        processing_fill_kv_lens = inputs.processing_fill_kv_lens
+        processing_attn_kv_lens = inputs.processing_attn_kv_lens
         dllm_cfg = getattr(build_ctx, 'dllm_config', None) if build_ctx is not None else None
         focus_params = FocusParams()
         if dllm_cfg is not None:
@@ -511,13 +524,22 @@ class StepContext:
 
         # seq_len + history_length
         if use_delayed_cache:
-            end_offsets = q_start_loc + q_seqlens - 1
-            rightmost_vals = proc_tensor.index_select(0, end_offsets)
-            rightmost_plus_one = rightmost_vals + 1
-            kv_seqlens = history_seqlens + rightmost_plus_one
+            if processing_attn_kv_lens is not None:
+                kv_seqlens = processing_attn_kv_lens
+            else:
+                end_offsets = q_start_loc + q_seqlens - 1
+                rightmost_vals = proc_tensor.index_select(0, end_offsets)
+                rightmost_plus_one = rightmost_vals + 1
+                kv_seqlens = history_seqlens + rightmost_plus_one
+            if processing_fill_kv_lens is not None:
+                fill_kv_seqlens = processing_fill_kv_lens
+            else:
+                fill_kv_seqlens = kv_seqlens
         else:
             kv_seqlens = q_seqlens + history_seqlens
-        kv_seqlens -= num_ignored_history
+            fill_kv_seqlens = kv_seqlens
+        kv_seqlens = kv_seqlens - num_ignored_history
+        fill_kv_seqlens = fill_kv_seqlens - num_ignored_history
 
         focus_view = None
         if focus_params.enabled:
@@ -574,6 +596,7 @@ class StepContext:
             attention_mask=attention_mask,
             q_seqlens=q_seqlens,
             kv_seqlens=kv_seqlens,
+            fill_kv_seqlens=fill_kv_seqlens,
             q_start_loc=q_start_loc,
             kv_caches=kv_caches,
             is_decoding=inputs.is_decoding,
@@ -591,6 +614,8 @@ class StepContext:
             state_caches=state_caches,
             state_offsets=inputs.state_offsets,
             processing_indices=proc_tensor,
+            processing_target_starts=inputs.processing_target_starts,
+            processing_target_ends=inputs.processing_target_ends,
             use_delayed_cache=use_delayed_cache,
             history_lengths=history_seqlens,
             num_ignored_history=num_ignored_history,
@@ -654,16 +679,20 @@ class StepContext:
         self.q_seqlens = new_q_lens
         self.q_start_loc = q_start_loc
         self.kv_seqlens = kv_seqlens
+        self.fill_kv_seqlens = kv_seqlens
         self.attn_metadata.q_seqlens = new_q_lens
         self.attn_metadata.q_start_loc = q_start_loc
         self.attn_metadata.cu_seqlens_q = cu_q
         self.attn_metadata.processing_indices = new_proc_indices
         self.attn_metadata.kv_seqlens = kv_seqlens
+        self.attn_metadata.fill_kv_seqlens = kv_seqlens
         self.attn_metadata.cu_seqlens_k = cu_k
         # Update fill_seqlens if it was set (needed for FOCUS to work correctly)
         self.attn_metadata.fill_seqlens = new_q_lens
         self.source_inputs.processing_indices = self.processing_indices
         self.source_inputs.processing_q_lens = self.q_seqlens
+        self.source_inputs.processing_fill_kv_lens = self.fill_kv_seqlens
+        self.source_inputs.processing_attn_kv_lens = self.kv_seqlens
 
         from lmdeploy.pytorch.engine.engine import build_delayed_cache_ragged_metadata
         if not self.focus_view.new_q_lens_event.query():

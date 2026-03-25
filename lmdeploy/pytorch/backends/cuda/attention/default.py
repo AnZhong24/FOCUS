@@ -24,6 +24,7 @@ class TritonAttentionMetadata(AttentionMetadata):
         q_seqlens: Length of each query sequence [batch_size].
         kv_start_loc: Start location of each KV sequence [batch_size].
         kv_seqlens: Length of each KV sequence [batch_size].
+        fill_kv_seqlens: KV lengths used for cache writeback [batch_size].
         fill_seqlens: Fill sequence lengths (for special cases like MLlama).
         quant_policy: Quantization policy (0=none, 4=int4, 8=int8/fp8).
         kv_flatten_size: Total size of flattened KV cache.
@@ -43,6 +44,7 @@ class TritonAttentionMetadata(AttentionMetadata):
     q_seqlens: torch.Tensor = None
     kv_start_loc: torch.Tensor = None
     kv_seqlens: torch.Tensor = None
+    fill_kv_seqlens: torch.Tensor = None
     fill_seqlens: torch.Tensor = None
     quant_policy: Literal[0, 4, 8] = 0
     kv_flatten_size: int = None
@@ -167,7 +169,9 @@ class TritonAttentionImpl(AttentionImpl[TritonAttentionMetadata]):
         v_scales_zeros: torch.Tensor = None,
     ):
         """Fill kv cache."""
-        kv_seqlens = attn_metadata.kv_seqlens
+        kv_seqlens = attn_metadata.fill_kv_seqlens
+        if kv_seqlens is None:
+            kv_seqlens = attn_metadata.kv_seqlens
         block_offsets = attn_metadata.block_offsets
         quant_policy = attn_metadata.quant_policy
         processing_indices = getattr(attn_metadata, 'processing_indices', None)

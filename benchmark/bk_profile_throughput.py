@@ -310,6 +310,8 @@ def parse_args():
     ArgumentHelper.dllm_denoising_steps(pt_group)
     ArgumentHelper.dllm_confidence_threshold(pt_group)
     ArgumentHelper.dllm_enable_delayed_cache(pt_group)
+    ArgumentHelper.dllm_enable_sub_block_cache_reuse(pt_group)
+    ArgumentHelper.dllm_sub_block_size(pt_group)
     ArgumentHelper.dllm_enable_focus(pt_group)
     ArgumentHelper.dllm_focus_alpha(pt_group)
     ArgumentHelper.dllm_track(pt_group)
@@ -374,6 +376,8 @@ def main():
             dllm_denoising_steps=args.dllm_denoising_steps,
             dllm_confidence_threshold=args.dllm_confidence_threshold,
             dllm_enable_delayed_cache=args.dllm_enable_delayed_cache,
+            dllm_enable_sub_block_cache_reuse=args.dllm_enable_sub_block_cache_reuse,
+            dllm_sub_block_size=args.dllm_sub_block_size,
             dllm_enable_focus=args.dllm_enable_focus,
             dllm_focus_alpha=args.dllm_focus_alpha,
             dllm_track=args.dllm_track,

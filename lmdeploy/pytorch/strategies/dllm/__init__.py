@@ -66,6 +66,8 @@ class DLLMStrategyFactory(StrategyFactoryBase):
         return DLLMModelInputsStrategy(
             block_size=self.dllm_block_length,
             enable_delayed_cache=self.dllm_config.enable_delayed_cache,
+            enable_sub_block_cache_reuse=self.dllm_config.enable_sub_block_cache_reuse,
+            sub_block_size=self.dllm_config.sub_block_size,
             enable_focus=self.dllm_config.enable_focus,
             num_attention_heads=self.model_config.num_attention_heads,
             num_key_value_heads=self.model_config.num_key_value_heads,
